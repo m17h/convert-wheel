@@ -12,7 +12,7 @@ public sealed record ConversionPlan(
     IReadOnlyList<FormatInfo> Suggested,
     IReadOnlyList<FormatInfo> All)
 {
-    public bool NeedsLibreOffice => SourceKind is FormatKind.Document or FormatKind.Spreadsheet or FormatKind.Presentation;
+    public bool IsOfficeDocument => SourceKind is FormatKind.Document or FormatKind.Spreadsheet or FormatKind.Presentation;
 }
 
 public static class Formats

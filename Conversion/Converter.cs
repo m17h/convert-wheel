@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Text;
 using System.Text.RegularExpressions;
+using ConvertWheel.Conversion.Documents;
 
 namespace ConvertWheel.Conversion;
 
@@ -14,7 +15,8 @@ public sealed class ToolMissingException(string tool) : Exception($"{tool} is no
 
 /// <summary>
 /// Picks an engine per conversion: Windows imaging (WIC) for common still images, FFmpeg for
-/// audio/video and exotic images, LibreOffice for documents.
+/// audio/video and exotic images, and for documents Microsoft Office, LibreOffice or the
+/// built-in document engine, whichever is available and best.
 /// </summary>
 public sealed partial class Converter(AppSettings settings)
 {
@@ -26,9 +28,9 @@ public sealed partial class Converter(AppSettings settings)
         var output = ReserveOutputPath(plan.SourcePath, target.Ext);
         try
         {
-            if (plan.NeedsLibreOffice)
+            if (plan.IsOfficeDocument)
             {
-                await LibreOfficeAsync(plan, target, output, ct);
+                await DocumentAsync(plan, target, output, ct);
             }
             else if (plan.SourceKind == FormatKind.Image && WicTargets.Contains(target.Ext) &&
                      await RunSta(() => ImageConverter.TryConvert(plan.SourcePath, output, target.Ext)))
@@ -220,6 +222,54 @@ public sealed partial class Converter(AppSettings settings)
             .ToList();
         var message = lines.LastOrDefault(l => l.Contains("rror") || l.Contains("nvalid") || l.Contains("not ")) ?? lines.LastOrDefault();
         return string.IsNullOrWhiteSpace(message) ? "FFmpeg couldn't convert this file." : message.Length > 220 ? message[..220] + "…" : message;
+    }
+
+    // ---------------------------------------------------------------- documents
+
+    /// <summary>
+    /// Office gives a pixel-perfect result for its own formats, so it goes first when installed,
+    /// then an installed LibreOffice, then the built-in engine. The built-in engine goes first for
+    /// plain text and CSV (no layout to preserve) and for PDF output, because Office's PDF export
+    /// runs through its print pipeline and can stall for a minute or more on some PCs.
+    /// </summary>
+    public static bool CanConvertDocumentWithoutDownload(ConversionPlan plan) =>
+        BuiltInDocuments.CanRead(plan) || OfficeAutomation.CanOpen(plan) || ToolLocator.FindLibreOffice() != null;
+
+    static async Task DocumentAsync(ConversionPlan plan, FormatInfo target, string output, CancellationToken ct)
+    {
+        var engines = new List<(string name, Func<Task> run)>();
+        bool builtIn = BuiltInDocuments.CanConvert(plan, target);
+        bool builtInFirst = plan.SourceExt is "txt" or "csv" || target.Ext == "pdf";
+        var builtInEngine = ("built-in", (Func<Task>)(() => RunSta(() => { BuiltInDocuments.Convert(plan, target, output); return true; })));
+
+        if (builtIn && builtInFirst) engines.Add(builtInEngine);
+        if (OfficeAutomation.CanConvert(plan, target)) engines.Add(("Microsoft Office", () => OfficeAutomation.ConvertAsync(plan, target, output, ct)));
+        if (ToolLocator.FindLibreOffice() != null) engines.Add(("LibreOffice", () => LibreOfficeAsync(plan, target, output, ct)));
+        if (builtIn && !builtInFirst) engines.Add(builtInEngine);
+
+        // Testing aid: CONVERTWHEEL_DOC_ENGINE=built-in (or "Microsoft Office", "LibreOffice") forces one engine.
+        if (Environment.GetEnvironmentVariable("CONVERTWHEEL_DOC_ENGINE") is { Length: > 0 } forced)
+            engines.RemoveAll(e => !e.name.Equals(forced, StringComparison.OrdinalIgnoreCase));
+        if (engines.Count == 0) throw new ToolMissingException("LibreOffice");
+
+        Exception? last = null;
+        foreach (var (name, run) in engines)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                await run();
+                if (File.Exists(output) && new FileInfo(output).Length > 0) return;
+                last = new ConversionException($"{name} produced an empty file.");
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                Log.Write($"Document engine {name} failed for {plan.SourcePath} -> {target.Ext}: {ex}");
+                last = ex;
+            }
+        }
+        throw last is ConversionException ? last : new ConversionException(last?.Message ?? "Couldn't convert this document.");
     }
 
     // ---------------------------------------------------------------- LibreOffice

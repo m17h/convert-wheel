@@ -16,17 +16,19 @@ public partial class SettingsWindow : Window
     readonly ToolLocator _tools;
     readonly Action<bool> _suspendTrigger;
     readonly Action _downloadFfmpeg;
+    readonly Action _downloadLibreOffice;
     readonly HashSet<int> _held = [];
     readonly HashSet<int> _recorded = [];
     bool _recording;
     bool _loading = true; // controls raise change events while InitializeComponent builds them
 
-    internal SettingsWindow(AppSettings settings, ToolLocator tools, Action<bool> suspendTrigger, Action downloadFfmpeg)
+    internal SettingsWindow(AppSettings settings, ToolLocator tools, Action<bool> suspendTrigger, Action downloadFfmpeg, Action downloadLibreOffice)
     {
         _settings = settings;
         _tools = tools;
         _suspendTrigger = suspendTrigger;
         _downloadFfmpeg = downloadFfmpeg;
+        _downloadLibreOffice = downloadLibreOffice;
         InitializeComponent();
 
         Logo.Source = LoadLogo();
@@ -84,12 +86,21 @@ public partial class SettingsWindow : Window
         var ffmpeg = _tools.FindFfmpeg();
         FfmpegStatus.Text = ffmpeg != null
             ? $"Ready · {ffmpeg}"
-            : "Not installed yet. It downloads automatically the first time you convert audio or video.";
+            : $"Downloads automatically (about {ToolLocator.FfmpegDownloadMb} MB) the first time you convert audio or video.";
         FfmpegDownload.Visibility = ffmpeg == null ? Visibility.Visible : Visibility.Collapsed;
 
-        var office = ToolLocator.FindLibreOffice();
-        LibreOfficeStatus.Text = office != null ? $"Ready · {office}" : "Not installed. Needed only for documents.";
-        LibreOfficeButton.Visibility = office == null ? Visibility.Visible : Visibility.Collapsed;
+        var apps = new[] { "Word", "Excel", "PowerPoint" }.Where(OfficeAutomation.IsInstalled).ToList();
+        OfficeStatus.Text = apps.Count > 0
+            ? $"Found {string.Join(", ", apps)}. Used automatically for the most faithful conversions of Office files."
+            : "Not installed. That's fine: the built-in converter handles most documents.";
+
+        var libreOffice = ToolLocator.FindLibreOffice();
+        LibreOfficeStatus.Text = libreOffice != null
+            ? $"Ready · {libreOffice}"
+            : apps.Contains("PowerPoint")
+                ? "Not needed on this PC."
+                : $"Only needed for PowerPoint slides and old .doc files. You'll be asked first ({ToolLocator.LibreOfficeDownloadMb} MB).";
+        LibreOfficeButton.Visibility = libreOffice == null && !apps.Contains("PowerPoint") ? Visibility.Visible : Visibility.Collapsed;
     }
 
     // ------------------------------------------------------------------ simple settings
@@ -163,8 +174,12 @@ public partial class SettingsWindow : Window
         _settings.Save();
     }
 
-    void OnGetLibreOffice(object sender, RoutedEventArgs e) =>
-        Process.Start(new ProcessStartInfo(ToolLocator.LibreOfficeUrl) { UseShellExecute = true });
+    void OnGetLibreOffice(object sender, RoutedEventArgs e)
+    {
+        LibreOfficeButton.IsEnabled = false;
+        LibreOfficeStatus.Text = "Downloading… progress is shown in the corner of your screen.";
+        _downloadLibreOffice();
+    }
 
     // ------------------------------------------------------------------ shortcut recording
 

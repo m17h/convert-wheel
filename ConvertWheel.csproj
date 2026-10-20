@@ -29,4 +29,10 @@
     <Using Include="System.IO" />
   </ItemGroup>
 
+  <ItemGroup>
+    <PackageReference Include="ExcelDataReader" Version="3.9.0" />
+    <!-- Pinned: 6.2.x is the last MIT-licensed PDFsharp; later versions are AGPL. -->
+    <PackageReference Include="PDFsharp" Version="6.2.4" />
+  </ItemGroup>
+
 </Project>

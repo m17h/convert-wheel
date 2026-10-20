@@ -10,7 +10,7 @@ internal sealed class ConversionManager(AppSettings settings, ToolLocator tools,
 {
     readonly Converter _converter = new(settings);
     readonly SemaphoreSlim _slots = new(2);
-    Task<string>? _ffmpegDownload;
+    Task<string>? _ffmpegDownload, _libreOfficeDownload;
 
     public async void Start(ConversionPlan plan, FormatInfo target)
     {
@@ -23,9 +23,6 @@ internal sealed class ConversionManager(AppSettings settings, ToolLocator tools,
 
         try
         {
-            if (plan.NeedsLibreOffice && ToolLocator.FindLibreOffice() == null)
-                throw new ToolMissingException("LibreOffice");
-
             await _slots.WaitAsync(cts.Token);
             string output;
             try
@@ -54,8 +51,16 @@ internal sealed class ConversionManager(AppSettings settings, ToolLocator tools,
         }
         catch (ToolMissingException ex) when (ex.Tool == "LibreOffice")
         {
-            Finish(toast, ToastGlyph.Error, Palette.Error, "LibreOffice is needed for documents", "It's free. Install it, then try again.", 20);
-            toast.AddAction("Get LibreOffice", () => OpenFile(ToolLocator.LibreOfficeUrl));
+            // Only reached for formats nothing built in can read (e.g. PowerPoint files without Office).
+            Finish(toast, ToastGlyph.Info, Palette.Neutral, $"{plan.SourceExt.ToUpperInvariant()} files need a free helper",
+                $"LibreOffice: one-time {ToolLocator.LibreOfficeDownloadMb} MB download, nothing to install.", 30);
+            toast.AddAction("Download & convert", () =>
+            {
+                toast.DismissNow();
+                EnsureLibreOfficeAsync().ContinueWith(t => { if (t.IsCompletedSuccessfully) Start(plan, target); },
+                    TaskScheduler.FromCurrentSynchronizationContext());
+            });
+            toast.AddAction("Not now", toast.DismissNow);
         }
         catch (Exception ex)
         {
@@ -87,7 +92,7 @@ internal sealed class ConversionManager(AppSettings settings, ToolLocator tools,
 
     async Task<string> DownloadFfmpegAsync()
     {
-        var toast = toasts.Push("Setting up FFmpeg", "One-time download (about 200 MB) for audio & video", Palette.Neutral, ToastGlyph.Download);
+        var toast = toasts.Push("Setting up FFmpeg", $"One-time download (about {ToolLocator.FfmpegDownloadMb} MB) for audio & video", Palette.Neutral, ToastGlyph.Download);
         toast.SetProgress(0);
         try
         {
@@ -101,6 +106,37 @@ internal sealed class ConversionManager(AppSettings settings, ToolLocator tools,
             _ffmpegDownload = null;
             Finish(toast, ToastGlyph.Error, Palette.Error, "Couldn't download FFmpeg", "Check your connection, or set ffmpeg.exe in Settings.", 15);
             throw new ConversionException("FFmpeg isn't available.");
+        }
+    }
+
+    /// <summary>Downloads LibreOffice once; concurrent requests share the same download.</summary>
+    public Task<string> EnsureLibreOfficeAsync()
+    {
+        if (ToolLocator.FindLibreOffice() is { } existing) return Task.FromResult(existing);
+        return _libreOfficeDownload ??= DownloadLibreOfficeAsync();
+    }
+
+    async Task<string> DownloadLibreOfficeAsync()
+    {
+        var toast = toasts.Push("Setting up LibreOffice", $"One-time download (about {ToolLocator.LibreOfficeDownloadMb} MB)", Palette.Neutral, ToastGlyph.Download);
+        toast.SetProgress(0);
+        var progress = new Progress<double?>(p =>
+        {
+            toast.SetProgress(p);
+            if (p == null) toast.Update("Setting up LibreOffice", "Unpacking… this takes a minute");
+        });
+        try
+        {
+            var path = await ToolLocator.DownloadLibreOfficeAsync(progress, CancellationToken.None);
+            Finish(toast, ToastGlyph.Success, Palette.Success, "LibreOffice is ready", "Every document format can now be converted.", 4);
+            return path;
+        }
+        catch (Exception ex)
+        {
+            Log.Write(ex);
+            _libreOfficeDownload = null;
+            Finish(toast, ToastGlyph.Error, Palette.Error, "Couldn't set up LibreOffice", ex is ConversionException ? ex.Message : "Check your connection and try again.", 15);
+            throw;
         }
     }
 

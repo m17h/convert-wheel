@@ -1,15 +1,27 @@
+using System.Diagnostics;
 using System.IO.Compression;
 using System.Net.Http;
+using System.Text.RegularExpressions;
 
 namespace ConvertWheel.Conversion;
 
-/// <summary>Finds FFmpeg and LibreOffice, and can fetch FFmpeg on first use.</summary>
-public sealed class ToolLocator(AppSettings settings)
+/// <summary>Finds FFmpeg and LibreOffice, and can fetch either into the app's private tools folder.</summary>
+public sealed partial class ToolLocator(AppSettings settings)
 {
-    const string FfmpegZipUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip";
-    public const string LibreOfficeUrl = "https://www.libreoffice.org/download/download-libreoffice/";
+    // gyan.dev's "essentials" build has every codec we use at roughly half the size of the full builds.
+    static readonly string[] FfmpegZipUrls =
+    [
+        "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
+        "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip",
+    ];
+    const string LibreOfficeIndexUrl = "https://download.documentfoundation.org/libreoffice/stable/";
+    const string LibreOfficeFallbackVersion = "26.8.1";
+
+    public const int FfmpegDownloadMb = 110;
+    public const int LibreOfficeDownloadMb = 360;
 
     public static string ToolsDir { get; } = Path.Combine(Log.DataDir, "tools");
+    static string LibreOfficeDir => Path.Combine(ToolsDir, "LibreOffice");
 
     public string? FindFfmpeg()
     {
@@ -34,6 +46,7 @@ public sealed class ToolLocator(AppSettings settings)
             candidates.Add(key?.GetValue(null) as string);
         }
         catch { }
+        candidates.Add(Path.Combine(LibreOfficeDir, "program", "soffice.exe"));
         candidates.AddRange(SearchPath("soffice.exe"));
         return candidates.FirstOrDefault(p => !string.IsNullOrWhiteSpace(p) && File.Exists(p));
     }
@@ -56,30 +69,29 @@ public sealed class ToolLocator(AppSettings settings)
         }
     }
 
-    /// <summary>Downloads the FFmpeg build and extracts just ffmpeg.exe into the tools folder.</summary>
+    /// <summary>Downloads an FFmpeg build and extracts just ffmpeg.exe into the tools folder.</summary>
     public async Task<string> DownloadFfmpegAsync(IProgress<double?> progress, CancellationToken ct)
     {
         Directory.CreateDirectory(ToolsDir);
         var zipPath = Path.Combine(ToolsDir, "ffmpeg-download.zip");
         try
         {
-            using (var http = new HttpClient { Timeout = TimeSpan.FromMinutes(30) })
-            using (var response = await http.GetAsync(FfmpegZipUrl, HttpCompletionOption.ResponseHeadersRead, ct))
+            Exception? last = null;
+            foreach (var url in FfmpegZipUrls)
             {
-                response.EnsureSuccessStatusCode();
-                long? total = response.Content.Headers.ContentLength;
-                await using var input = await response.Content.ReadAsStreamAsync(ct);
-                await using var output = File.Create(zipPath);
-                var buffer = new byte[1 << 16];
-                long read = 0;
-                int n;
-                while ((n = await input.ReadAsync(buffer, ct)) > 0)
+                try
                 {
-                    await output.WriteAsync(buffer.AsMemory(0, n), ct);
-                    read += n;
-                    progress.Report(total > 0 ? (double)read / total.Value : null);
+                    await DownloadAsync(url, zipPath, progress, ct);
+                    last = null;
+                    break;
+                }
+                catch (Exception ex) when (ex is HttpRequestException or IOException or TaskCanceledException && !ct.IsCancellationRequested)
+                {
+                    Log.Write($"FFmpeg download from {url} failed: {ex.Message}");
+                    last = ex;
                 }
             }
+            if (last != null) throw last;
 
             progress.Report(null);
             var target = Path.Combine(ToolsDir, "ffmpeg.exe");
@@ -97,4 +109,85 @@ public sealed class ToolLocator(AppSettings settings)
             try { File.Delete(zipPath); } catch { }
         }
     }
+
+    /// <summary>
+    /// Downloads the official LibreOffice installer and unpacks it into the tools folder with an
+    /// administrative extract: nothing is installed system-wide and no admin rights are needed.
+    /// </summary>
+    public static async Task<string> DownloadLibreOfficeAsync(IProgress<double?> progress, CancellationToken ct)
+    {
+        Directory.CreateDirectory(ToolsDir);
+        var msi = Path.Combine(ToolsDir, "libreoffice-download.msi");
+        var staging = Path.Combine(ToolsDir, "LibreOffice-unpacking");
+        try
+        {
+            var version = await LatestLibreOfficeVersionAsync(ct);
+            var url = $"{LibreOfficeIndexUrl}{version}/win/x86_64/LibreOffice_{version}_Win_x86-64.msi";
+            await DownloadAsync(url, msi, progress, ct);
+
+            progress.Report(null);
+            if (Directory.Exists(staging)) Directory.Delete(staging, recursive: true);
+            var psi = new ProcessStartInfo("msiexec.exe") { UseShellExecute = false, CreateNoWindow = true };
+            foreach (var arg in new[] { "/a", msi, "/qn", $"TARGETDIR={staging}" }) psi.ArgumentList.Add(arg);
+            using (var process = Process.Start(psi)!)
+            {
+                await process.WaitForExitAsync(ct);
+                if (process.ExitCode != 0) throw new ConversionException($"Unpacking LibreOffice failed (error {process.ExitCode}).");
+            }
+
+            var soffice = Directory.EnumerateFiles(staging, "soffice.exe", SearchOption.AllDirectories).FirstOrDefault()
+                ?? throw new ConversionException("The LibreOffice download didn't contain soffice.exe.");
+            var root = Path.GetDirectoryName(Path.GetDirectoryName(soffice)!)!; // ...\program\soffice.exe -> install root
+            if (Directory.Exists(LibreOfficeDir)) Directory.Delete(LibreOfficeDir, recursive: true);
+            Directory.Move(root, LibreOfficeDir);
+            return FindLibreOffice() ?? throw new ConversionException("LibreOffice couldn't be set up.");
+        }
+        finally
+        {
+            try { File.Delete(msi); } catch { }
+            try { if (Directory.Exists(staging)) Directory.Delete(staging, recursive: true); } catch { }
+        }
+    }
+
+    static async Task<string> LatestLibreOfficeVersionAsync(CancellationToken ct)
+    {
+        try
+        {
+            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
+            var html = await http.GetStringAsync(LibreOfficeIndexUrl, ct);
+            var latest = VersionLinkRegex().Matches(html)
+                .Select(m => Version.TryParse(m.Groups[1].Value, out var v) ? v : null)
+                .Where(v => v != null)
+                .Max();
+            if (latest != null) return latest.ToString();
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException && !ct.IsCancellationRequested)
+        {
+            Log.Write($"Couldn't look up the latest LibreOffice version: {ex.Message}");
+        }
+        return LibreOfficeFallbackVersion;
+    }
+
+    static async Task DownloadAsync(string url, string path, IProgress<double?> progress, CancellationToken ct)
+    {
+        using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(30) };
+        http.DefaultRequestHeaders.UserAgent.ParseAdd("ConvertWheel/1.0");
+        using var response = await http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct);
+        response.EnsureSuccessStatusCode();
+        long? total = response.Content.Headers.ContentLength;
+        await using var input = await response.Content.ReadAsStreamAsync(ct);
+        await using var output = File.Create(path);
+        var buffer = new byte[1 << 16];
+        long read = 0;
+        int n;
+        while ((n = await input.ReadAsync(buffer, ct)) > 0)
+        {
+            await output.WriteAsync(buffer.AsMemory(0, n), ct);
+            read += n;
+            progress.Report(total > 0 ? (double)read / total.Value : null);
+        }
+    }
+
+    [GeneratedRegex(@"href=""(\d+\.\d+\.\d+)/""")]
+    private static partial Regex VersionLinkRegex();
 }

@@ -135,6 +135,15 @@
             <TextBlock Text="CONVERTERS" Style="{StaticResource SectionTitle}" />
             <Border Style="{StaticResource Card}">
                 <StackPanel>
+                    <TextBlock Text="Built in, nothing to download" Style="{StaticResource Body}" />
+                    <TextBlock Style="{StaticResource Hint}"
+                               Text="PNG, JPG, BMP, GIF, TIFF and ICO images. Word (.docx), OpenDocument, RTF and text documents to PDF, DOCX, ODT, RTF, TXT and HTML. Excel, OpenDocument and CSV spreadsheets to XLSX, ODS, CSV, PDF and HTML." />
+                    <Border Style="{StaticResource Divider}" />
+                    <StackPanel>
+                        <TextBlock Text="Microsoft Office" Style="{StaticResource Body}" />
+                        <TextBlock x:Name="OfficeStatus" Style="{StaticResource Hint}" />
+                    </StackPanel>
+                    <Border Style="{StaticResource Divider}" />
                     <Grid>
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="*" />
@@ -156,14 +165,11 @@
                             <ColumnDefinition Width="Auto" />
                         </Grid.ColumnDefinitions>
                         <StackPanel VerticalAlignment="Center" Margin="0,0,12,0">
-                            <TextBlock Text="LibreOffice (documents, spreadsheets, slides)" Style="{StaticResource Body}" />
+                            <TextBlock Text="LibreOffice (optional)" Style="{StaticResource Body}" />
                             <TextBlock x:Name="LibreOfficeStatus" Style="{StaticResource Hint}" />
                         </StackPanel>
-                        <Button x:Name="LibreOfficeButton" Grid.Column="1" Content="Get LibreOffice" Click="OnGetLibreOffice" VerticalAlignment="Center" />
+                        <Button x:Name="LibreOfficeButton" Grid.Column="1" Content="Download" Click="OnGetLibreOffice" VerticalAlignment="Center" />
                     </Grid>
-                    <Border Style="{StaticResource Divider}" />
-                    <TextBlock Style="{StaticResource Hint}" Margin="0"
-                               Text="PNG, JPG, BMP, GIF, TIFF and ICO images are converted with Windows' built-in imaging and need nothing extra." />
                 </StackPanel>
             </Border>
 
