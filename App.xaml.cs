@@ -121,7 +121,7 @@ public partial class App : Application
             var target = plan.All.FirstOrDefault(f => f.Ext == Formats.Canonical(ext.TrimStart('.').ToLowerInvariant()))
                 ?? throw new ConversionException($"Can't convert {plan.SourceExt} to {ext}.");
             var output = await new Converter(settings).ConvertAsync(plan, target,
-                async () => tools.FindFfmpeg() ?? await tools.DownloadFfmpegAsync(new Progress<double?>(), CancellationToken.None),
+                () => Task.FromResult(tools.FindFfmpeg() ?? throw new ToolMissingException("FFmpeg")),
                 new Progress<double?>(), CancellationToken.None);
             Console.WriteLine(output);
             exitCode = 0;

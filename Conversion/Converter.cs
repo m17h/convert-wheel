@@ -20,7 +20,6 @@ public sealed class ToolMissingException(string tool) : Exception($"{tool} is no
 /// </summary>
 public sealed partial class Converter(AppSettings settings)
 {
-    static readonly HashSet<string> WicTargets = ["png", "jpg", "bmp", "tiff", "gif", "ico"];
 
     public async Task<string> ConvertAsync(
         ConversionPlan plan, FormatInfo target, Func<Task<string>> ensureFfmpeg, IProgress<double?> progress, CancellationToken ct)
@@ -32,13 +31,15 @@ public sealed partial class Converter(AppSettings settings)
             {
                 await DocumentAsync(plan, target, output, ct);
             }
-            else if (plan.SourceKind == FormatKind.Image && WicTargets.Contains(target.Ext) &&
-                     await RunSta(() => ImageConverter.TryConvert(plan.SourcePath, output, target.Ext)))
+            else if (await RunSta(() => BuiltInMedia(plan, target, output, progress, ct)))
             {
-                // Done by Windows imaging.
+                // Done by the built-in engines (Windows codecs plus bundled open-source ones).
             }
             else
             {
+                // Rare formats only: FFmpeg is an optional download.
+                if (Environment.GetEnvironmentVariable("CONVERTWHEEL_MEDIA_ENGINE") == "built-in")
+                    throw new ConversionException("Built-in engine failed (FFmpeg fallback disabled for testing).");
                 await FfmpegAsync(await ensureFfmpeg(), plan, target, output, progress, ct);
             }
             progress.Report(1);
@@ -49,6 +50,38 @@ public sealed partial class Converter(AppSettings settings)
             TryDelete(output);
             throw;
         }
+    }
+
+    /// <summary>
+    /// Tries the converters that ship with the app. Returns false (after cleaning up) when the format or
+    /// codec is beyond them, so the caller can fall back to FFmpeg.
+    /// </summary>
+    static bool BuiltInMedia(ConversionPlan plan, FormatInfo target, string output, IProgress<double?> progress, CancellationToken ct)
+    {
+        if (Environment.GetEnvironmentVariable("CONVERTWHEEL_MEDIA_ENGINE") == "ffmpeg") return false;
+        try
+        {
+            if (plan.SourceKind == FormatKind.Image && ImageConverter.TryConvert(plan.SourcePath, output, target.Ext)) return true;
+            if (plan.SourceKind is FormatKind.Audio or FormatKind.Video && target.Kind == FormatKind.Audio && Media.AudioEngine.CanEncode(target.Ext))
+            {
+                Media.AudioEngine.Convert(plan.SourcePath, output, target.Ext, progress, ct);
+                return true;
+            }
+            if (Media.VideoEngine.CanConvert(plan, target))
+            {
+                Media.VideoEngine.Convert(plan, target, output, progress, ct);
+                return true;
+            }
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (ConversionException) { throw; }
+        catch (Exception ex)
+        {
+            Log.Write($"Built-in engine couldn't convert {plan.SourcePath} to {target.Ext}: {ex.Message}");
+        }
+        // Leave an empty reserved file for the next engine to overwrite.
+        try { using (File.Create(output)) { } } catch { }
+        return false;
     }
 
     string ReserveOutputPath(string input, string ext)

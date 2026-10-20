@@ -5,27 +5,32 @@ using System.Windows.Media.Imaging;
 
 namespace ConvertWheel.Conversion;
 
-/// <summary>Still-image conversion through Windows' built-in codecs (no FFmpeg needed). Must run on an STA thread.</summary>
+/// <summary>
+/// Image conversion through Windows' built-in codecs, with Skia (bundled) for WebP and for images
+/// Windows can't read. Must run on an STA thread.
+/// </summary>
 internal static class ImageConverter
 {
-    /// <returns>false if Windows can't decode the source, so the caller can fall back to FFmpeg.</returns>
+    /// <returns>false if neither Windows nor Skia can handle it, so the caller can fall back to FFmpeg.</returns>
     public static bool TryConvert(string input, string output, string ext)
     {
-        BitmapSource image;
-        try
+        // Animated GIFs stay animated as WebP.
+        if (ext == "webp" && Path.GetExtension(input).Equals(".gif", StringComparison.OrdinalIgnoreCase))
         {
-            using var stream = File.OpenRead(input);
-            var decoder = BitmapDecoder.Create(stream, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnLoad);
-            image = new FormatConvertedBitmap(Orient(decoder.Frames[0]), PixelFormats.Bgra32, null, 0);
-            image.Freeze();
+            var frames = Media.GifReader.Read(input);
+            if (frames.Count > 1)
+            {
+                WebP.WriteAnimated(frames, output);
+                return true;
+            }
         }
-        catch (Exception ex) when (ex is NotSupportedException or FileFormatException or COMException or ArgumentException or InvalidOperationException)
-        {
-            return false;
-        }
+
+        var image = Decode(input);
+        if (image == null) return false;
 
         switch (ext)
         {
+            case "webp": File.WriteAllBytes(output, WebP.Encode(image, quality: 90)); break;
             case "png": Save(new PngBitmapEncoder(), image, output); break;
             case "gif": Save(new GifBitmapEncoder(), image, output); break;
             case "tiff": Save(new TiffBitmapEncoder { Compression = TiffCompressOption.Lzw }, image, output); break;
@@ -35,6 +40,23 @@ internal static class ImageConverter
             default: return false;
         }
         return true;
+    }
+
+    /// <summary>Decodes with Windows imaging (honouring EXIF orientation), falling back to Skia.</summary>
+    static BitmapSource? Decode(string input)
+    {
+        try
+        {
+            using var stream = File.OpenRead(input);
+            var decoder = BitmapDecoder.Create(stream, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnLoad);
+            var image = new FormatConvertedBitmap(Orient(decoder.Frames[0]), PixelFormats.Bgra32, null, 0);
+            image.Freeze();
+            return image;
+        }
+        catch (Exception ex) when (ex is NotSupportedException or FileFormatException or COMException or ArgumentException or InvalidOperationException)
+        {
+            return WebP.DecodeWithSkia(input);
+        }
     }
 
     static void Save(BitmapEncoder encoder, BitmapSource image, string output)

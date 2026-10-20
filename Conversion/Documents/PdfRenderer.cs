@@ -22,35 +22,205 @@ internal static class PdfRenderer
         GlobalFontSettings.FontResolver = WindowsFontResolver.Instance;
     }
 
-    public static void Render(DDocument doc, string output) => Render(FlowBridge.ToFlow(doc), output, doc.Title);
-
-    public static void Render(FlowDocument flow, string output, string? title)
+    /// <summary>
+    /// Renders a document: WPF lays out the body (footnotes and wrapped floats included); then each page
+    /// gets its header/footer (with live page numbers) and any behind/in-front pictures painted around it.
+    /// </summary>
+    public static void Render(DDocument doc, string output)
     {
+        var ctx = new FlowBridge.FlowContext(doc);
+        var flow = FlowBridge.ToFlow(ctx);
         var pdf = new PdfDocument();
-        if (!string.IsNullOrEmpty(title)) pdf.Info.Title = title;
+        if (!string.IsNullOrEmpty(doc.Title)) pdf.Info.Title = doc.Title;
         pdf.Info.Creator = "Convert Wheel";
 
-        var paginator = ((IDocumentPaginatorSource)flow).DocumentPaginator;
-        paginator.PageSize = new Size(flow.PageWidth, flow.PageHeight);
-        paginator.ComputePageCount();
+        var paginator = Paginate(flow);
+
+        // Footnotes: a first layout shows which page each reference lands on; the final layout then gives
+        // each page one block holding its notes in order.
+        var footnotes = ctx.NoteAnchors.Where(kv => !kv.Key.Endnote).ToList();
+        if (footnotes.Count > 1)
+        {
+            var pagesOfNotes = footnotes.ToDictionary(kv => kv.Key, kv => PageOf(paginator, kv.Value));
+            ctx = new FlowBridge.FlowContext(doc) { NotePages = pagesOfNotes };
+            flow = FlowBridge.ToFlow(ctx);
+            paginator = Paginate(flow);
+        }
+        int pages = paginator.PageCount;
+
+        // Which page each overlay belongs to: the page holding its anchor.
+        var overlays = ctx.Overlays.Select(o => (o.Float, page: PageOf(paginator, o.Anchor))).ToList();
 
         var images = new Dictionary<ImageSource, XImage>();
-        for (int i = 0; i < paginator.PageCount; i++)
+        for (int i = 0; i < pages; i++)
         {
             using var page = paginator.GetPage(i);
             var pdfPage = pdf.AddPage();
-            pdfPage.Width = XUnit.FromPoint(Units.ToPoints(flow.PageWidth));
-            pdfPage.Height = XUnit.FromPoint(Units.ToPoints(flow.PageHeight));
+            pdfPage.Width = XUnit.FromPoint(doc.PageWidth);
+            pdfPage.Height = XUnit.FromPoint(doc.PageHeight);
             using var gfx = XGraphics.FromPdfPage(pdfPage);
             gfx.ScaleTransform(72.0 / 96.0); // draw in WPF device-independent pixels
-            new PageWriter(gfx, images).Visual(page.Visual, Matrix.Identity);
+            var writer = new PageWriter(gfx, images);
+            var here = overlays.Where(o => o.page == i).Select(o => o.Float).ToList();
+
+            foreach (var f in here.Where(f => f.Wrap == FloatWrap.Behind)) DrawFloat(writer, doc, ctx, f, Units.ToDip(doc.Margins.Top));
+            writer.Visual(page.Visual, Matrix.Identity);
+            foreach (var f in here.Where(f => f.Wrap != FloatWrap.Behind)) DrawFloat(writer, doc, ctx, f, Units.ToDip(doc.Margins.Top));
+
+            var (header, footer) = doc.HeaderFooterFor(i + 1);
+            DrawHeaderFooter(writer, doc, header, i + 1, pages, isHeader: true);
+            DrawHeaderFooter(writer, doc, footer, i + 1, pages, isHeader: false);
         }
         if (pdf.PageCount == 0) pdf.AddPage();
         pdf.Save(output);
     }
 
+    /// <summary>
+    /// The area actually painted (text, pictures, visible lines and fills). WPF's own bounds include the
+    /// invisible page rectangle, which is useless for measuring a header or footer.
+    /// </summary>
+    static Rect InkBounds(Visual visual, Matrix parent)
+    {
+        var local = VisualTreeHelper.GetTransform(visual)?.Value ?? Matrix.Identity;
+        var offset = VisualTreeHelper.GetOffset(visual);
+        local.Translate(offset.X, offset.Y);
+        var matrix = local * parent;
+        var bounds = Rect.Empty;
+        if (VisualTreeHelper.GetDrawing(visual) is { } drawing) bounds.Union(InkBounds(drawing, matrix));
+        for (int i = 0; i < VisualTreeHelper.GetChildrenCount(visual); i++)
+            if (VisualTreeHelper.GetChild(visual, i) is Visual child) bounds.Union(InkBounds(child, matrix));
+        return bounds;
+    }
+
+    static Rect InkBounds(Drawing drawing, Matrix matrix)
+    {
+        static bool Visible(Brush? b) => b is SolidColorBrush { Color.A: > 0 } || b is GradientBrush or ImageBrush;
+        var bounds = Rect.Empty;
+        switch (drawing)
+        {
+            case DrawingGroup group:
+                var m = (group.Transform?.Value ?? Matrix.Identity) * matrix;
+                foreach (var child in group.Children) bounds.Union(InkBounds(child, m));
+                return bounds;
+            case GlyphRunDrawing or ImageDrawing:
+                bounds = drawing.Bounds;
+                break;
+            case GeometryDrawing g when Visible(g.Brush) || (g.Pen != null && Visible(g.Pen.Brush)):
+                bounds = drawing.Bounds;
+                break;
+            default:
+                return Rect.Empty;
+        }
+        if (!bounds.IsEmpty) bounds.Transform(matrix);
+        return bounds;
+    }
+
+    static DynamicDocumentPaginator Paginate(FlowDocument flow)
+    {
+        var paginator = (DynamicDocumentPaginator)((IDocumentPaginatorSource)flow).DocumentPaginator;
+        paginator.PageSize = new Size(flow.PageWidth, flow.PageHeight);
+        paginator.ComputePageCount();
+        return paginator;
+    }
+
+    static int PageOf(DynamicDocumentPaginator paginator, TextElement element)
+    {
+        try { return paginator.GetPageNumber(paginator.GetObjectPosition(element)); }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException) { return 0; }
+    }
+
+    static void DrawHeaderFooter(PageWriter writer, DDocument doc, DHeaderFooter? part, int page, int pages, bool isHeader)
+    {
+        if (part == null || part.IsEmpty) return;
+        var ctx = new FlowBridge.FlowContext(doc) { Page = page, Pages = pages, AllFloatsAsOverlays = true };
+        var (visual, height) = Layout(FlowBridge.PartFlow(ctx, part.Blocks, doc.ContentWidth));
+        using (visual)
+        {
+            double top = isHeader ? Units.ToDip(doc.HeaderDistance) : Units.ToDip(doc.PageHeight - doc.FooterDistance) - height;
+            foreach (var f in ctx.Overlays.Select(o => o.Float).Where(f => f.Wrap == FloatWrap.Behind)) DrawFloat(writer, doc, ctx, f, top);
+            var m = Matrix.Identity;
+            m.Translate(Units.ToDip(doc.Margins.Left), top);
+            writer.Visual(visual.Visual, m);
+            foreach (var f in ctx.Overlays.Select(o => o.Float).Where(f => f.Wrap != FloatWrap.Behind)) DrawFloat(writer, doc, ctx, f, top);
+        }
+    }
+
+    /// <summary>Lays out a small flow (header, text box) on one page and measures how tall its content is.</summary>
+    static (DocumentPage page, double height) Layout(FlowDocument flow)
+    {
+        var paginator = ((IDocumentPaginatorSource)flow).DocumentPaginator;
+        paginator.PageSize = new Size(flow.PageWidth, flow.PageHeight);
+        var page = paginator.GetPage(0);
+        var bounds = InkBounds(page.Visual, Matrix.Identity);
+        return (page, bounds.IsEmpty ? 0 : bounds.Bottom + flow.PagePadding.Bottom);
+    }
+
+    /// <summary>Paints a positioned picture or text box at its place on the page (sizes in points, drawing in DIPs).</summary>
+    static void DrawFloat(PageWriter writer, DDocument doc, FlowBridge.FlowContext ctx, DFloat f, double paragraphTop)
+    {
+        double w = Units.ToDip(f.Width), h = Units.ToDip(f.Height);
+        double pageW = Units.ToDip(doc.PageWidth), pageH = Units.ToDip(doc.PageHeight);
+        var m = doc.Margins;
+        var (left, areaW) = f.HorizontalFrom == FloatFrom.Page ? (0.0, pageW) : (Units.ToDip(m.Left), Units.ToDip(doc.ContentWidth));
+        var (top, areaH) = f.VerticalFrom switch
+        {
+            FloatFrom.Page => (0.0, pageH),
+            FloatFrom.Margin => (Units.ToDip(m.Top), pageH - Units.ToDip(m.Top + m.Bottom)),
+            _ => (paragraphTop, pageH - paragraphTop),
+        };
+        double x = f.HorizontalAlign switch
+        {
+            FloatAlign.Start => left,
+            FloatAlign.Center => left + (areaW - w) / 2,
+            FloatAlign.End => left + areaW - w,
+            _ => left + Units.ToDip(f.X),
+        };
+        double y = f.VerticalAlign switch
+        {
+            FloatAlign.Start => top,
+            FloatAlign.Center => top + (areaH - h) / 2,
+            FloatAlign.End => top + areaH - h,
+            _ => top + Units.ToDip(f.Y),
+        };
+
+        var rect = new Rect(x, y, w, h);
+        writer.Box(rect, f.Fill, f.Border);
+        if (f.Image != null && FlowBridge.Decode(f.Image.Data) is { } source) writer.Picture(source, rect);
+        if (f.Blocks.Count > 0)
+        {
+            var inner = new FlowBridge.FlowContext(doc) { Page = ctx.Page, Pages = ctx.Pages };
+            var (visual, _) = Layout(FlowBridge.PartFlow(inner, f.Blocks, f.Width, new Thickness(7.2, 3.6, 7.2, 3.6)));
+            using (visual)
+            {
+                var t = Matrix.Identity;
+                t.Translate(x, y);
+                writer.Visual(visual.Visual, t);
+            }
+        }
+    }
+
     sealed class PageWriter(XGraphics gfx, Dictionary<ImageSource, XImage> images)
     {
+        public void Box(Rect rect, Color? fill, Color? border)
+        {
+            if (fill == null && border == null) return;
+            var brush = fill is { } f ? new XSolidBrush(XColor.FromArgb(f.A, f.R, f.G, f.B)) : null;
+            var pen = border is { } b ? new XPen(XColor.FromArgb(b.A, b.R, b.G, b.B), 1) : null;
+            if (pen != null && brush != null) gfx.DrawRectangle(pen, brush, rect.X, rect.Y, rect.Width, rect.Height);
+            else if (brush != null) gfx.DrawRectangle(brush, rect.X, rect.Y, rect.Width, rect.Height);
+            else gfx.DrawRectangle(pen!, rect.X, rect.Y, rect.Width, rect.Height);
+        }
+
+        public void Picture(BitmapSource source, Rect rect)
+        {
+            if (!images.TryGetValue(source, out var image))
+            {
+                image = XImage.FromStream(Encode(source));
+                images[source] = image;
+            }
+            gfx.DrawImage(image, rect.X, rect.Y, rect.Width, rect.Height);
+        }
+
         public void Visual(Visual visual, Matrix parent)
         {
             var local = VisualTreeHelper.GetTransform(visual)?.Value ?? Matrix.Identity;

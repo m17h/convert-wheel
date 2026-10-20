@@ -14,6 +14,9 @@
     <Product>Convert Wheel</Product>
     <Version>1.0.0</Version>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- Single-file publish: also embed native libraries (Skia), extracted on first run. -->
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
     <!-- WPF reads DPI awareness from app.manifest; the WinForms tray menu follows it. -->
     <NoWarn>$(NoWarn);WFO0003</NoWarn>
   </PropertyGroup>
@@ -30,9 +33,19 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="Concentus" Version="2.2.2" />
+    <PackageReference Include="Concentus.Oggfile" Version="1.0.7" />
     <PackageReference Include="ExcelDataReader" Version="3.9.0" />
+    <PackageReference Include="NVorbis" Version="0.10.5" />
+    <PackageReference Include="OggVorbisEncoder" Version="1.2.2" />
     <!-- Pinned: 6.2.x is the last MIT-licensed PDFsharp; later versions are AGPL. -->
     <PackageReference Include="PDFsharp" Version="6.2.4" />
+    <PackageReference Include="SkiaSharp" Version="4.153.1" />
   </ItemGroup>
+
+  <!-- SkiaSharp's package ships a ~96 MB native debug-symbols file; it isn't needed to run. -->
+  <Target Name="DropSkiaSymbols" AfterTargets="Publish">
+    <Delete Files="$(PublishDir)libSkiaSharp.pdb" />
+  </Target>
 
 </Project>

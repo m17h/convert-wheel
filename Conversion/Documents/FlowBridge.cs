@@ -17,35 +17,70 @@ internal static class FlowBridge
 
     // ------------------------------------------------------------------ model -> FlowDocument
 
-    /// <param name="forRtf">RTF can't hold WPF controls, so list markers become plain text.</param>
-    public static FlowDocument ToFlow(DDocument doc, bool forRtf = false)
+    /// <summary>A float the PDF renderer paints itself (behind or in front of the text) once pages are laid out.</summary>
+    internal sealed record Overlay(DFloat Float, TextElement Anchor);
+
+    /// <summary>State for one conversion to a FlowDocument.</summary>
+    internal sealed class FlowContext(DDocument doc)
     {
-        var flow = new FlowDocument
-        {
-            FontFamily = Family(doc.Font),
-            FontSize = Units.ToDip(doc.FontSize),
-            PageWidth = Units.ToDip(doc.PageWidth),
-            PageHeight = Units.ToDip(doc.PageHeight),
-            PagePadding = new Thickness(Units.ToDip(doc.Margins.Left), Units.ToDip(doc.Margins.Top),
-                Units.ToDip(doc.Margins.Right), Units.ToDip(doc.Margins.Bottom)),
-            ColumnWidth = double.PositiveInfinity,
-            TextAlignment = TextAlignment.Left,
-            Foreground = Brushes.Black,
-            Background = Brushes.White,
-        };
-        foreach (var block in doc.Blocks) flow.Blocks.Add(ToBlock(block, doc, doc.ContentWidth, forRtf));
+        public DDocument Doc { get; } = doc;
+        /// <summary>RTF can't hold WPF controls or figures, so list markers become text and notes go to the end.</summary>
+        public bool ForRtf { get; init; }
+        /// <summary>Page number and count, for page fields in headers and footers.</summary>
+        public int Page { get; init; } = 1;
+        public int Pages { get; init; } = 1;
+        /// <summary>In headers/footers every float is painted as an overlay at its page position.</summary>
+        public bool AllFloatsAsOverlays { get; init; }
+        public List<Overlay> Overlays { get; } = [];
+        public List<DNote> Endnotes { get; } = [];
+        /// <summary>The reference mark of each footnote, so a first layout pass can find which page it landed on.</summary>
+        public Dictionary<DNote, TextElement> NoteAnchors { get; } = [];
+        /// <summary>From a first pass: the page of each footnote. Notes sharing a page are then laid out together.</summary>
+        public Dictionary<DNote, int>? NotePages { get; init; }
+    }
+
+    public static FlowDocument ToFlow(DDocument doc, bool forRtf = false) => ToFlow(new FlowContext(doc) { ForRtf = forRtf });
+
+    public static FlowDocument ToFlow(FlowContext ctx)
+    {
+        var doc = ctx.Doc;
+        var flow = NewFlow(doc, doc.PageWidth, doc.PageHeight, doc.Margins);
+        foreach (var block in doc.Blocks) flow.Blocks.Add(ToBlock(block, ctx, doc.ContentWidth));
+        AppendEndnotes(flow, ctx);
         return flow;
     }
 
-    static Block ToBlock(DBlock block, DDocument doc, double available, bool forRtf) => block switch
+    /// <summary>A header, footer or text box laid out on its own, <paramref name="width"/> points wide.</summary>
+    public static FlowDocument PartFlow(FlowContext ctx, IEnumerable<DBlock> blocks, double width, Thickness padding = default)
     {
-        DTable t => ToTable(t, doc, available, forRtf),
-        DParagraph p => ToParagraph(p, doc, available, forRtf),
+        var flow = NewFlow(ctx.Doc, width, ctx.Doc.PageHeight, padding);
+        foreach (var block in blocks) flow.Blocks.Add(ToBlock(block, ctx, width - padding.Left - padding.Right));
+        return flow;
+    }
+
+    static FlowDocument NewFlow(DDocument doc, double width, double height, Thickness margins) => new()
+    {
+        FontFamily = Family(doc.Font),
+        FontSize = Units.ToDip(doc.FontSize),
+        PageWidth = Units.ToDip(width),
+        PageHeight = Units.ToDip(height),
+        PagePadding = new Thickness(Units.ToDip(margins.Left), Units.ToDip(margins.Top), Units.ToDip(margins.Right), Units.ToDip(margins.Bottom)),
+        ColumnWidth = double.PositiveInfinity,
+        TextAlignment = TextAlignment.Left,
+        Foreground = Brushes.Black,
+        Background = null, // the PDF page is already white; a fill would hide what lies beneath and skew measurements
+    };
+
+    static Block ToBlock(DBlock block, FlowContext ctx, double available) => block switch
+    {
+        DTable t => ToTable(t, ctx, available),
+        DParagraph p => ToParagraph(p, ctx, available),
         _ => new Paragraph(),
     };
 
-    static Paragraph ToParagraph(DParagraph p, DDocument doc, double available, bool forRtf)
+    static Paragraph ToParagraph(DParagraph p, FlowContext ctx, double available)
     {
+        var doc = ctx.Doc;
         double baseSize = p.Inlines.OfType<DText>().Select(t => t.Style.Size ?? HeadingSize(p) ?? doc.FontSize).DefaultIfEmpty(p.MarkSize ?? doc.FontSize).Max();
         var para = new Paragraph
         {
@@ -65,7 +100,7 @@ internal static class FlowBridge
         if (p.ListLabel != null)
         {
             double hang = p.IndentFirst < 0 ? -p.IndentFirst : 18;
-            if (forRtf)
+            if (ctx.ForRtf)
             {
                 para.Inlines.Add(new Run(p.ListLabel + "\t"));
             }
@@ -102,23 +137,200 @@ internal static class FlowBridge
                 case DLineBreak:
                     para.Inlines.Add(new LineBreak());
                     break;
-                case DImage img when Decode(img.Data) is { } source:
-                    double scale = Math.Min(1, available / Math.Max(1, img.Width));
-                    var image = new Image
-                    {
-                        Source = source,
-                        Width = Units.ToDip(img.Width * scale),
-                        Height = Units.ToDip(img.Height * scale),
-                        Stretch = Stretch.Fill,
-                    };
+                case DImage img when ImageElement(img, available) is { } image:
                     para.Inlines.Add(new InlineUIContainer(image) { BaselineAlignment = BaselineAlignment.Baseline });
+                    break;
+                case DField f:
+                    para.Inlines.Add(Styled(new Run((f.Kind == FieldKind.Page ? ctx.Page : ctx.Pages).ToString()), f.Style, heading));
+                    break;
+                case DNote n:
+                    var noteMark = Styled(new Run(NoteMark(n)), n.Style with { Superscript = true }, heading);
+                    para.Inlines.Add(noteMark);
+                    ctx.NoteAnchors[n] = noteMark;
+                    if (n.Endnote || ctx.ForRtf) ctx.Endnotes.Add(n);
+                    else if (FootnotesToPlace(n, ctx) is { Count: > 0 } group) para.Inlines.Add(FootnoteFigure(group, ctx));
+                    break;
+                case DFloat f:
+                    AddFloat(para, f, ctx, available);
                     break;
             }
         }
 
-        if (para.Inlines.Count == 0)
-            para.Inlines.Add(new Run(forRtf ? "" : "​") { FontSize = Units.ToDip(p.MarkSize ?? doc.FontSize) });
+        if (para.Inlines.Count == 0 || para.Inlines.All(i => i is Figure or Floater))
+            para.Inlines.Add(new Run(ctx.ForRtf ? "" : "​") { FontSize = Units.ToDip(p.MarkSize ?? doc.FontSize) });
         return para;
+    }
+
+    internal static string NoteMark(DNote n) => n.Endnote ? ListLabels.Format(n.Number, "lowerRoman") : n.Number.ToString();
+
+    static Image? ImageElement(DImage img, double available)
+    {
+        if (Decode(img.Data) is not { } source) return null;
+        double scale = Math.Min(1, available / Math.Max(1, img.Width));
+        return new Image
+        {
+            Source = source,
+            Width = Units.ToDip(img.Width * scale),
+            Height = Units.ToDip(img.Height * scale),
+            Stretch = Stretch.Fill,
+        };
+    }
+
+    static BlockUIContainer NoteRule(double spaceBefore) => new(new System.Windows.Shapes.Rectangle
+    {
+        Width = Units.ToDip(144), Height = 0.75, Fill = Brushes.Black, HorizontalAlignment = HorizontalAlignment.Left,
+    })
+    { Margin = new Thickness(0, Units.ToDip(spaceBefore), 0, Units.ToDip(3)) };
+
+    /// <summary>Footnotes sit at the bottom of the page that references them, under a short rule.</summary>
+    /// <summary>
+    /// Without page information each note gets its own figure. With it, the first note on a page carries
+    /// all of that page's notes in order (others carry none), under a single separator.
+    /// </summary>
+    static List<DNote> FootnotesToPlace(DNote note, FlowContext ctx)
+    {
+        if (ctx.NotePages == null || !ctx.NotePages.TryGetValue(note, out int page)) return [note];
+        var group = ctx.NotePages.Where(kv => kv.Value == page).Select(kv => kv.Key).OrderBy(n => n.Number).ToList();
+        return group[0] == note ? group : [];
+    }
+
+    static Figure FootnoteFigure(List<DNote> notes, FlowContext ctx)
+    {
+        var figure = new Figure
+        {
+            VerticalAnchor = FigureVerticalAnchor.ContentBottom, // bottom of the text area, above the footer
+            HorizontalAnchor = FigureHorizontalAnchor.ContentLeft,
+            Width = new FigureLength(1, FigureUnitType.Content),
+            WrapDirection = WrapDirection.None,
+            Padding = new Thickness(0),
+            Margin = new Thickness(0, Units.ToDip(4), 0, 0),
+            CanDelayPlacement = false,
+        };
+        figure.Blocks.Add(NoteRule(0));
+        foreach (var note in notes)
+            foreach (var block in WithMark(note)) figure.Blocks.Add(ToBlock(block, ctx, ctx.Doc.ContentWidth));
+        return figure;
+    }
+
+    /// <summary>Notes from some formats don't repeat their number inside; add it so the note reads "1 Text…".</summary>
+    internal static List<DBlock> WithMark(DNote note)
+    {
+        var blocks = note.Blocks.ToList();
+        var mark = NoteMark(note);
+        if (blocks.FirstOrDefault() is DParagraph first && first.PlainText().TrimStart().StartsWith(mark)) return blocks;
+        var p = new DParagraph();
+        if (blocks.FirstOrDefault() is DParagraph original)
+        {
+            p = new DParagraph { Align = original.Align, SpaceAfter = original.SpaceAfter, MarkSize = original.MarkSize };
+            p.Inlines.AddRange(original.Inlines);
+            blocks[0] = p;
+        }
+        else blocks.Insert(0, p);
+        p.Inlines.Insert(0, new DText(mark + " ", TextStyle.Plain with { Superscript = true }));
+        return blocks;
+    }
+
+    /// <summary>
+    /// For formats that draw the note number themselves (Word, ODF, RTF, the HTML notes list): the note
+    /// content without a number the source spelled out at its start.
+    /// </summary>
+    internal static List<DBlock> WithoutMark(DNote note)
+    {
+        var blocks = note.Blocks.ToList();
+        if (blocks.FirstOrDefault() is DParagraph p && p.Inlines.FirstOrDefault() is DText { Style.Superscript: true } t &&
+            t.Text.Trim() == NoteMark(note))
+        {
+            var copy = new DParagraph { Align = p.Align, SpaceAfter = p.SpaceAfter, SpaceBefore = p.SpaceBefore, MarkSize = p.MarkSize };
+            copy.Inlines.AddRange(p.Inlines.Skip(1));
+            if (copy.Inlines.FirstOrDefault() is DText next) copy.Inlines[0] = new DText(next.Text.TrimStart(), next.Style, next.Link);
+            blocks[0] = copy;
+        }
+        return blocks;
+    }
+
+    static void AppendEndnotes(FlowDocument flow, FlowContext ctx)
+    {
+        if (ctx.Endnotes.Count == 0) return;
+        if (!ctx.ForRtf) flow.Blocks.Add(NoteRule(12));
+        var notes = ctx.Endnotes.ToList();
+        ctx.Endnotes.Clear();
+        foreach (var note in notes)
+            foreach (var block in WithMark(note)) flow.Blocks.Add(ToBlock(block, ctx, ctx.Doc.ContentWidth));
+    }
+
+    static void AddFloat(Paragraph para, DFloat f, FlowContext ctx, double available)
+    {
+        if (ctx.ForRtf)
+        {
+            // RTF output keeps the picture (inline) and a text box's text.
+            if (f.Image != null && ImageElement(f.Image, available) is { } image) para.Inlines.Add(new InlineUIContainer(image));
+            foreach (var p in f.Blocks.OfType<DParagraph>())
+            {
+                para.Inlines.Add(new LineBreak());
+                para.Inlines.Add(new Run(p.PlainText()));
+            }
+            return;
+        }
+        // Floats that sit behind/in front of the text at a page position are painted by the PDF renderer;
+        // a zero-width anchor tells it which page they belong to.
+        if (ctx.AllFloatsAsOverlays || (f.Wrap is FloatWrap.Behind or FloatWrap.InFront && f.VerticalFrom != FloatFrom.Paragraph))
+        {
+            var anchor = new Run("​");
+            para.Inlines.Add(anchor);
+            ctx.Overlays.Add(new Overlay(f, anchor));
+            return;
+        }
+        para.Inlines.Add(FloatFigure(f, ctx));
+    }
+
+    static Figure FloatFigure(DFloat f, FlowContext ctx)
+    {
+        bool textBox = f.Image == null;
+        var figure = new Figure
+        {
+            Width = new FigureLength(Units.ToDip(f.Width)),
+            Height = new FigureLength(Units.ToDip(f.Height)),
+            Padding = textBox ? new Thickness(Units.ToDip(7.2), Units.ToDip(3.6), Units.ToDip(7.2), Units.ToDip(3.6)) : new Thickness(0),
+            Margin = new Thickness(0),
+            CanDelayPlacement = false,
+            WrapDirection = f.Wrap == FloatWrap.TopAndBottom ? WrapDirection.None : WrapDirection.Both,
+            HorizontalAnchor = (f.HorizontalFrom, f.HorizontalAlign) switch
+            {
+                (FloatFrom.Page, FloatAlign.Center) => FigureHorizontalAnchor.PageCenter,
+                (FloatFrom.Page, FloatAlign.End) => FigureHorizontalAnchor.PageRight,
+                (FloatFrom.Page, _) => FigureHorizontalAnchor.PageLeft,
+                (FloatFrom.Margin, FloatAlign.Center) => FigureHorizontalAnchor.ContentCenter,
+                (FloatFrom.Margin, FloatAlign.End) => FigureHorizontalAnchor.ContentRight,
+                (FloatFrom.Margin, _) => FigureHorizontalAnchor.ContentLeft,
+                (_, FloatAlign.Center) => FigureHorizontalAnchor.ColumnCenter,
+                (_, FloatAlign.End) => FigureHorizontalAnchor.ColumnRight,
+                _ => FigureHorizontalAnchor.ColumnLeft,
+            },
+            VerticalAnchor = (f.VerticalFrom, f.VerticalAlign) switch
+            {
+                (FloatFrom.Page, FloatAlign.Center) => FigureVerticalAnchor.PageCenter,
+                (FloatFrom.Page, FloatAlign.End) => FigureVerticalAnchor.PageBottom,
+                (FloatFrom.Page, _) => FigureVerticalAnchor.PageTop,
+                (FloatFrom.Margin, FloatAlign.Center) => FigureVerticalAnchor.ContentCenter,
+                (FloatFrom.Margin, FloatAlign.End) => FigureVerticalAnchor.ContentBottom,
+                (FloatFrom.Margin, _) => FigureVerticalAnchor.ContentTop,
+                _ => FigureVerticalAnchor.ParagraphTop,
+            },
+        };
+        if (f.HorizontalAlign == FloatAlign.None) figure.HorizontalOffset = Units.ToDip(f.X);
+        if (f.VerticalAlign == FloatAlign.None) figure.VerticalOffset = Units.ToDip(f.Y);
+        if (f.Fill is { } fill) figure.Background = new SolidColorBrush(fill);
+        if (f.Border is { } border)
+        {
+            figure.BorderBrush = new SolidColorBrush(border);
+            figure.BorderThickness = new Thickness(0.75);
+        }
+
+        if (f.Image != null && Decode(f.Image.Data) is { } source)
+            figure.Blocks.Add(new BlockUIContainer(new Image { Source = source, Stretch = Stretch.Fill, Width = Units.ToDip(f.Width), Height = Units.ToDip(f.Height) }));
+        foreach (var block in f.Blocks) figure.Blocks.Add(ToBlock(block, ctx, Math.Max(20, f.Width - 14.4)));
+        if (figure.Blocks.Count == 0) figure.Blocks.Add(new Paragraph());
+        return figure;
     }
 
     static double? HeadingSize(DParagraph p) => p.Heading is > 0 and < 7 ? HeadingSizes[p.Heading] : null;
@@ -148,7 +360,7 @@ internal static class FlowBridge
         return run;
     }
 
-    static Table ToTable(DTable t, DDocument doc, double available, bool forRtf)
+    static Table ToTable(DTable t, FlowContext ctx, double available)
     {
         var table = new Table { CellSpacing = 0, Margin = new Thickness(0, 0, 0, Units.ToDip(6)) };
         int columns = Math.Max(1, t.ColumnCount);
@@ -180,7 +392,7 @@ internal static class FlowBridge
                     BorderThickness = t.Borders ? new Thickness(0.67) : new Thickness(0),
                 };
                 if (c.Shading is { } shade) cell.Background = new SolidColorBrush(shade);
-                foreach (var b in c.Blocks) cell.Blocks.Add(ToBlock(b, doc, Math.Max(20, cellWidth - 10.8), forRtf));
+                foreach (var b in c.Blocks) cell.Blocks.Add(ToBlock(b, ctx, Math.Max(20, cellWidth - 10.8)));
                 if (cell.Blocks.Count == 0) cell.Blocks.Add(new Paragraph());
                 if (r.Header) foreach (var p in cell.Blocks.OfType<Paragraph>()) p.FontWeight = FontWeights.Bold;
                 row.Cells.Add(cell);
@@ -223,11 +435,12 @@ internal static class FlowBridge
 
     // ------------------------------------------------------------------ FlowDocument -> model
 
-    public static DDocument FromFlow(FlowDocument flow, string? title)
+    /// <param name="normalize">False when the result will be merged with other parts and normalised once afterwards.</param>
+    public static DDocument FromFlow(FlowDocument flow, string? title, bool normalize = true)
     {
         var doc = new DDocument { Title = title };
         foreach (var block in flow.Blocks) FromBlock(block, doc.Blocks, 0);
-        doc.NormalizeDefaults();
+        if (normalize) doc.NormalizeDefaults();
         return doc;
     }
 

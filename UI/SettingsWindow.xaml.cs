@@ -86,7 +86,7 @@ public partial class SettingsWindow : Window
         var ffmpeg = _tools.FindFfmpeg();
         FfmpegStatus.Text = ffmpeg != null
             ? $"Ready · {ffmpeg}"
-            : $"Downloads automatically (about {ToolLocator.FfmpegDownloadMb} MB) the first time you convert audio or video.";
+            : $"Only needed for WebM, AVI, AVIF and unusual formats. You'll be asked first ({ToolLocator.FfmpegDownloadMb} MB).";
         FfmpegDownload.Visibility = ffmpeg == null ? Visibility.Visible : Visibility.Collapsed;
 
         var apps = new[] { "Word", "Excel", "PowerPoint" }.Where(OfficeAutomation.IsInstalled).ToList();

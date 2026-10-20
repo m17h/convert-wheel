@@ -18,8 +18,21 @@ internal sealed class DocxReader
     static readonly XNamespace M = "http://schemas.openxmlformats.org/officeDocument/2006/math";
 
     readonly ZipArchive _zip;
-    readonly string _docDir;
-    readonly Dictionary<string, (string target, bool external)> _rels = [];
+    // Relationships (images, links) are per part: the body, each header/footer and the notes all have their own.
+    string _docDir;
+    Dictionary<string, (string target, bool external)> _rels = [];
+    readonly Dictionary<string, (string target, bool external)> _mainRels;
+    readonly Dictionary<string, XElement> _footnotes = [], _endnotes = [];
+    string? _footnotesPath, _endnotesPath, _settingsPath;
+    int _footnoteNumber, _endnoteNumber;
+    DNote? _currentNote;
+    readonly Stack<FieldState> _fields = new();
+
+    sealed class FieldState
+    {
+        public readonly System.Text.StringBuilder Code = new();
+        public bool Separated, ReplacesResult;
+    }
     readonly Dictionary<string, Style> _styles = [];
     readonly Dictionary<string, NumberingInstance> _numbering = [];
     readonly Dictionary<string, int[]> _counters = [];
@@ -98,6 +111,17 @@ internal sealed class DocxReader
             if (type.EndsWith("/styles")) stylesPath = Resolve(target);
             else if (type.EndsWith("/numbering")) numberingPath = Resolve(target);
             else if (type.EndsWith("/theme")) themePath = Resolve(target);
+            else if (type.EndsWith("/footnotes")) _footnotesPath = Resolve(target);
+            else if (type.EndsWith("/endnotes")) _endnotesPath = Resolve(target);
+            else if (type.EndsWith("/settings")) _settingsPath = Resolve(target);
+        }
+        _mainRels = _rels;
+
+        foreach (var (path, map, tag) in new[] { (_footnotesPath, _footnotes, "footnote"), (_endnotesPath, _endnotes, "endnote") })
+        {
+            if (path == null || Load(path)?.Root is not { } notes) continue;
+            foreach (var note in notes.Elements(W + tag))
+                if (Attr(note, "id") is { } id && Attr(note, "type") is null or "normal") map[id] = note;
         }
 
         if (themePath != null && Load(themePath)?.Root is { } theme)
@@ -178,11 +202,76 @@ internal sealed class DocxReader
                 doc.PageHeight = h;
             }
             if (margin != null)
+            {
                 doc.Margins = new Thickness(Twips(Attr(margin, "left")) ?? 72, Twips(Attr(margin, "top")) ?? 72,
                     Twips(Attr(margin, "right")) ?? 72, Twips(Attr(margin, "bottom")) ?? 72);
+                doc.HeaderDistance = Twips(Attr(margin, "header")) ?? 36;
+                doc.FooterDistance = Twips(Attr(margin, "footer")) ?? 36;
+            }
         }
+        ReadHeadersAndFooters(body, doc);
         doc.NormalizeDefaults();
         return doc;
+    }
+
+    /// <summary>
+    /// Running headers and footers come from the last section that defines them (sections inherit
+    /// them in Word), with "different first page" and, if enabled, separate even-page versions.
+    /// </summary>
+    void ReadHeadersAndFooters(XElement body, DDocument doc)
+    {
+        var sections = body.Descendants(W + "sectPr").ToList();
+        var final = body.Element(W + "sectPr");
+        bool evenAndOdd = _settingsPath != null && Load(_settingsPath)?.Root?.Element(W + "evenAndOddHeaders") is { } eo && On(eo);
+        doc.DifferentFirstPage = final?.Element(W + "titlePg") is { } tp && On(tp);
+
+        DHeaderFooter? Part(string element, string type)
+        {
+            foreach (var sect in Enumerable.Reverse(sections))
+            {
+                var reference = sect.Elements(W + element).FirstOrDefault(r => (Attr(r, "type") ?? "default") == type);
+                if (reference == null || Attr(reference, R + "id") is not { } rid || !_mainRels.TryGetValue(rid, out var rel)) continue;
+                var path = Resolve(rel.target);
+                var root = Load(path)?.Root;
+                if (root == null) return null;
+                var part = new DHeaderFooter();
+                WithPart(path, () => ReadBlocks(root.Elements(), part.Blocks, null));
+                return part;
+            }
+            return null;
+        }
+
+        doc.Header = Part("headerReference", "default");
+        doc.Footer = Part("footerReference", "default");
+        if (doc.DifferentFirstPage)
+        {
+            doc.FirstHeader = Part("headerReference", "first") ?? new DHeaderFooter();
+            doc.FirstFooter = Part("footerReference", "first") ?? new DHeaderFooter();
+        }
+        if (evenAndOdd)
+        {
+            doc.EvenHeader = Part("headerReference", "even");
+            doc.EvenFooter = Part("footerReference", "even");
+        }
+    }
+
+    /// <summary>Reads content from another part (header, footer, notes) with that part's relationships.</summary>
+    void WithPart(string path, Action read)
+    {
+        var (savedRels, savedDir) = (_rels, _docDir);
+        _rels = LoadRels(path);
+        _docDir = path.Contains('/') ? path[..path.LastIndexOf('/')] : "";
+        try { read(); }
+        finally { (_rels, _docDir) = (savedRels, savedDir); }
+    }
+
+    Dictionary<string, (string target, bool external)> LoadRels(string partPath)
+    {
+        var map = new Dictionary<string, (string target, bool external)>();
+        foreach (var rel in Load(RelsPath(partPath))?.Root?.Elements(PR + "Relationship") ?? [])
+            if ((string?)rel.Attribute("Id") is { } id && (string?)rel.Attribute("Target") is { } target)
+                map[id] = (target, (string?)rel.Attribute("TargetMode") == "External");
+        return map;
     }
 
     // ------------------------------------------------------------------ blocks
@@ -254,6 +343,14 @@ internal sealed class DocxReader
         var current = para;
         output.Add(current);
         ReadInlines(p.Elements().Where(e => e.Name != W + "pPr"), runBase, null, ref current, output, pending, props, styles);
+        // A page break at the end of a paragraph leaves nothing after it; Word doesn't show that as an
+        // empty line at the top of the next page, so carry the break to the next paragraph instead.
+        if (current != para && current.Inlines.Count == 0 && current.PageBreakBefore)
+        {
+            output.Remove(current);
+            _pendingPageBreak = true;
+            current = para;
+        }
         output.AddRange(pending);
 
         if (pPr?.Element(W + "sectPr") is { } sect && Attr(sect.Element(W + "type"), "val") != "continuous")
@@ -323,6 +420,8 @@ internal sealed class DocxReader
                 if (Attr(el, R + "id") is { } rid && _rels.TryGetValue(rid, out var rel)) target = rel.target;
                 ReadInlines(el.Elements(), runBase, target ?? link, ref current, output, pending, props, styles);
             }
+            else if (name == W + "fldSimple" && FieldKindOf(Attr(el, "instr")) is { } kind)
+                current.Inlines.Add(new DField(kind, RunStyleOf(el.Element(W + "r"), runBase)));
             else if (name == W + "ins" || name == W + "smartTag" || name == W + "customXml" || name == W + "fldSimple" ||
                      name == W + "moveTo" || name == W + "bdo" || name == W + "dir")
                 ReadInlines(el.Elements(), runBase, link, ref current, output, pending, props, styles);
@@ -348,6 +447,58 @@ internal sealed class DocxReader
         foreach (var el in r.Elements())
         {
             var n = el.Name;
+            // Complex fields: begin … code … separate … displayed result … end. Page-number fields
+            // become live DFields and their stale result text is dropped.
+            if (n == W + "fldChar")
+            {
+                switch (Attr(el, "fldCharType"))
+                {
+                    case "begin": _fields.Push(new FieldState()); break;
+                    case "separate" when _fields.Count > 0:
+                        var field = _fields.Peek();
+                        field.Separated = true;
+                        if (FieldKindOf(field.Code.ToString()) is { } kind)
+                        {
+                            current.Inlines.Add(new DField(kind, style));
+                            field.ReplacesResult = true;
+                        }
+                        break;
+                    case "end" when _fields.Count > 0:
+                        var ended = _fields.Pop();
+                        if (!ended.Separated && FieldKindOf(ended.Code.ToString()) is { } k) current.Inlines.Add(new DField(k, style));
+                        break;
+                }
+                continue;
+            }
+            if (n == W + "instrText")
+            {
+                if (_fields.Count > 0 && !_fields.Peek().Separated) _fields.Peek().Code.Append(el.Value);
+                continue;
+            }
+            if (_fields.Any(f => f.ReplacesResult)) continue;
+
+            if (n == W + "footnoteReference" || n == W + "endnoteReference")
+            {
+                bool endnote = n == W + "endnoteReference";
+                var notes = endnote ? _endnotes : _footnotes;
+                if (Attr(el, "id") is { } id && notes.TryGetValue(id, out var body))
+                {
+                    var note = new DNote(endnote ? ++_endnoteNumber : ++_footnoteNumber, endnote, style);
+                    var saved = _currentNote;
+                    _currentNote = note;
+                    WithPart((endnote ? _endnotesPath : _footnotesPath)!, () => ReadBlocks(body.Elements(), note.Blocks, null));
+                    _currentNote = saved;
+                    current.Inlines.Add(note);
+                }
+                continue;
+            }
+            if (n == W + "footnoteRef" || n == W + "endnoteRef")
+            {
+                // The note's own number at the start of its text.
+                if (_currentNote != null) AddText(current, _currentNote.Endnote ? ListLabels.Format(_currentNote.Number, "lowerRoman") : _currentNote.Number.ToString(), style with { Superscript = true }, null);
+                continue;
+            }
+
             if (n == W + "t") AddText(current, rp.Caps ? el.Value.ToUpperInvariant() : el.Value, style, link);
             else if (n == W + "tab" || n == W + "ptab") AddText(current, "\t", style, link);
             else if (n == W + "noBreakHyphen") AddText(current, "-", style, link);
@@ -381,6 +532,21 @@ internal sealed class DocxReader
         }
     }
 
+    static FieldKind? FieldKindOf(string? code)
+    {
+        var word = code?.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault()?.ToUpperInvariant();
+        return word switch { "PAGE" => FieldKind.Page, "NUMPAGES" or "SECTIONPAGES" => FieldKind.NumPages, _ => null };
+    }
+
+    TextStyle RunStyleOf(XElement? r, RunProps runBase)
+    {
+        var rp = runBase.Clone();
+        var rPr = r?.Element(W + "rPr");
+        if (Val(rPr?.Element(W + "rStyle")) is { } rStyle) foreach (var s in Chain(rStyle)) ApplyRun(rp, s.RPr);
+        ApplyRun(rp, rPr);
+        return rp.ToStyle();
+    }
+
     static void AddText(DParagraph p, string text, TextStyle style, string? link)
     {
         if (text.Length == 0) return;
@@ -397,14 +563,75 @@ internal sealed class DocxReader
             var extent = container.Element(WP + "extent");
             double width = (Long(Attr(extent, "cx")) ?? 0) / 12700.0, height = (Long(Attr(extent, "cy")) ?? 0) / 12700.0;
 
+            DImage? image = null;
             var blip = container.Descendants(A + "blip").FirstOrDefault();
-            if (blip != null && Attr(blip, R + "embed") is { } rid && LoadImage(rid) is { } image)
-                current.Inlines.Add(new DImage(image.data, image.ext, width, height));
+            if (blip != null && Attr(blip, R + "embed") is { } rid && LoadImage(rid) is { } data)
+                image = new DImage(data.data, data.ext, width, height);
+            var boxes = container.Descendants(W + "txbxContent").Where(b => !b.Ancestors(W + "txbxContent").Any()).ToList();
 
-            // Text boxes and shapes with text: keep their text as paragraphs after this one.
-            foreach (var box in container.Descendants(W + "txbxContent").Where(b => !b.Ancestors(W + "txbxContent").Any()))
-                ReadBlocks(box.Elements(), pending, null);
+            if (container.Name == WP + "anchor")
+            {
+                // Positioned picture or text box.
+                var f = ReadAnchor(container, width, height);
+                f.Image = image;
+                foreach (var box in boxes) ReadBlocks(box.Elements(), f.Blocks, null);
+                if (f.Image != null || f.Blocks.Count > 0) current.Inlines.Add(f);
+                continue;
+            }
+            if (image != null) current.Inlines.Add(image);
+            // An inline text box: keep its text as paragraphs after this one.
+            foreach (var box in boxes) ReadBlocks(box.Elements(), pending, null);
         }
+    }
+
+    static DFloat ReadAnchor(XElement anchor, double width, double height)
+    {
+        var f = new DFloat { Width = width, Height = height };
+        var ph = anchor.Element(WP + "positionH");
+        var pv = anchor.Element(WP + "positionV");
+        f.HorizontalFrom = (string?)ph?.Attribute("relativeFrom") switch
+        {
+            "page" => FloatFrom.Page,
+            "character" => FloatFrom.Paragraph,
+            _ => FloatFrom.Margin,
+        };
+        f.VerticalFrom = (string?)pv?.Attribute("relativeFrom") switch
+        {
+            "page" => FloatFrom.Page,
+            "margin" or "topMargin" => FloatFrom.Margin,
+            _ => FloatFrom.Paragraph,
+        };
+        f.X = (Long(ph?.Element(WP + "posOffset")?.Value) ?? 0) / 12700.0;
+        f.Y = (Long(pv?.Element(WP + "posOffset")?.Value) ?? 0) / 12700.0;
+        f.HorizontalAlign = ph?.Element(WP + "align")?.Value switch
+        {
+            "left" or "inside" => FloatAlign.Start,
+            "center" => FloatAlign.Center,
+            "right" or "outside" => FloatAlign.End,
+            _ => FloatAlign.None,
+        };
+        f.VerticalAlign = pv?.Element(WP + "align")?.Value switch
+        {
+            "top" or "inside" => FloatAlign.Start,
+            "center" => FloatAlign.Center,
+            "bottom" or "outside" => FloatAlign.End,
+            _ => FloatAlign.None,
+        };
+        bool behind = (string?)anchor.Attribute("behindDoc") is "1" or "true";
+        f.Wrap = anchor.Element(WP + "wrapNone") != null ? (behind ? FloatWrap.Behind : FloatWrap.InFront)
+               : anchor.Element(WP + "wrapTopAndBottom") != null ? FloatWrap.TopAndBottom
+               : FloatWrap.Square;
+
+        // Text box fill and outline.
+        var spPr = anchor.Descendants().FirstOrDefault(e => e.Name.LocalName == "spPr" && e.Parent?.Name.LocalName == "wsp");
+        if (spPr != null)
+        {
+            f.Fill = Units.ParseHex((string?)spPr.Element(A + "solidFill")?.Element(A + "srgbClr")?.Attribute("val"));
+            var ln = spPr.Element(A + "ln");
+            if (ln != null && ln.Element(A + "noFill") == null)
+                f.Border = Units.ParseHex((string?)ln.Element(A + "solidFill")?.Element(A + "srgbClr")?.Attribute("val")) ?? Colors.Black;
+        }
+        return f;
     }
 
     void ReadVml(XElement pict, DParagraph current)

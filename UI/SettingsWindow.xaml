@@ -137,7 +137,7 @@
                 <StackPanel>
                     <TextBlock Text="Built in, nothing to download" Style="{StaticResource Body}" />
                     <TextBlock Style="{StaticResource Hint}"
-                               Text="PNG, JPG, BMP, GIF, TIFF and ICO images. Word (.docx), OpenDocument, RTF and text documents to PDF, DOCX, ODT, RTF, TXT and HTML. Excel, OpenDocument and CSV spreadsheets to XLSX, ODS, CSV, PDF and HTML." />
+                               Text="Audio: MP3, M4A, AAC, WAV, FLAC, OGG, Opus, WMA and AIFF. Video: MP4, MOV, MKV, WMV and GIF (using Windows' own codecs). Images: PNG, JPG, WebP, BMP, GIF, TIFF and ICO. Documents: Word, OpenDocument, RTF and text to PDF, DOCX, ODT, RTF, TXT and HTML. Spreadsheets: Excel, OpenDocument and CSV to XLSX, ODS, CSV, PDF and HTML." />
                     <Border Style="{StaticResource Divider}" />
                     <StackPanel>
                         <TextBlock Text="Microsoft Office" Style="{StaticResource Body}" />
@@ -150,7 +150,7 @@
                             <ColumnDefinition Width="Auto" />
                         </Grid.ColumnDefinitions>
                         <StackPanel VerticalAlignment="Center" Margin="0,0,12,0">
-                            <TextBlock Text="FFmpeg (audio, video, WebP, AVIF)" Style="{StaticResource Body}" />
+                            <TextBlock Text="FFmpeg (optional)" Style="{StaticResource Body}" />
                             <TextBlock x:Name="FfmpegStatus" Style="{StaticResource Hint}" />
                         </StackPanel>
                         <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">

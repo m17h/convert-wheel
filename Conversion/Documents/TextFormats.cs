@@ -50,9 +50,33 @@ internal static class PlainText
     public static string ToText(DDocument doc)
     {
         var sb = new StringBuilder();
+        var (header, footer) = doc.HeaderFooterFor(1);
+        if (PartText(header) is { Length: > 0 } top) sb.Append(top).Append(Environment.NewLine).Append(Environment.NewLine);
         Blocks(doc.Blocks, sb);
+
+        // Notes are listed at the end, after a short rule.
+        var notes = doc.Notes().OrderBy(n => n.Endnote).ThenBy(n => n.Number).ToList();
+        if (notes.Count > 0)
+        {
+            sb.Append(Environment.NewLine).Append("----").Append(Environment.NewLine);
+            foreach (var note in notes)
+            {
+                var text = string.Join(" ", note.Blocks.OfType<DParagraph>().Select(p => p.PlainText().Trim()).Where(s => s.Length > 0));
+                var mark = FlowBridge.NoteMark(note);
+                if (text.StartsWith(mark)) text = text[mark.Length..].TrimStart();
+                sb.Append('[').Append(mark).Append("] ").Append(text).Append(Environment.NewLine);
+            }
+        }
+        if (PartText(footer) is { Length: > 0 } bottom) sb.Append(Environment.NewLine).Append(bottom).Append(Environment.NewLine);
         return sb.ToString().TrimEnd('\r', '\n') + Environment.NewLine;
     }
+
+    /// <summary>A header/footer as text, skipping page-number fields (there are no pages in a text file).</summary>
+    static string PartText(DHeaderFooter? part) => part == null ? "" :
+        string.Join(Environment.NewLine, part.Blocks.OfType<DParagraph>().Select(p => p.PlainText().Trim()).Where(s => s.Length > 0 && !IsOnlyPageWords(s)));
+
+    static bool IsOnlyPageWords(string s) =>
+        s.Split(' ', StringSplitOptions.RemoveEmptyEntries).All(w => w.Equals("page", StringComparison.OrdinalIgnoreCase) || w.Equals("of", StringComparison.OrdinalIgnoreCase));
 
     static void Blocks(IEnumerable<DBlock> blocks, StringBuilder sb)
     {
@@ -76,24 +100,6 @@ internal static class PlainText
         string.Join(" ", cell.Blocks.OfType<DParagraph>().Select(p => p.PlainText().Replace('\n', ' ')).Where(s => s.Length > 0));
 }
 
-internal static class RichText
-{
-    public static DDocument Read(string path)
-    {
-        var flow = new FlowDocument();
-        using (var stream = File.OpenRead(path))
-            new TextRange(flow.ContentStart, flow.ContentEnd).Load(stream, DataFormats.Rtf);
-        return FlowBridge.FromFlow(flow, Path.GetFileNameWithoutExtension(path));
-    }
-
-    public static void Write(DDocument doc, string path)
-    {
-        var flow = FlowBridge.ToFlow(doc, forRtf: true);
-        using var stream = File.Create(path);
-        new TextRange(flow.ContentStart, flow.ContentEnd).Save(stream, DataFormats.Rtf);
-    }
-}
-
 internal static class HtmlWriter
 {
     public static void Write(DDocument doc, string path)
@@ -104,11 +110,45 @@ internal static class HtmlWriter
         sb.Append($"body {{ font-family: '{doc.Font}', Calibri, Arial, sans-serif; font-size: {Num(doc.FontSize)}pt; line-height: 1.4; max-width: 50em; margin: 2em auto; padding: 0 1em; color: #111; }}\n");
         sb.Append("p { margin: 0 0 0.6em; }\ntable { border-collapse: collapse; margin: 0 0 1em; }\n");
         sb.Append("td, th { padding: 4px 8px; vertical-align: top; text-align: left; }\ntable.grid td, table.grid th { border: 1px solid #999; }\n");
-        sb.Append("img { max-width: 100%; height: auto; }\n</style>\n</head>\n<body>\n");
+        sb.Append("img { max-width: 100%; height: auto; }\n");
+        sb.Append("header, footer { color: #555; font-size: 0.9em; }\nheader { border-bottom: 1px solid #ddd; margin-bottom: 1.5em; }\nfooter { border-top: 1px solid #ddd; margin-top: 2em; }\n");
+        sb.Append(".notes { font-size: 0.9em; border-top: 1px solid #ccc; margin-top: 2em; padding-top: 0.5em; }\n.box { padding: 4px 8px; margin: 0 0 0.5em; }\n");
+        sb.Append("</style>\n</head>\n<body>\n");
+
+        var (header, footer) = doc.HeaderFooterFor(1);
+        if (header is { IsEmpty: false })
+        {
+            sb.Append("<header>\n");
+            Blocks(header.Blocks, sb);
+            sb.Append("</header>\n");
+        }
         Blocks(doc.Blocks, sb);
+
+        var notes = doc.Notes().OrderBy(n => n.Endnote).ThenBy(n => n.Number).ToList();
+        if (notes.Count > 0)
+        {
+            sb.Append("<section class=\"notes\">\n");
+            foreach (var note in notes)
+            {
+                var mark = FlowBridge.NoteMark(note);
+                sb.Append($"<div id=\"{NoteId(note)}\"><a href=\"#ref-{NoteId(note)}\">{Enc(mark)}</a> ");
+                Blocks(FlowBridge.WithoutMark(note), sb);
+                sb.Append("</div>\n");
+            }
+            sb.Append("</section>\n");
+        }
+
+        if (footer is { IsEmpty: false })
+        {
+            sb.Append("<footer>\n");
+            Blocks(footer.Blocks, sb);
+            sb.Append("</footer>\n");
+        }
         sb.Append("</body>\n</html>\n");
         File.WriteAllText(path, sb.ToString(), new UTF8Encoding(false));
     }
+
+    static string NoteId(DNote note) => (note.Endnote ? "endnote-" : "footnote-") + note.Number;
 
     static void Blocks(List<DBlock> blocks, StringBuilder sb)
     {
@@ -180,6 +220,33 @@ internal static class HtmlWriter
             {
                 case DLineBreak:
                     sb.Append("<br>");
+                    break;
+                case DNote note:
+                    sb.Append($"<sup id=\"ref-{NoteId(note)}\"><a href=\"#{NoteId(note)}\">{Enc(FlowBridge.NoteMark(note))}</a></sup>");
+                    break;
+                case DFloat f:
+                    // Pictures and text boxes float to the side they were aligned to.
+                    string side = f.HorizontalAlign == FloatAlign.End || (f.HorizontalAlign == FloatAlign.None && f.X > 72) ? "right" : "left";
+                    string floatCss = f.Wrap == FloatWrap.TopAndBottom
+                        ? $"display: block; width: {Num(Units.ToDip(f.Width))}px"
+                        : $"float: {side}; width: {Num(Units.ToDip(f.Width))}px; margin: 0 {(side == "left" ? "1em" : "0")} 0.5em {(side == "right" ? "1em" : "0")}";
+                    if (f.Image != null)
+                    {
+                        var floatMime = f.Image.Ext == "jpeg" ? "image/jpeg" : $"image/{f.Image.Ext}";
+                        sb.Append($"<img src=\"data:{floatMime};base64,{Convert.ToBase64String(f.Image.Data)}\" style=\"{floatCss}\" alt=\"\">");
+                    }
+                    else
+                    {
+                        if (f.Border is { } border) floatCss += $"; border: 1px solid #{Units.Hex(border)}";
+                        if (f.Fill is { } fill) floatCss += $"; background: #{Units.Hex(fill)}";
+                        sb.Append($"<span class=\"box\" style=\"{floatCss}; display: inline-block\">");
+                        foreach (var boxPara in f.Blocks.OfType<DParagraph>())
+                        {
+                            Inlines(boxPara, sb);
+                            sb.Append("<br>");
+                        }
+                        sb.Append("</span>");
+                    }
                     break;
                 case DImage img:
                     var mime = img.Ext == "jpeg" ? "image/jpeg" : $"image/{img.Ext}";

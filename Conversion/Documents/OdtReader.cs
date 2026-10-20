@@ -23,6 +23,7 @@ internal sealed class OdtReader
     readonly Dictionary<string, XElement> _listStyles = [];
     readonly Dictionary<string, string> _fontFaces = [];
     XElement? _defaultParagraphStyle;
+    int _footnoteNumber, _endnoteNumber;
     DParagraph? _previous;
     string? _previousStyle;
 
@@ -97,8 +98,43 @@ internal sealed class OdtReader
             doc.PageWidth = w;
             doc.PageHeight = h;
         }
-        doc.Margins = new Thickness(Len(props, Fo + "margin-left") ?? 56.7, Len(props, Fo + "margin-top") ?? 56.7,
-            Len(props, Fo + "margin-right") ?? 56.7, Len(props, Fo + "margin-bottom") ?? 56.7);
+        double top = Len(props, Fo + "margin-top") ?? 56.7, bottom = Len(props, Fo + "margin-bottom") ?? 56.7;
+
+        // ODF page margins run to the header/footer; the body starts after their height and spacing.
+        DHeaderFooter? Part(string name)
+        {
+            var element = master?.Element(St + name);
+            if (element == null || (string?)element.Attribute(St + "display") == "false") return null;
+            var part = new DHeaderFooter();
+            ReadBlocks(element.Elements(), part.Blocks, 0, null);
+            return part;
+        }
+        doc.Header = Part("header");
+        doc.Footer = Part("footer");
+        doc.EvenHeader = Part("header-left");
+        doc.EvenFooter = Part("footer-left");
+        var firstHeader = Part("header-first");
+        var firstFooter = Part("footer-first");
+        if (firstHeader != null || firstFooter != null)
+        {
+            doc.DifferentFirstPage = true;
+            doc.FirstHeader = firstHeader ?? doc.Header;
+            doc.FirstFooter = firstFooter ?? doc.Footer;
+        }
+
+        var headerProps = layout?.Element(St + "header-style")?.Element(St + "header-footer-properties");
+        var footerProps = layout?.Element(St + "footer-style")?.Element(St + "header-footer-properties");
+        if (doc.Header != null)
+        {
+            doc.HeaderDistance = top;
+            top += (Len(headerProps, Fo + "min-height") ?? 14) + (Len(headerProps, Fo + "margin-bottom") ?? 0);
+        }
+        if (doc.Footer != null)
+        {
+            doc.FooterDistance = bottom;
+            bottom += (Len(footerProps, Fo + "min-height") ?? 14) + (Len(footerProps, Fo + "margin-top") ?? 0);
+        }
+        doc.Margins = new Thickness(Len(props, Fo + "margin-left") ?? 56.7, top, Len(props, Fo + "margin-right") ?? 56.7, bottom);
     }
 
     // ------------------------------------------------------------------ blocks
@@ -282,6 +318,15 @@ internal sealed class OdtReader
             else if (n == Text + "tab") builder.Literal("\t", run.ToStyle(), link);
             else if (n == Text + "line-break") builder.Add(new DLineBreak());
             else if (n == Draw + "frame") ReadFrame(el, builder);
+            else if (n == Text + "page-number") builder.Add(new DField(FieldKind.Page, run.ToStyle()));
+            else if (n == Text + "page-count") builder.Add(new DField(FieldKind.NumPages, run.ToStyle()));
+            else if (n == Text + "note")
+            {
+                bool endnote = (string?)el.Attribute(Text + "note-class") == "endnote";
+                var note = new DNote(endnote ? ++_endnoteNumber : ++_footnoteNumber, endnote, run.ToStyle());
+                ReadBlocks(el.Element(Text + "note-body")?.Elements() ?? [], note.Blocks, 0, null);
+                builder.Add(note);
+            }
             else if (n == Draw + "a") ReadInlines(el.Nodes(), run, link, builder);
             else if (n == Text + "note" || n == Text + "bookmark-start" || n == Text + "annotation" || n == Office + "annotation" ||
                      n == Text + "soft-page-break" || n == Text + "bookmark" || n == Text + "bookmark-end" || n == Text + "reference-mark")
@@ -290,31 +335,70 @@ internal sealed class OdtReader
         }
     }
 
+    /// <summary>Pictures and text boxes: inline when anchored "as character", otherwise positioned floats.</summary>
     void ReadFrame(XElement frame, InlineBuilder builder)
     {
         double? w = Len(frame, Svg + "width"), h = Len(frame, Svg + "height");
-        var image = frame.Element(Draw + "image");
-        var href = (string?)image?.Attribute(XLink + "href");
-        if (href != null && !href.Contains("://"))
+        var image = LoadFrameImage(frame);
+        var anchor = (string?)frame.Attribute(Text + "anchor-type") ?? "paragraph";
+        var box = frame.Element(Draw + "text-box");
+
+        if (anchor == "as-char")
         {
-            var entry = _zip.GetEntry(href.TrimStart('.', '/'));
-            var ext = Path.GetExtension(href).TrimStart('.').ToLowerInvariant();
-            ext = ext switch { "jpg" or "jpeg" => "jpeg", "tif" => "tiff", _ => ext };
-            if (entry != null && ext is "png" or "jpeg" or "gif" or "bmp" or "tiff")
-            {
-                using var stream = entry.Open();
-                using var ms = new MemoryStream();
-                stream.CopyTo(ms);
-                var data = ms.ToArray();
-                var (pw, ph) = DocxReader.ImageSize(data);
-                builder.Add(new DImage(data, ext, w ?? pw, h ?? ph));
-                return;
-            }
+            if (image != null) builder.Add(new DImage(image.Value.data, image.Value.ext, w ?? image.Value.w, h ?? image.Value.h));
+            else if (box != null)
+                foreach (var p in box.Descendants().Where(d => d.Name == Text + "p" || d.Name == Text + "h"))
+                    builder.Literal(string.Concat(p.DescendantNodes().OfType<XText>().Select(t => t.Value)) + " ", TextStyle.Plain, null);
+            return;
         }
-        // Text frames: inline their paragraphs' text.
-        if (frame.Element(Draw + "text-box") is { } box)
-            foreach (var p in box.Descendants().Where(d => d.Name == Text + "p" || d.Name == Text + "h"))
-                builder.Literal(string.Concat(p.DescendantNodes().OfType<XText>().Select(t => t.Value)) + " ", TextStyle.Plain, null);
+
+        var f = new DFloat { Width = w ?? image?.w ?? 144, Height = h ?? image?.h ?? 72, X = Len(frame, Svg + "x") ?? 0, Y = Len(frame, Svg + "y") ?? 0 };
+        if (image != null) f.Image = new DImage(image.Value.data, image.Value.ext, f.Width, f.Height);
+        if (box != null) ReadBlocks(box.Elements(), f.Blocks, 0, null);
+        if (f.Image == null && f.Blocks.Count == 0) return;
+
+        var g = Style((string?)frame.Attribute(Draw + "style-name"))?.Element(St + "graphic-properties");
+        string? Prop(XName name) => (string?)g?.Attribute(name);
+        static FloatFrom From(string? rel, FloatFrom fallback) => rel switch
+        {
+            "page" or "page-start-margin" or "page-end-margin" => FloatFrom.Page,
+            "page-content" or "page-content-top" or "page-content-bottom" => FloatFrom.Margin,
+            "paragraph" or "paragraph-content" or "char" or "line" or "baseline" or "text" => FloatFrom.Paragraph,
+            _ => fallback,
+        };
+        f.HorizontalFrom = anchor == "page" ? FloatFrom.Page : From(Prop(St + "horizontal-rel"), FloatFrom.Margin);
+        f.VerticalFrom = anchor == "page" ? FloatFrom.Page : From(Prop(St + "vertical-rel"), FloatFrom.Paragraph);
+        f.HorizontalAlign = Prop(St + "horizontal-pos") switch { "left" or "inside" => FloatAlign.Start, "center" => FloatAlign.Center, "right" or "outside" => FloatAlign.End, _ => FloatAlign.None };
+        f.VerticalAlign = Prop(St + "vertical-pos") switch { "top" => FloatAlign.Start, "middle" => FloatAlign.Center, "bottom" => FloatAlign.End, _ => FloatAlign.None };
+        f.Wrap = Prop(St + "wrap") switch
+        {
+            "run-through" => Prop(St + "run-through") == "background" ? FloatWrap.Behind : FloatWrap.InFront,
+            "none" => FloatWrap.TopAndBottom,
+            _ => FloatWrap.Square,
+        };
+        if (box != null)
+        {
+            if (Prop(Draw + "fill") != "none") f.Fill = Units.ParseHex(Prop(Draw + "fill-color") ?? Prop(Fo + "background-color"));
+            if (Prop(Draw + "stroke") is not (null or "none")) f.Border = Units.ParseHex(Prop(Svg + "stroke-color")) ?? Colors.Black;
+            else if (Prop(Fo + "border") is { } border && border != "none") f.Border = Units.ParseHex(border.Split(' ').LastOrDefault()) ?? Colors.Black;
+        }
+        builder.Add(f);
+    }
+
+    (byte[] data, string ext, double w, double h)? LoadFrameImage(XElement frame)
+    {
+        var href = (string?)frame.Element(Draw + "image")?.Attribute(XLink + "href");
+        if (href == null || href.Contains("://")) return null;
+        var entry = _zip.GetEntry(href.TrimStart('.', '/'));
+        var ext = Path.GetExtension(href).TrimStart('.').ToLowerInvariant();
+        ext = ext switch { "jpg" or "jpeg" => "jpeg", "tif" => "tiff", _ => ext };
+        if (entry == null || ext is not ("png" or "jpeg" or "gif" or "bmp" or "tiff")) return null;
+        using var stream = entry.Open();
+        using var ms = new MemoryStream();
+        stream.CopyTo(ms);
+        var data = ms.ToArray();
+        var (pw, ph) = DocxReader.ImageSize(data);
+        return (data, ext, pw, ph);
     }
 
     // ------------------------------------------------------------------ tables

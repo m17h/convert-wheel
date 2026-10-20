@@ -44,6 +44,56 @@ internal sealed class DImage(byte[] data, string ext, double width, double heigh
     public double Height { get; set; } = height;
 }
 
+internal enum FieldKind { Page, NumPages }
+
+/// <summary>A page-number field; its text is filled in per page when rendering.</summary>
+internal sealed class DField(FieldKind kind, TextStyle style) : DInline
+{
+    public FieldKind Kind { get; } = kind;
+    public TextStyle Style { get; set; } = style;
+}
+
+/// <summary>A footnote or endnote: the reference mark in the text plus the note's own content.</summary>
+internal sealed class DNote(int number, bool endnote, TextStyle style) : DInline
+{
+    public int Number { get; } = number;
+    public bool Endnote { get; } = endnote;
+    public TextStyle Style { get; set; } = style;
+    public List<DBlock> Blocks { get; } = [];
+}
+
+internal enum FloatWrap { Square, TopAndBottom, Behind, InFront }
+internal enum FloatFrom { Page, Margin, Paragraph }
+internal enum FloatAlign { None, Start, Center, End }
+
+/// <summary>
+/// A positioned picture or text box (anchored to the paragraph it appears in). Offsets are from the
+/// edge chosen by <see cref="HorizontalFrom"/> / <see cref="VerticalFrom"/>, unless an alignment is set.
+/// </summary>
+internal sealed class DFloat : DInline
+{
+    public DImage? Image { get; set; }
+    public List<DBlock> Blocks { get; } = [];
+    public double Width { get; set; }
+    public double Height { get; set; }
+    public FloatFrom HorizontalFrom { get; set; } = FloatFrom.Margin;
+    public FloatFrom VerticalFrom { get; set; } = FloatFrom.Paragraph;
+    public double X { get; set; }
+    public double Y { get; set; }
+    public FloatAlign HorizontalAlign { get; set; }
+    public FloatAlign VerticalAlign { get; set; }
+    public FloatWrap Wrap { get; set; } = FloatWrap.Square;
+    public Color? Fill { get; set; }
+    public Color? Border { get; set; }
+}
+
+/// <summary>Running header or footer content.</summary>
+internal sealed class DHeaderFooter
+{
+    public List<DBlock> Blocks { get; } = [];
+    public bool IsEmpty => Blocks.Count == 0 || Blocks.All(b => b is DParagraph p && p.Inlines.Count == 0);
+}
+
 internal abstract class DBlock;
 
 internal enum ListKind { None, Bullet, Number }
@@ -75,6 +125,9 @@ internal sealed class DParagraph : DBlock
         {
             if (inline is DText t) sb.Append(t.Text);
             else if (inline is DLineBreak) sb.Append('\n');
+            else if (inline is DNote n) sb.Append('[').Append(n.Endnote ? ListLabels.Format(n.Number, "lowerRoman") : n.Number.ToString()).Append(']');
+            else if (inline is DFloat { Blocks.Count: > 0 } f)
+                sb.Append(' ').Append(string.Join(" ", f.Blocks.OfType<DParagraph>().Select(p => p.PlainText()).Where(s => s.Length > 0))).Append(' ');
         }
         return sb.ToString();
     }
@@ -112,12 +165,46 @@ internal sealed class DDocument
     public Thickness Margins { get; set; } = new(72);
     public string? Title { get; set; }
 
+    public DHeaderFooter? Header { get; set; }
+    public DHeaderFooter? Footer { get; set; }
+    /// <summary>Used on the first page when set (Word's "different first page").</summary>
+    public DHeaderFooter? FirstHeader { get; set; }
+    public DHeaderFooter? FirstFooter { get; set; }
+    /// <summary>Used on even pages when set.</summary>
+    public DHeaderFooter? EvenHeader { get; set; }
+    public DHeaderFooter? EvenFooter { get; set; }
+    public bool DifferentFirstPage { get; set; }
+    /// <summary>Distance from the page's top edge to the header, and bottom edge to the footer.</summary>
+    public double HeaderDistance { get; set; } = 36;
+    public double FooterDistance { get; set; } = 36;
+
+    public (DHeaderFooter? header, DHeaderFooter? footer) HeaderFooterFor(int pageNumber)
+    {
+        if (pageNumber == 1 && DifferentFirstPage) return (FirstHeader, FirstFooter);
+        if (pageNumber % 2 == 0 && (EvenHeader != null || EvenFooter != null)) return (EvenHeader ?? Header, EvenFooter ?? Footer);
+        return (Header, Footer);
+    }
+
+    public IEnumerable<DNote> Notes() => AllParagraphs().SelectMany(p => p.Inlines.OfType<DNote>());
+
     public double ContentWidth => PageWidth - Margins.Left - Margins.Right;
 
     /// <summary>A4 in metric regions, US Letter elsewhere.</summary>
     public static Size DefaultPage => System.Globalization.RegionInfo.CurrentRegion.IsMetric ? new Size(595.3, 841.9) : new Size(612, 792);
 
     public IEnumerable<DParagraph> AllParagraphs() => Paragraphs(Blocks);
+
+    /// <summary>Every paragraph including those in headers, footers, notes and text boxes.</summary>
+    public IEnumerable<DParagraph> EveryParagraph()
+    {
+        var parts = new[] { Header, Footer, FirstHeader, FirstFooter, EvenHeader, EvenFooter }.Where(h => h != null).SelectMany(h => h!.Blocks);
+        foreach (var p in Paragraphs(Blocks.Concat(parts)))
+        {
+            yield return p;
+            foreach (var inner in p.Inlines.SelectMany(i => i is DNote n ? Paragraphs(n.Blocks) : i is DFloat f ? Paragraphs(f.Blocks) : []))
+                yield return inner;
+        }
+    }
 
     static IEnumerable<DParagraph> Paragraphs(IEnumerable<DBlock> blocks)
     {
@@ -138,23 +225,33 @@ internal sealed class DDocument
     /// </summary>
     public void NormalizeDefaults()
     {
-        var texts = AllParagraphs().SelectMany(p => p.Inlines.OfType<DText>()).Where(t => t.Text.Length > 0).ToList();
+        var texts = EveryParagraph().SelectMany(p => p.Inlines.OfType<DText>()).Where(t => t.Text.Length > 0).ToList();
         if (texts.Count == 0) return;
 
-        var font = texts.Where(t => t.Style.Font != null).GroupBy(t => t.Style.Font!)
-            .OrderByDescending(g => g.Sum(t => t.Text.Length)).FirstOrDefault()?.Key;
-        var size = texts.Where(t => t.Style.Size != null).GroupBy(t => t.Style.Size!.Value)
-            .OrderByDescending(g => g.Sum(t => t.Text.Length)).FirstOrDefault()?.Key;
-        if (font != null) Font = font;
-        if (size != null) FontSize = size.Value;
-
-        foreach (var t in texts)
+        // Unset values already mean "the document default", so count them as such (this keeps a second call harmless).
+        var font = texts.GroupBy(t => t.Style.Font ?? Font).OrderByDescending(g => g.Sum(t => t.Text.Length)).First().Key;
+        var size = texts.GroupBy(t => t.Style.Size ?? FontSize).OrderByDescending(g => g.Sum(t => t.Text.Length)).First().Key;
+        if (font != Font || size != FontSize)
         {
-            var style = t.Style;
+            // Make the old defaults explicit before switching, so no run silently changes.
+            foreach (var t in texts)
+                t.Style = t.Style with { Font = t.Style.Font ?? Font, Size = t.Style.Size ?? FontSize };
+        }
+        Font = font;
+        FontSize = size;
+
+        TextStyle Strip(TextStyle style)
+        {
             if (style.Font == Font) style = style with { Font = null };
             if (style.Size == FontSize) style = style with { Size = null };
             if (style.Color is { } c && c.R == 0 && c.G == 0 && c.B == 0) style = style with { Color = null };
-            t.Style = style;
+            return style;
+        }
+        foreach (var inline in EveryParagraph().SelectMany(p => p.Inlines))
+        {
+            if (inline is DText t) t.Style = Strip(t.Style);
+            else if (inline is DField f) f.Style = Strip(f.Style);
+            else if (inline is DNote n) n.Style = Strip(n.Style);
         }
     }
 }

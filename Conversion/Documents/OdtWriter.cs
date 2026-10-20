@@ -57,14 +57,24 @@ internal static class OdfPackage
 internal sealed class OdtWriter
 {
     readonly DDocument _doc;
-    readonly List<XElement> _autoStyles = [];
-    readonly Dictionary<string, string> _textStyles = [];
-    readonly Dictionary<string, string> _paraStyles = [];
+    /// <summary>Automatic styles live in the file that uses them: content.xml for the body, styles.xml for headers/footers.</summary>
+    sealed class StyleSet(string prefix)
+    {
+        public readonly string Prefix = prefix;
+        public readonly List<XElement> Elements = [];
+        public readonly Dictionary<string, string> Text = [], Para = [];
+    }
+    readonly StyleSet _contentStyles = new(""), _masterStyles = new("M");
+    StyleSet _set;
     readonly List<(string name, byte[] data, string type)> _pictures = [];
     readonly HashSet<string> _fonts = [];
     int _tables, _frames;
 
-    OdtWriter(DDocument doc) => _doc = doc;
+    OdtWriter(DDocument doc)
+    {
+        _doc = doc;
+        _set = _contentStyles;
+    }
 
     public static void Write(DDocument doc, string path) => new OdtWriter(doc).Save(path);
 
@@ -76,7 +86,7 @@ internal sealed class OdtWriter
 
         var content = new XElement(Office + "document-content", OdfPackage.Namespaces(),
             FontDecls(),
-            new XElement(Office + "automatic-styles", _autoStyles),
+            new XElement(Office + "automatic-styles", _contentStyles.Elements),
             new XElement(Office + "body", body));
         OdfPackage.Save(path, "application/vnd.oasis.opendocument.text", content, Styles(), _pictures);
     }
@@ -116,9 +126,91 @@ internal sealed class OdtWriter
                 case DImage img:
                     el.Add(Frame(img, available));
                     break;
+                case DField f:
+                    var field = f.Kind == FieldKind.Page
+                        ? new XElement(Text + "page-number", new XAttribute(Text + "select-page", "current"), "1")
+                        : new XElement(Text + "page-count", "1");
+                    el.Add(TextStyleName(f.Style, false) is { } fieldStyle ? new XElement(Text + "span", new XAttribute(Text + "style-name", fieldStyle), field) : field);
+                    break;
+                case DNote n:
+                    el.Add(Note(n));
+                    break;
+                case DFloat f:
+                    el.Add(FloatFrame(f));
+                    break;
             }
         }
         return el;
+    }
+
+    XElement Note(DNote note)
+    {
+        var body = new XElement(Text + "note-body");
+        Blocks(FlowBridge.WithoutMark(note), body, _doc.ContentWidth);
+        if (!body.HasElements) body.Add(new XElement(Text + "p"));
+        return new XElement(Text + "note",
+            new XAttribute(Text + "id", $"{(note.Endnote ? "edn" : "ftn")}{note.Number}"),
+            new XAttribute(Text + "note-class", note.Endnote ? "endnote" : "footnote"),
+            new XElement(Text + "note-citation", FlowBridge.NoteMark(note)),
+            body);
+    }
+
+    /// <summary>A positioned picture or text box, anchored to its paragraph.</summary>
+    XElement FloatFrame(DFloat f)
+    {
+        _frames++;
+        var styleName = $"{_set.Prefix}fr{_frames}";
+        var props = new XElement(St + "graphic-properties",
+            new XAttribute(St + "wrap", f.Wrap switch { FloatWrap.TopAndBottom => "none", FloatWrap.Behind or FloatWrap.InFront => "run-through", _ => "parallel" }),
+            new XAttribute(St + "horizontal-pos", f.HorizontalAlign switch { FloatAlign.Start => "left", FloatAlign.Center => "center", FloatAlign.End => "right", _ => "from-left" }),
+            new XAttribute(St + "horizontal-rel", f.HorizontalFrom switch { FloatFrom.Page => "page", FloatFrom.Margin => "page-content", _ => "paragraph" }),
+            new XAttribute(St + "vertical-pos", f.VerticalAlign switch { FloatAlign.Start => "top", FloatAlign.Center => "middle", FloatAlign.End => "bottom", _ => "from-top" }),
+            new XAttribute(St + "vertical-rel", f.VerticalFrom switch { FloatFrom.Page => "page", FloatFrom.Margin => "page-content", _ => "paragraph" }));
+        if (f.Wrap is FloatWrap.Behind or FloatWrap.InFront)
+            props.Add(new XAttribute(St + "run-through", f.Wrap == FloatWrap.Behind ? "background" : "foreground"));
+        if (f.Image == null)
+        {
+            props.Add(new XAttribute(Fo + "padding", "3.6pt"));
+            props.Add(f.Fill is { } fill ? new XAttribute(Fo + "background-color", "#" + Units.Hex(fill)) : new XAttribute(Fo + "background-color", "transparent"));
+            props.Add(new XAttribute(Fo + "border", f.Border is { } b ? $"0.75pt solid #{Units.Hex(b)}" : "none"));
+        }
+        _set.Elements.Add(new XElement(St + "style", new XAttribute(St + "name", styleName), new XAttribute(St + "family", "graphic"), props));
+
+        var frame = new XElement(Draw + "frame",
+            new XAttribute(Draw + "style-name", styleName), new XAttribute(Draw + "name", $"Frame{_frames}"),
+            new XAttribute(Text + "anchor-type", "paragraph"),
+            new XAttribute(Svg + "width", OdfPackage.Len(f.Width)), new XAttribute(Svg + "height", OdfPackage.Len(f.Height)));
+        if (f.HorizontalAlign == FloatAlign.None) frame.Add(new XAttribute(Svg + "x", OdfPackage.Len(f.X)));
+        if (f.VerticalAlign == FloatAlign.None) frame.Add(new XAttribute(Svg + "y", OdfPackage.Len(f.Y)));
+        if (f.Image != null)
+        {
+            var ext = f.Image.Ext == "jpeg" ? "jpg" : f.Image.Ext;
+            var name = $"Pictures/image{_pictures.Count + 1}.{ext}";
+            _pictures.Add((name, f.Image.Data, f.Image.Ext == "jpeg" ? "image/jpeg" : $"image/{f.Image.Ext}"));
+            frame.Add(new XElement(Draw + "image", new XAttribute(XLink + "href", name), new XAttribute(XLink + "type", "simple"),
+                new XAttribute(XLink + "show", "embed"), new XAttribute(XLink + "actuate", "onLoad")));
+        }
+        else
+        {
+            var box = new XElement(Draw + "text-box");
+            Blocks(f.Blocks, box, Math.Max(20, f.Width - 7.2));
+            if (!box.HasElements) box.Add(new XElement(Text + "p"));
+            frame.Add(box);
+        }
+        return frame;
+    }
+
+    /// <summary>Header/footer content for the master page; its styles go to styles.xml.</summary>
+    XElement? MasterPart(string name, DHeaderFooter? part)
+    {
+        if (part == null) return null;
+        var saved = _set;
+        _set = _masterStyles;
+        var element = new XElement(St + name);
+        Blocks(part.Blocks, element, _doc.ContentWidth);
+        if (!element.HasElements) element.Add(new XElement(Text + "p"));
+        _set = saved;
+        return element;
     }
 
     /// <summary>ODF collapses whitespace, so runs of spaces and tabs need explicit elements.</summary>
@@ -176,15 +268,15 @@ internal sealed class OdtWriter
         var parent = p.Heading > 0 ? $"Heading_20_{p.Heading}" : "Standard";
         var key = parent + props;
         if (p.Inlines.Count == 0 && p.MarkSize is double mark) key += mark;
-        if (_paraStyles.TryGetValue(key, out var name)) return name;
+        if (_set.Para.TryGetValue(key, out var name)) return name;
 
-        name = $"P{_paraStyles.Count + 1}";
+        name = $"{_set.Prefix}P{_set.Para.Count + 1}";
         var style = new XElement(St + "style", new XAttribute(St + "name", name), new XAttribute(St + "family", "paragraph"),
             new XAttribute(St + "parent-style-name", parent), props);
         if (p.Inlines.Count == 0 && p.MarkSize is double size)
             style.Add(new XElement(St + "text-properties", new XAttribute(Fo + "font-size", OdfPackage.Len(size))));
-        _autoStyles.Add(style);
-        _paraStyles[key] = name;
+        _set.Elements.Add(style);
+        _set.Para[key] = name;
         return name;
     }
 
@@ -209,10 +301,10 @@ internal sealed class OdtWriter
         if (!props.HasAttributes) return null;
 
         var key = props.ToString();
-        if (_textStyles.TryGetValue(key, out var name)) return name;
-        name = $"T{_textStyles.Count + 1}";
-        _autoStyles.Add(new XElement(St + "style", new XAttribute(St + "name", name), new XAttribute(St + "family", "text"), props));
-        _textStyles[key] = name;
+        if (_set.Text.TryGetValue(key, out var name)) return name;
+        name = $"{_set.Prefix}T{_set.Text.Count + 1}";
+        _set.Elements.Add(new XElement(St + "style", new XAttribute(St + "name", name), new XAttribute(St + "family", "text"), props));
+        _set.Text[key] = name;
         return name;
     }
 
@@ -240,19 +332,19 @@ internal sealed class OdtWriter
         double total = widths.Sum();
         if (total > available) widths = widths.Select(w => w * available / total).ToList();
 
-        var tableName = $"Table{index}";
-        _autoStyles.Add(new XElement(St + "style", new XAttribute(St + "name", tableName), new XAttribute(St + "family", "table"),
+        var tableName = $"{_set.Prefix}Table{index}";
+        _set.Elements.Add(new XElement(St + "style", new XAttribute(St + "name", tableName), new XAttribute(St + "family", "table"),
             new XElement(St + "table-properties", new XAttribute(St + "width", OdfPackage.Len(widths.Sum())), new XAttribute(Table + "align", "left"))));
         var cellStyle = $"{tableName}.Cell";
         var cellProps = new XElement(St + "table-cell-properties", new XAttribute(Fo + "padding", "2.7pt"));
         if (t.Borders) cellProps.Add(new XAttribute(Fo + "border", "0.5pt solid #000000"));
-        _autoStyles.Add(new XElement(St + "style", new XAttribute(St + "name", cellStyle), new XAttribute(St + "family", "table-cell"), cellProps));
+        _set.Elements.Add(new XElement(St + "style", new XAttribute(St + "name", cellStyle), new XAttribute(St + "family", "table-cell"), cellProps));
 
         var table = new XElement(Table + "table", new XAttribute(Table + "name", tableName), new XAttribute(Table + "style-name", tableName));
         for (int i = 0; i < columns; i++)
         {
             var colStyle = $"{tableName}.C{i + 1}";
-            _autoStyles.Add(new XElement(St + "style", new XAttribute(St + "name", colStyle), new XAttribute(St + "family", "table-column"),
+            _set.Elements.Add(new XElement(St + "style", new XAttribute(St + "name", colStyle), new XAttribute(St + "family", "table-column"),
                 new XElement(St + "table-column-properties", new XAttribute(St + "column-width", OdfPackage.Len(widths[i])))));
             table.Add(new XElement(Table + "table-column", new XAttribute(Table + "style-name", colStyle)));
         }
@@ -274,7 +366,7 @@ internal sealed class OdtWriter
                         style = $"{tableName}.S{shaded.Count + 1}";
                         var props = new XElement(cellProps);
                         props.Add(new XAttribute(Fo + "background-color", "#" + hex));
-                        _autoStyles.Add(new XElement(St + "style", new XAttribute(St + "name", style), new XAttribute(St + "family", "table-cell"), props));
+                        _set.Elements.Add(new XElement(St + "style", new XAttribute(St + "name", style), new XAttribute(St + "family", "table-cell"), props));
                         shaded[hex] = style;
                     }
                 }
@@ -311,18 +403,36 @@ internal sealed class OdtWriter
                 new XElement(St + "paragraph-properties", new XAttribute(Fo + "keep-with-next", "always")),
                 new XElement(St + "text-properties", new XAttribute(Fo + "font-weight", "bold"), new XAttribute(Fo + "font-size", OdfPackage.Len(sizes[level])))));
 
+        // Headers and footers are written first so their fonts and styles are known below.
+        var master = new XElement(St + "master-page", new XAttribute(St + "name", "Standard"), new XAttribute(St + "page-layout-name", "pm1"),
+            MasterPart("header", _doc.Header), MasterPart("header-left", _doc.EvenHeader),
+            _doc.DifferentFirstPage ? MasterPart("header-first", _doc.FirstHeader ?? new DHeaderFooter()) : null,
+            MasterPart("footer", _doc.Footer), MasterPart("footer-left", _doc.EvenFooter),
+            _doc.DifferentFirstPage ? MasterPart("footer-first", _doc.FirstFooter ?? new DHeaderFooter()) : null);
+
+        // ODF margins run to the header/footer; the gap down to the body becomes their height plus spacing.
+        bool hasHeader = _doc.Header != null || _doc.FirstHeader != null, hasFooter = _doc.Footer != null || _doc.FirstFooter != null;
+        double top = hasHeader ? Math.Min(_doc.HeaderDistance, _doc.Margins.Top) : _doc.Margins.Top;
+        double bottom = hasFooter ? Math.Min(_doc.FooterDistance, _doc.Margins.Bottom) : _doc.Margins.Bottom;
+        XElement HeaderFooterStyle(string name, double gap, string spacingSide) => new(St + name,
+            new XElement(St + "header-footer-properties", new XAttribute(St + "dynamic-spacing", "false"),
+                new XAttribute(Fo + "min-height", OdfPackage.Len(Math.Max(0, gap - Math.Min(7.2, gap / 3)))),
+                new XAttribute(Fo + spacingSide, OdfPackage.Len(Math.Min(7.2, gap / 3)))));
+
         var layout = new XElement(St + "page-layout", new XAttribute(St + "name", "pm1"),
             new XElement(St + "page-layout-properties",
                 new XAttribute(Fo + "page-width", OdfPackage.Len(_doc.PageWidth)), new XAttribute(Fo + "page-height", OdfPackage.Len(_doc.PageHeight)),
                 new XAttribute(St + "print-orientation", _doc.PageWidth > _doc.PageHeight ? "landscape" : "portrait"),
-                new XAttribute(Fo + "margin-top", OdfPackage.Len(_doc.Margins.Top)), new XAttribute(Fo + "margin-bottom", OdfPackage.Len(_doc.Margins.Bottom)),
-                new XAttribute(Fo + "margin-left", OdfPackage.Len(_doc.Margins.Left)), new XAttribute(Fo + "margin-right", OdfPackage.Len(_doc.Margins.Right))));
+                new XAttribute(Fo + "margin-top", OdfPackage.Len(top)), new XAttribute(Fo + "margin-bottom", OdfPackage.Len(bottom)),
+                new XAttribute(Fo + "margin-left", OdfPackage.Len(_doc.Margins.Left)), new XAttribute(Fo + "margin-right", OdfPackage.Len(_doc.Margins.Right))),
+            hasHeader ? HeaderFooterStyle("header-style", _doc.Margins.Top - top, "margin-bottom") : null,
+            hasFooter ? HeaderFooterStyle("footer-style", _doc.Margins.Bottom - bottom, "margin-top") : null);
 
+        var automatic = new XElement(Office + "automatic-styles", layout, _masterStyles.Elements);
         return new XElement(Office + "document-styles", OdfPackage.Namespaces(),
             FontDecls(),
             styles,
-            new XElement(Office + "automatic-styles", layout),
-            new XElement(Office + "master-styles",
-                new XElement(St + "master-page", new XAttribute(St + "name", "Standard"), new XAttribute(St + "page-layout-name", "pm1"))));
+            automatic,
+            new XElement(Office + "master-styles", master));
     }
 }

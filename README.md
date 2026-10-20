@@ -25,16 +25,25 @@ The tray icon (in the taskbar's hidden icons) opens **Settings** and can pause o
 
 ## Converters
 
+Almost everything is converted by code that ships inside the app. Downloads are optional and always asked for first.
+
 | Files | Engine |
 | --- | --- |
-| PNG, JPG, BMP, GIF, TIFF, ICO output from images | Windows imaging, built in |
-| Audio, video, GIF↔video, WebP, AVIF | FFmpeg. Downloaded automatically (about 110 MB) to `%LOCALAPPDATA%\ConvertWheel\tools` the first time it's needed. |
-| Word (.docx), OpenDocument (.odt), RTF, TXT → PDF, DOCX, ODT, RTF, TXT, HTML | Built-in document engine |
-| Excel (.xlsx, .xls), OpenDocument (.ods), CSV → XLSX, ODS, CSV, PDF, HTML | Built-in spreadsheet engine |
+| Audio: MP3, M4A, AAC, WAV, FLAC, WMA ↔ each other, and the audio track of any video | Windows Media Foundation (Windows' own codecs) |
+| Audio: OGG Vorbis and Opus (read and write), AIFF | Bundled open-source codecs (NVorbis, OggVorbisEncoder, Concentus) and our own AIFF/WAV code |
+| Video → MP4, MOV, WMV (H.264/WMV, often GPU accelerated) | Windows Media Foundation |
+| Video → MKV | Our Matroska writer (lossless copy when possible) |
+| Video ↔ GIF, GIF → animated WebP | Our GIF encoder (median-cut palette, ordered dithering, frame differencing) and WebP container writer |
+| Images: PNG, JPG, BMP, GIF, TIFF, ICO, WebP | Windows imaging, plus Skia for WebP and images Windows can't read |
+| Documents: Word, OpenDocument, RTF, TXT → PDF, DOCX, ODT, RTF, TXT, HTML | Built-in document engine |
+| Spreadsheets: Excel, OpenDocument, CSV → XLSX, ODS, CSV, PDF, HTML | Built-in spreadsheet engine |
 | Any Office format, including PowerPoint and old `.doc` | Microsoft Office, when installed |
-| Anything the above can't handle (e.g. PowerPoint without Office) | LibreOffice, only after the user agrees to a one-time ~360 MB download. Unpacked privately, no install or admin rights. |
+| WebM, AVI, AVIF, and inputs Windows can't decode (e.g. FLV) | FFmpeg: optional ~110 MB download, offered when needed |
+| Office files nothing else can read (e.g. PowerPoint without Office) | LibreOffice: optional ~360 MB download, offered when needed |
 
-Video to MP4/MKV/MOV/WebM is a lossless remux when the streams already fit, so it's instant.
+Lossless shortcuts: H.264/AAC video moves between MP4, MOV and MKV without re-encoding, and an MP4's AAC
+audio becomes M4A/AAC instantly. Song details (title, artist, album, track, year, genre) carry across audio
+conversions. Phone videos keep their rotation.
 
 ### How documents are converted
 
@@ -51,13 +60,22 @@ If one engine fails the next is tried. The built-in engine reads DOCX/ODT/RTF/TX
 model (`Conversion/Documents/DocModel.cs`) and writes every output from that. PDFs are laid out by WPF's
 own pagination and written with [PDFsharp](https://github.com/empira/PDFsharp), with the real Windows fonts embedded.
 
-Not yet handled by the built-in engine: headers/footers, footnotes, text boxes keep their text but not
-their position, floating images become inline, and page breaks inside RTF files are lost.
+The built-in engine keeps headers and footers (including first-page and even-page versions, with live
+"Page X of Y" fields), footnotes and endnotes, page breaks, and positioned pictures and text boxes
+(wrapped, behind or in front of text) across DOCX, ODT, RTF and PDF. Plain text and HTML get the header,
+footer and a notes list. Not yet handled: multiple sections with different page sizes, columns, charts
+and SmartArt, comments and tracked changes (accepted text is kept), and RTF pictures stay inline.
 
 ### Third-party libraries
 
+All permissively licensed and bundled into the exe:
+
 - **PDFsharp 6.2.4** (MIT). Pinned on purpose: 6.3 and later are AGPL, which would force this app to be AGPL too.
 - **ExcelDataReader** (MIT) for reading `.xlsx` and `.xls`.
+- **SkiaSharp** (MIT) for WebP encoding and decoding.
+- **NVorbis** (MIT) and **OggVorbisEncoder** (MIT) for Ogg Vorbis. The encoder drops the first half-block of
+  audio and misbehaves above quality 0.5, so the app pads the start and uses 0.5 (~160 kbps).
+- **Concentus** and **Concentus.OggFile** (BSD / MIT) for Opus.
 
 ## Build & run
 
@@ -76,5 +94,6 @@ Command-line extras:
 - `ConvertWheel.exe --export-icon Assets\ConvertWheel.ico` regenerates the app icon.
 - Setting `CONVERTWHEEL_DOC_ENGINE` to `built-in`, `Microsoft Office` or `LibreOffice` forces one document
   engine, which is handy for testing.
+- Setting `CONVERTWHEEL_MEDIA_ENGINE` to `built-in` disables the FFmpeg fallback (or `ffmpeg` forces it), for testing.
 
 Settings are saved in `%APPDATA%\ConvertWheel\settings.json`. Errors are logged to `%LOCALAPPDATA%\ConvertWheel\log.txt`.

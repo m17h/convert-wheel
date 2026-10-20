@@ -17,15 +17,27 @@ internal sealed class DocxWriter
     static readonly XNamespace PIC = "http://schemas.openxmlformats.org/drawingml/2006/picture";
     const string RelBase = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/";
 
+    static readonly XNamespace WPS = "http://schemas.microsoft.com/office/word/2010/wordprocessingShape";
+    static readonly XNamespace MC = "http://schemas.openxmlformats.org/markup-compatibility/2006";
+
     readonly DDocument _doc;
-    readonly List<XElement> _rels = [];
+    readonly List<XElement> _mainRels = [];
+    // Relationships of the part currently being written (body, a header/footer, or the notes).
+    List<XElement> _rels;
+    readonly List<XElement> _footnoteRels = [], _endnoteRels = [];
+    readonly List<XElement> _footnotes = [], _endnotes = [];
+    readonly List<(string name, string type, XElement root, List<XElement> rels)> _parts = [];
     readonly List<(string name, byte[] data)> _media = [];
     readonly List<XElement> _nums = [];
-    int _nextRel = 10, _nextDrawing = 1;
+    int _nextRel = 10, _nextDrawing = 1, _nextFootnote = 1, _nextEndnote = 1;
     int? _currentNumId;
     ListKind _currentKind;
 
-    DocxWriter(DDocument doc) => _doc = doc;
+    DocxWriter(DDocument doc)
+    {
+        _doc = doc;
+        _rels = _mainRels;
+    }
 
     public static void Write(DDocument doc, string path) => new DocxWriter(doc).Save(path);
 
@@ -33,33 +45,65 @@ internal sealed class DocxWriter
     {
         var body = new XElement(W + "body");
         Blocks(_doc.Blocks, body, _doc.ContentWidth, topLevel: true);
-        body.Add(new XElement(W + "sectPr",
+
+        // Section: header/footer references first, then page size and margins.
+        var sectPr = new XElement(W + "sectPr");
+        foreach (var (kind, type, part) in new[]
+        {
+            ("header", "default", _doc.Header), ("header", "first", _doc.FirstHeader), ("header", "even", _doc.EvenHeader),
+            ("footer", "default", _doc.Footer), ("footer", "first", _doc.FirstFooter), ("footer", "even", _doc.EvenFooter),
+        })
+        {
+            if (part == null || (type == "first" && !_doc.DifferentFirstPage)) continue;
+            sectPr.Add(new XElement(W + (kind + "Reference"), new XAttribute(W + "type", type), new XAttribute(R + "id", HeaderFooterPart(kind, part))));
+        }
+        sectPr.Add(
             new XElement(W + "pgSz", new XAttribute(W + "w", Units.ToTwips(_doc.PageWidth)), new XAttribute(W + "h", Units.ToTwips(_doc.PageHeight)),
                 _doc.PageWidth > _doc.PageHeight ? new XAttribute(W + "orient", "landscape") : null),
             new XElement(W + "pgMar",
                 new XAttribute(W + "top", Units.ToTwips(_doc.Margins.Top)), new XAttribute(W + "right", Units.ToTwips(_doc.Margins.Right)),
                 new XAttribute(W + "bottom", Units.ToTwips(_doc.Margins.Bottom)), new XAttribute(W + "left", Units.ToTwips(_doc.Margins.Left)),
-                new XAttribute(W + "header", 708), new XAttribute(W + "footer", 708), new XAttribute(W + "gutter", 0))));
+                new XAttribute(W + "header", Units.ToTwips(_doc.HeaderDistance)), new XAttribute(W + "footer", Units.ToTwips(_doc.FooterDistance)),
+                new XAttribute(W + "gutter", 0)));
+        if (_doc.DifferentFirstPage) sectPr.Add(new XElement(W + "titlePg"));
+        body.Add(sectPr);
 
-        var document = new XElement(W + "document",
-            new XAttribute(XNamespace.Xmlns + "w", W), new XAttribute(XNamespace.Xmlns + "r", R),
-            new XAttribute(XNamespace.Xmlns + "wp", WP), new XAttribute(XNamespace.Xmlns + "a", A), new XAttribute(XNamespace.Xmlns + "pic", PIC),
-            body);
+        var document = new XElement(W + "document", Namespaces(), body);
 
-        _rels.Add(Rel("rId1", "styles", "styles.xml"));
-        _rels.Add(Rel("rId2", "numbering", "numbering.xml"));
-        _rels.Add(Rel("rId3", "settings", "settings.xml"));
+        _mainRels.Add(Rel("rId1", "styles", "styles.xml"));
+        _mainRels.Add(Rel("rId2", "numbering", "numbering.xml"));
+        _mainRels.Add(Rel("rId3", "settings", "settings.xml"));
+        if (_footnotes.Count > 0) _mainRels.Add(Rel("rId4", "footnotes", "footnotes.xml"));
+        if (_endnotes.Count > 0) _mainRels.Add(Rel("rId5", "endnotes", "endnotes.xml"));
+
+        var settings = new XElement(W + "settings", new XAttribute(XNamespace.Xmlns + "w", W),
+            new XElement(W + "defaultTabStop", new XAttribute(W + "val", 720)));
+        if (_doc.EvenHeader != null || _doc.EvenFooter != null) settings.Add(new XElement(W + "evenAndOddHeaders"));
 
         using var zip = new ZipArchive(File.Create(path), ZipArchiveMode.Create);
         Put(zip, "[Content_Types].xml", ContentTypes());
         Put(zip, "_rels/.rels", new XElement(PR + "Relationships",
             new XElement(PR + "Relationship", new XAttribute("Id", "rId1"), new XAttribute("Type", RelBase + "officeDocument"), new XAttribute("Target", "word/document.xml"))));
         Put(zip, "word/document.xml", document);
-        Put(zip, "word/_rels/document.xml.rels", new XElement(PR + "Relationships", _rels));
+        Put(zip, "word/_rels/document.xml.rels", new XElement(PR + "Relationships", _mainRels));
         Put(zip, "word/styles.xml", Styles());
         Put(zip, "word/numbering.xml", Numbering());
-        Put(zip, "word/settings.xml", new XElement(W + "settings", new XAttribute(XNamespace.Xmlns + "w", W),
-            new XElement(W + "defaultTabStop", new XAttribute(W + "val", 720))));
+        Put(zip, "word/settings.xml", settings);
+        foreach (var (name, _, root, rels) in _parts)
+        {
+            Put(zip, "word/" + name, root);
+            if (rels.Count > 0) Put(zip, $"word/_rels/{name}.rels", new XElement(PR + "Relationships", rels));
+        }
+        if (_footnotes.Count > 0)
+        {
+            Put(zip, "word/footnotes.xml", NotesPart("footnote", _footnotes));
+            if (_footnoteRels.Count > 0) Put(zip, "word/_rels/footnotes.xml.rels", new XElement(PR + "Relationships", _footnoteRels));
+        }
+        if (_endnotes.Count > 0)
+        {
+            Put(zip, "word/endnotes.xml", NotesPart("endnote", _endnotes));
+            if (_endnoteRels.Count > 0) Put(zip, "word/_rels/endnotes.xml.rels", new XElement(PR + "Relationships", _endnoteRels));
+        }
         foreach (var (name, data) in _media)
         {
             using var stream = zip.CreateEntry("word/media/" + name, CompressionLevel.Optimal).Open();
@@ -156,9 +200,159 @@ internal sealed class DocxWriter
                 case DImage img:
                     para.Add(Image(img, available));
                     break;
+                case DField f:
+                    var fieldRun = new XElement(W + "r");
+                    if (RunProps(f.Style, false, false) is { HasElements: true } fieldProps) fieldRun.Add(fieldProps);
+                    fieldRun.Add(new XElement(W + "t", "1"));
+                    para.Add(new XElement(W + "fldSimple", new XAttribute(W + "instr", f.Kind == FieldKind.Page ? " PAGE " : " NUMPAGES "), fieldRun));
+                    break;
+                case DNote n:
+                    para.Add(NoteReference(n));
+                    break;
+                case DFloat f:
+                    para.Add(Anchor(f));
+                    break;
             }
         }
         return para;
+    }
+
+    // ------------------------------------------------------------------ notes, headers, floats
+
+    XElement NoteReference(DNote note)
+    {
+        bool endnote = note.Endnote;
+        int id = endnote ? _nextEndnote++ : _nextFootnote++;
+        var tag = endnote ? "endnote" : "footnote";
+
+        // Note content lives in its own part (with its own relationships for links and pictures).
+        var savedRels = _rels;
+        _rels = endnote ? _endnoteRels : _footnoteRels;
+        var element = new XElement(W + tag, new XAttribute(W + "id", id));
+        var blocks = FlowBridge.WithoutMark(note);
+        Blocks(blocks, element, _doc.ContentWidth, topLevel: false);
+        var first = element.Element(W + "p")!;
+        var pPr = first.Element(W + "pPr");
+        var markRun = new XElement(W + "r",
+            new XElement(W + "rPr", new XElement(W + "rStyle", new XAttribute(W + "val", endnote ? "EndnoteReference" : "FootnoteReference"))),
+            new XElement(W + (endnote ? "endnoteRef" : "footnoteRef")));
+        var space = new XElement(W + "r", new XElement(W + "t", new XAttribute(XNamespace.Xml + "space", "preserve"), " "));
+        if (pPr != null) pPr.AddAfterSelf(markRun, space);
+        else first.AddFirst(markRun, space);
+        _rels = savedRels;
+        (endnote ? _endnotes : _footnotes).Add(element);
+
+        return new XElement(W + "r",
+            new XElement(W + "rPr", new XElement(W + "rStyle", new XAttribute(W + "val", endnote ? "EndnoteReference" : "FootnoteReference"))),
+            new XElement(W + (endnote ? "endnoteReference" : "footnoteReference"), new XAttribute(W + "id", id)));
+    }
+
+
+    static XElement NotesPart(string tag, List<XElement> notes)
+    {
+        // Word expects the separator lines as notes -1 and 0.
+        var root = new XElement(W + (tag + "s"), Namespaces(),
+            new XElement(W + tag, new XAttribute(W + "type", "separator"), new XAttribute(W + "id", -1),
+                new XElement(W + "p", new XElement(W + "r", new XElement(W + "separator")))),
+            new XElement(W + tag, new XAttribute(W + "type", "continuationSeparator"), new XAttribute(W + "id", 0),
+                new XElement(W + "p", new XElement(W + "r", new XElement(W + "continuationSeparator")))));
+        root.Add(notes);
+        return root;
+    }
+
+    /// <summary>Writes a header or footer part and returns its relationship id.</summary>
+    string HeaderFooterPart(string kind, DHeaderFooter part)
+    {
+        var name = $"{kind}{_parts.Count(p => p.type == kind) + 1}.xml";
+        var savedRels = _rels;
+        _rels = [];
+        var root = new XElement(W + (kind == "header" ? "hdr" : "ftr"), Namespaces());
+        Blocks(part.Blocks, root, _doc.ContentWidth, topLevel: false);
+        _parts.Add((name, kind, root, _rels));
+        _rels = savedRels;
+        return NewRel(kind, name, external: false);
+    }
+
+    static XAttribute[] Namespaces() =>
+    [
+        new(XNamespace.Xmlns + "w", W), new(XNamespace.Xmlns + "r", R), new(XNamespace.Xmlns + "wp", WP),
+        new(XNamespace.Xmlns + "a", A), new(XNamespace.Xmlns + "pic", PIC), new(XNamespace.Xmlns + "wps", WPS),
+        new(XNamespace.Xmlns + "mc", MC),
+    ];
+
+    /// <summary>A positioned picture or text box (Word's "anchor" drawing).</summary>
+    XElement Anchor(DFloat f)
+    {
+        int id = _nextDrawing++;
+        long cx = Units.ToEmu(f.Width), cy = Units.ToEmu(f.Height);
+        XElement Position(string axis, FloatFrom from, FloatAlign align, double offset)
+        {
+            string rel = from switch
+            {
+                FloatFrom.Page => "page",
+                FloatFrom.Margin => "margin",
+                _ => axis == "H" ? "column" : "paragraph",
+            };
+            object value = align == FloatAlign.None
+                ? new XElement(WP + "posOffset", Units.ToEmu(offset))
+                : new XElement(WP + "align", (axis, align) switch
+                {
+                    ("H", FloatAlign.Start) => "left", ("H", FloatAlign.Center) => "center", ("H", _) => "right",
+                    (_, FloatAlign.Start) => "top", (_, FloatAlign.Center) => "center", _ => "bottom",
+                });
+            return new XElement(WP + ("position" + axis), new XAttribute("relativeFrom", rel), value);
+        }
+
+        XElement graphic;
+        if (f.Image != null)
+        {
+            var rid = AddMedia(f.Image, out var name);
+            graphic = new XElement(A + "graphic", new XElement(A + "graphicData", new XAttribute("uri", PIC.NamespaceName),
+                Picture(id, name, rid, cx, cy)));
+        }
+        else
+        {
+            var box = new XElement(W + "txbxContent");
+            Blocks(f.Blocks, box, Math.Max(20, f.Width - 14.4), topLevel: false);
+            var spPr = new XElement(WPS + "spPr",
+                new XElement(A + "xfrm", new XElement(A + "off", new XAttribute("x", 0), new XAttribute("y", 0)),
+                    new XElement(A + "ext", new XAttribute("cx", cx), new XAttribute("cy", cy))),
+                new XElement(A + "prstGeom", new XAttribute("prst", "rect"), new XElement(A + "avLst")),
+                f.Fill is { } fill ? new XElement(A + "solidFill", new XElement(A + "srgbClr", new XAttribute("val", Units.Hex(fill)))) : new XElement(A + "noFill"),
+                new XElement(A + "ln", new XAttribute("w", 9525), f.Border is { } border
+                    ? new XElement(A + "solidFill", new XElement(A + "srgbClr", new XAttribute("val", Units.Hex(border))))
+                    : new XElement(A + "noFill")));
+            graphic = new XElement(A + "graphic", new XElement(A + "graphicData", new XAttribute("uri", WPS.NamespaceName),
+                new XElement(WPS + "wsp", new XElement(WPS + "cNvSpPr", new XAttribute("txBox", 1)), spPr,
+                    new XElement(WPS + "txbx", box),
+                    new XElement(WPS + "bodyPr", new XAttribute("wrap", "square"), new XAttribute("lIns", 91440), new XAttribute("tIns", 45720),
+                        new XAttribute("rIns", 91440), new XAttribute("bIns", 45720), new XElement(A + "noAutofit")))));
+        }
+
+        var anchor = new XElement(WP + "anchor",
+            new XAttribute("distT", 0), new XAttribute("distB", 0), new XAttribute("distL", 114300), new XAttribute("distR", 114300),
+            new XAttribute("simplePos", 0), new XAttribute("relativeHeight", 251658240 + id), new XAttribute("behindDoc", f.Wrap == FloatWrap.Behind ? 1 : 0),
+            new XAttribute("locked", 0), new XAttribute("layoutInCell", 1), new XAttribute("allowOverlap", 1),
+            new XElement(WP + "simplePos", new XAttribute("x", 0), new XAttribute("y", 0)),
+            Position("H", f.HorizontalFrom, f.HorizontalAlign, f.X),
+            Position("V", f.VerticalFrom, f.VerticalAlign, f.Y),
+            new XElement(WP + "extent", new XAttribute("cx", cx), new XAttribute("cy", cy)),
+            new XElement(WP + "effectExtent", new XAttribute("l", 0), new XAttribute("t", 0), new XAttribute("r", 0), new XAttribute("b", 0)),
+            f.Wrap switch
+            {
+                FloatWrap.TopAndBottom => new XElement(WP + "wrapTopAndBottom"),
+                FloatWrap.Behind or FloatWrap.InFront => new XElement(WP + "wrapNone"),
+                _ => new XElement(WP + "wrapSquare", new XAttribute("wrapText", "bothSides")),
+            },
+            new XElement(WP + "docPr", new XAttribute("id", id), new XAttribute("name", f.Image != null ? $"Picture {id}" : $"Text Box {id}")),
+            new XElement(WP + "cNvGraphicFramePr"),
+            graphic);
+
+        var drawing = new XElement(W + "drawing", anchor);
+        // Text boxes use the Word 2010 shape schema, which older readers expect wrapped like this.
+        return f.Image != null
+            ? new XElement(W + "r", drawing)
+            : new XElement(W + "r", new XElement(MC + "AlternateContent", new XElement(MC + "Choice", new XAttribute("Requires", "wps"), drawing)));
     }
 
     bool StartsNewList(DParagraph p) => p.List == ListKind.Number && LeadingNumber(p.ListLabel) == 1;
@@ -213,10 +407,7 @@ internal sealed class DocxWriter
     {
         double scale = Math.Min(1, available / Math.Max(1, img.Width));
         long cx = Units.ToEmu(img.Width * scale), cy = Units.ToEmu(img.Height * scale);
-        var ext = img.Ext == "jpeg" ? "jpg" : img.Ext;
-        var name = $"image{_media.Count + 1}.{ext}";
-        _media.Add((name, img.Data));
-        var rid = NewRel("image", "media/" + name, external: false);
+        var rid = AddMedia(img, out var name);
         int id = _nextDrawing++;
 
         return new XElement(W + "r", new XElement(W + "drawing",
@@ -224,20 +415,31 @@ internal sealed class DocxWriter
                 new XElement(WP + "extent", new XAttribute("cx", cx), new XAttribute("cy", cy)),
                 new XElement(WP + "docPr", new XAttribute("id", id), new XAttribute("name", $"Picture {id}")),
                 new XElement(A + "graphic",
-                    new XElement(A + "graphicData", new XAttribute("uri", PIC.NamespaceName),
-                        new XElement(PIC + "pic",
-                            new XElement(PIC + "nvPicPr",
-                                new XElement(PIC + "cNvPr", new XAttribute("id", id), new XAttribute("name", name)),
-                                new XElement(PIC + "cNvPicPr")),
-                            new XElement(PIC + "blipFill",
-                                new XElement(A + "blip", new XAttribute(R + "embed", rid)),
-                                new XElement(A + "stretch", new XElement(A + "fillRect"))),
-                            new XElement(PIC + "spPr",
-                                new XElement(A + "xfrm",
-                                    new XElement(A + "off", new XAttribute("x", 0), new XAttribute("y", 0)),
-                                    new XElement(A + "ext", new XAttribute("cx", cx), new XAttribute("cy", cy))),
-                                new XElement(A + "prstGeom", new XAttribute("prst", "rect"), new XElement(A + "avLst")))))))));
+                    new XElement(A + "graphicData", new XAttribute("uri", PIC.NamespaceName), Picture(id, name, rid, cx, cy))))));
     }
+
+    /// <summary>Stores the picture in word/media and links it from the part being written.</summary>
+    string AddMedia(DImage img, out string name)
+    {
+        var ext = img.Ext == "jpeg" ? "jpg" : img.Ext;
+        name = $"image{_media.Count + 1}.{ext}";
+        _media.Add((name, img.Data));
+        return NewRel("image", "media/" + name, external: false);
+    }
+
+    static XElement Picture(int id, string name, string rid, long cx, long cy) =>
+        new(PIC + "pic",
+            new XElement(PIC + "nvPicPr",
+                new XElement(PIC + "cNvPr", new XAttribute("id", id), new XAttribute("name", name)),
+                new XElement(PIC + "cNvPicPr")),
+            new XElement(PIC + "blipFill",
+                new XElement(A + "blip", new XAttribute(R + "embed", rid)),
+                new XElement(A + "stretch", new XElement(A + "fillRect"))),
+            new XElement(PIC + "spPr",
+                new XElement(A + "xfrm",
+                    new XElement(A + "off", new XAttribute("x", 0), new XAttribute("y", 0)),
+                    new XElement(A + "ext", new XAttribute("cx", cx), new XAttribute("cy", cy))),
+                new XElement(A + "prstGeom", new XAttribute("prst", "rect"), new XElement(A + "avLst"))));
 
     XElement Table(DTable t, double available)
     {
@@ -304,6 +506,10 @@ internal sealed class DocxWriter
             Override("/word/styles.xml", "application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"),
             Override("/word/numbering.xml", "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"),
             Override("/word/settings.xml", "application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"));
+        const string Ml = "application/vnd.openxmlformats-officedocument.wordprocessingml.";
+        foreach (var part in _parts) types.Add(Override("/word/" + part.name, Ml + part.type + "+xml"));
+        if (_footnotes.Count > 0) types.Add(Override("/word/footnotes.xml", Ml + "footnotes+xml"));
+        if (_endnotes.Count > 0) types.Add(Override("/word/endnotes.xml", Ml + "endnotes+xml"));
         foreach (var ext in _media.Select(m => Path.GetExtension(m.name).TrimStart('.')).Distinct())
             types.Add(Default(ext, ext switch { "jpg" => "image/jpeg", "tiff" => "image/tiff", _ => $"image/{ext}" }));
         return types;
@@ -326,6 +532,8 @@ internal sealed class DocxWriter
                     new XElement(W + "spacing", new XAttribute(W + "after", 0), new XAttribute(W + "line", 240), new XAttribute(W + "lineRule", "auto"))))),
             new XElement(W + "style", new XAttribute(W + "type", "paragraph"), new XAttribute(W + "default", 1), new XAttribute(W + "styleId", "Normal"),
                 new XElement(W + "name", new XAttribute(W + "val", "Normal")), new XElement(W + "qFormat")),
+            CharacterStyle("FootnoteReference", "footnote reference", new XElement(W + "vertAlign", new XAttribute(W + "val", "superscript"))),
+            CharacterStyle("EndnoteReference", "endnote reference", new XElement(W + "vertAlign", new XAttribute(W + "val", "superscript"))),
             new XElement(W + "style", new XAttribute(W + "type", "character"), new XAttribute(W + "styleId", "Hyperlink"),
                 new XElement(W + "name", new XAttribute(W + "val", "Hyperlink")),
                 new XElement(W + "rPr", new XElement(W + "color", new XAttribute(W + "val", "0563C1")), new XElement(W + "u", new XAttribute(W + "val", "single")))),
@@ -346,6 +554,10 @@ internal sealed class DocxWriter
                 new XElement(W + "rPr", new XElement(W + "b"), new XElement(W + "sz", new XAttribute(W + "val", (int)(sizes[level] * 2))))));
         return styles;
     }
+
+    static XElement CharacterStyle(string id, string name, params XElement[] runProps) =>
+        new(W + "style", new XAttribute(W + "type", "character"), new XAttribute(W + "styleId", id),
+            new XElement(W + "name", new XAttribute(W + "val", name)), new XElement(W + "rPr", runProps));
 
     XElement Numbering()
     {

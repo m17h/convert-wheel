@@ -62,6 +62,20 @@ internal sealed class ConversionManager(AppSettings settings, ToolLocator tools,
             });
             toast.AddAction("Not now", toast.DismissNow);
         }
+        catch (ToolMissingException ex) when (ex.Tool == "FFmpeg")
+        {
+            // Only reached for what the built-in engines can't do (WebM, AVI, AVIF, unusual inputs).
+            Finish(toast, ToastGlyph.Info, Palette.Neutral, $"{target.Label} needs a free helper",
+                $"FFmpeg: one-time {ToolLocator.FfmpegDownloadMb} MB download, nothing to install.", 30);
+            toast.AddAction("Download & convert", () =>
+            {
+                toast.DismissNow();
+                PrefetchFfmpeg();
+                _ffmpegDownload?.ContinueWith(t => { if (t.IsCompletedSuccessfully) Start(plan, target); },
+                    TaskScheduler.FromCurrentSynchronizationContext());
+            });
+            toast.AddAction("Not now", toast.DismissNow);
+        }
         catch (Exception ex)
         {
             Log.Write(ex);
@@ -78,26 +92,29 @@ internal sealed class ConversionManager(AppSettings settings, ToolLocator tools,
         toast.DismissAfter(TimeSpan.FromSeconds(seconds));
     }
 
-    /// <summary>Returns FFmpeg's path, downloading it once (shared by concurrent jobs) if it isn't installed.</summary>
+    /// <summary>
+    /// Returns FFmpeg's path. If it isn't there, a download already under way is awaited; otherwise the
+    /// user is asked first (via <see cref="ToolMissingException"/>) rather than downloading silently.
+    /// </summary>
     Task<string> EnsureFfmpegAsync(CancellationToken ct)
     {
         return Application.Current.Dispatcher.Invoke(() =>
         {
             var existing = tools.FindFfmpeg();
             if (existing != null) return Task.FromResult(existing);
-            _ffmpegDownload ??= DownloadFfmpegAsync();
-            return _ffmpegDownload.WaitAsync(ct);
+            if (_ffmpegDownload != null) return _ffmpegDownload.WaitAsync(ct);
+            throw new ToolMissingException("FFmpeg");
         });
     }
 
     async Task<string> DownloadFfmpegAsync()
     {
-        var toast = toasts.Push("Setting up FFmpeg", $"One-time download (about {ToolLocator.FfmpegDownloadMb} MB) for audio & video", Palette.Neutral, ToastGlyph.Download);
+        var toast = toasts.Push("Setting up FFmpeg", $"One-time download (about {ToolLocator.FfmpegDownloadMb} MB)", Palette.Neutral, ToastGlyph.Download);
         toast.SetProgress(0);
         try
         {
             var path = await tools.DownloadFfmpegAsync(new Progress<double?>(toast.SetProgress), CancellationToken.None);
-            Finish(toast, ToastGlyph.Success, Palette.Success, "FFmpeg is ready", "Audio and video conversions are now available.", 4);
+            Finish(toast, ToastGlyph.Success, Palette.Success, "FFmpeg is ready", "WebM, AVI, AVIF and rare formats can now be converted.", 4);
             return path;
         }
         catch (Exception ex)
