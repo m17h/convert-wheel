@@ -1,0 +1,174 @@
+<Window x:Class="ConvertWheel.UI.SettingsWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Convert Wheel Settings" Width="580" Height="780" MinWidth="480" MinHeight="420"
+        WindowStartupLocation="CenterScreen" Background="{StaticResource WindowBrush}"
+        FontFamily="{StaticResource UiFont}" Foreground="{StaticResource TextBrush}"
+        UseLayoutRounding="True">
+    <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+        <StackPanel Margin="28,24,28,28">
+
+            <!-- Header -->
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <Image x:Name="Logo" Width="48" Height="48" Margin="0,0,16,0" />
+                <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                    <TextBlock Text="Convert Wheel" FontSize="22" FontWeight="SemiBold" FontFamily="Segoe UI Variable Display, Segoe UI" />
+                    <TextBlock x:Name="StatusText" Style="{StaticResource Hint}" Margin="0,2,0,0" />
+                </StackPanel>
+                <CheckBox x:Name="EnabledToggle" Grid.Column="2" Content="Enabled" VerticalAlignment="Center"
+                          Click="OnEnabledClick" />
+            </Grid>
+
+            <!-- Shortcut -->
+            <TextBlock Text="SHORTCUT" Style="{StaticResource SectionTitle}" />
+            <Border Style="{StaticResource Card}">
+                <StackPanel>
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <StackPanel VerticalAlignment="Center" Margin="0,0,16,0">
+                            <TextBlock Text="Hold to open the wheel" Style="{StaticResource Body}" />
+                            <TextBlock x:Name="KeyHint" Style="{StaticResource Hint}"
+                                       Text="Click the button, then press the key or combination you want to hold." />
+                        </StackPanel>
+                        <Button x:Name="KeyButton" Grid.Column="1" Style="{StaticResource KeyButton}" Click="OnKeyButtonClick" />
+                    </Grid>
+                    <Border Style="{StaticResource Divider}" />
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="Hold time before the wheel appears" Style="{StaticResource Body}" />
+                        <TextBlock x:Name="DelayValue" Grid.Column="1" Style="{StaticResource Body}" FontWeight="SemiBold" />
+                    </Grid>
+                    <Slider x:Name="DelaySlider" Minimum="100" Maximum="1000" SmallChange="50" LargeChange="50"
+                            TickFrequency="50" IsSnapToTickEnabled="True" Margin="0,8,0,0" ValueChanged="OnDelayChanged" />
+                    <TextBlock Style="{StaticResource Hint}"
+                               Text="Shorter feels snappier; longer avoids opening the wheel while you use shortcuts like Ctrl+C." />
+                </StackPanel>
+            </Border>
+
+            <!-- Wheel -->
+            <TextBlock Text="WHEEL" Style="{StaticResource SectionTitle}" />
+            <Border Style="{StaticResource Card}">
+                <StackPanel>
+                    <CheckBox x:Name="ShowAllToggle" Click="OnSettingClick">
+                        <StackPanel>
+                            <TextBlock Text="Always show every format" Style="{StaticResource Body}" />
+                            <TextBlock Style="{StaticResource Hint}"
+                                       Text="Open the full outer ring right away instead of only the smart suggestions. You can always reach it from the “All” slice." />
+                        </StackPanel>
+                    </CheckBox>
+                </StackPanel>
+            </Border>
+
+            <!-- Converted files -->
+            <TextBlock Text="CONVERTED FILES" Style="{StaticResource SectionTitle}" />
+            <Border Style="{StaticResource Card}">
+                <StackPanel>
+                    <TextBlock Text="When a conversion finishes" Style="{StaticResource Body}" Margin="0,0,0,6" />
+                    <RadioButton x:Name="KeepOriginal" GroupName="Original" Click="OnSettingClick">
+                        <StackPanel>
+                            <TextBlock Text="Keep the original and create a copy" Style="{StaticResource Body}" />
+                            <TextBlock Text="song.ogg stays, song.mp3 is added next to it." Style="{StaticResource Hint}" />
+                        </StackPanel>
+                    </RadioButton>
+                    <RadioButton x:Name="ReplaceOriginal" GroupName="Original" Click="OnSettingClick">
+                        <StackPanel>
+                            <TextBlock Text="Replace the original" Style="{StaticResource Body}" />
+                            <TextBlock Text="The original is moved to the Recycle Bin, so you can still get it back."
+                                       Style="{StaticResource Hint}" />
+                        </StackPanel>
+                    </RadioButton>
+
+                    <Border Style="{StaticResource Divider}" />
+
+                    <TextBlock Text="Save converted files" Style="{StaticResource Body}" Margin="0,0,0,6" />
+                    <RadioButton x:Name="SameFolder" GroupName="Output" Click="OnSettingClick">
+                        <TextBlock Text="In the same folder as the original" Style="{StaticResource Body}" />
+                    </RadioButton>
+                    <RadioButton x:Name="CustomFolder" GroupName="Output" Click="OnSettingClick">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <StackPanel VerticalAlignment="Center">
+                                <TextBlock Text="In a specific folder" Style="{StaticResource Body}" />
+                                <TextBlock x:Name="CustomFolderText" Style="{StaticResource Hint}" TextTrimming="CharacterEllipsis" TextWrapping="NoWrap" />
+                            </StackPanel>
+                            <Button Grid.Column="1" Content="Choose…" Margin="12,0,0,0" Click="OnChooseFolder" />
+                        </Grid>
+                    </RadioButton>
+                </StackPanel>
+            </Border>
+
+            <!-- General -->
+            <TextBlock Text="GENERAL" Style="{StaticResource SectionTitle}" />
+            <Border Style="{StaticResource Card}">
+                <StackPanel>
+                    <CheckBox x:Name="StartupToggle" Click="OnSettingClick">
+                        <StackPanel>
+                            <TextBlock Text="Start with Windows" Style="{StaticResource Body}" />
+                            <TextBlock Text="Runs quietly in the notification area after you sign in." Style="{StaticResource Hint}" />
+                        </StackPanel>
+                    </CheckBox>
+                    <Border Style="{StaticResource Divider}" />
+                    <CheckBox x:Name="NotifyToggle" Click="OnSettingClick">
+                        <StackPanel>
+                            <TextBlock Text="Show a notification when a conversion finishes" Style="{StaticResource Body}" />
+                            <TextBlock Text="Progress is always shown while a file is converting." Style="{StaticResource Hint}" />
+                        </StackPanel>
+                    </CheckBox>
+                </StackPanel>
+            </Border>
+
+            <!-- Converters -->
+            <TextBlock Text="CONVERTERS" Style="{StaticResource SectionTitle}" />
+            <Border Style="{StaticResource Card}">
+                <StackPanel>
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <StackPanel VerticalAlignment="Center" Margin="0,0,12,0">
+                            <TextBlock Text="FFmpeg (audio, video, WebP, AVIF)" Style="{StaticResource Body}" />
+                            <TextBlock x:Name="FfmpegStatus" Style="{StaticResource Hint}" />
+                        </StackPanel>
+                        <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                            <Button x:Name="FfmpegDownload" Content="Download" Click="OnDownloadFfmpeg" Margin="0,0,8,0" />
+                            <Button Content="Choose…" Click="OnChooseFfmpeg" />
+                        </StackPanel>
+                    </Grid>
+                    <Border Style="{StaticResource Divider}" />
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <StackPanel VerticalAlignment="Center" Margin="0,0,12,0">
+                            <TextBlock Text="LibreOffice (documents, spreadsheets, slides)" Style="{StaticResource Body}" />
+                            <TextBlock x:Name="LibreOfficeStatus" Style="{StaticResource Hint}" />
+                        </StackPanel>
+                        <Button x:Name="LibreOfficeButton" Grid.Column="1" Content="Get LibreOffice" Click="OnGetLibreOffice" VerticalAlignment="Center" />
+                    </Grid>
+                    <Border Style="{StaticResource Divider}" />
+                    <TextBlock Style="{StaticResource Hint}" Margin="0"
+                               Text="PNG, JPG, BMP, GIF, TIFF and ICO images are converted with Windows' built-in imaging and need nothing extra." />
+                </StackPanel>
+            </Border>
+
+            <TextBlock Style="{StaticResource Hint}" Margin="4,18,0,0" HorizontalAlignment="Center"
+                       Text="Changes are saved automatically. While the wheel is open: release to convert, click a slice, 1–8 to pick, Tab for all formats, Esc to close." />
+        </StackPanel>
+    </ScrollViewer>
+</Window>
