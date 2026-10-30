@@ -23,7 +23,7 @@ internal static class Spreadsheets
 
     public static List<Sheet> Read(string path) => Path.GetExtension(path).ToLowerInvariant() switch
     {
-        ".csv" => [ReadCsv(path)],
+        ".csv" or ".tsv" => [ReadCsv(path)],
         ".ods" => ReadOds(path),
         _ => ReadExcel(path),
     };
@@ -218,7 +218,9 @@ internal static class Spreadsheets
     {
         switch (ext)
         {
-            case "csv": WriteCsv(sheets[0], path); break;
+            case "csv": WriteCsv(sheets[0], path, ','); break;
+            case "tsv": WriteCsv(sheets[0], path, '\t'); break;
+            case "json": DataFiles.FromSheets(sheets, path); break;
             case "xlsx": WriteXlsx(sheets, path); break;
             case "ods": WriteOds(sheets, path); break;
             case "html": WriteHtml(sheets, path, title); break;
@@ -236,7 +238,7 @@ internal static class Spreadsheets
         _ => Convert.ToString(v, CultureInfo.InvariantCulture) ?? "",
     };
 
-    static void WriteCsv(Sheet sheet, string path)
+    static void WriteCsv(Sheet sheet, string path, char delimiter)
     {
         var sb = new StringBuilder();
         int width = sheet.ColumnCount;
@@ -244,9 +246,9 @@ internal static class Spreadsheets
         {
             for (int i = 0; i < width; i++)
             {
-                if (i > 0) sb.Append(',');
+                if (i > 0) sb.Append(delimiter);
                 var text = Display(i < row.Length ? row[i] : null);
-                if (text.IndexOfAny([',', '"', '\n', '\r']) >= 0 || text.StartsWith(' ') || text.EndsWith(' '))
+                if (text.IndexOfAny([delimiter, '"', '\n', '\r']) >= 0 || text.StartsWith(' ') || text.EndsWith(' '))
                     text = "\"" + text.Replace("\"", "\"\"") + "\"";
                 sb.Append(text);
             }

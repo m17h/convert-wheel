@@ -291,9 +291,8 @@ internal sealed class TriggerController : IDisposable
 
         _phase = Phase.Open;
         _maskArmed = _trigger.Any(k => k is VirtualKeys.Alt or VirtualKeys.Win);
-        var notice = plan.IsOfficeDocument && !Converter.CanConvertDocumentWithoutDownload(plan) ? "Needs a free download" : null;
         Win32.GetCursorPos(out var cursor);
-        _wheel.Open(plan, cursor, _settings.AlwaysShowAll, notice);
+        _wheel.Open(plan, cursor, _settings.AlwaysShowAll, notice: null);
         Publish();
         LoadThumbnail(plan.SourcePath);
     }

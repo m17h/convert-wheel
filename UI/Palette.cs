@@ -22,6 +22,9 @@ internal static class Palette
         FormatKind.Document => (Hex("#60A5FA"), Hex("#6366F1")),
         FormatKind.Spreadsheet => (Hex("#4ADE80"), Hex("#059669")),
         FormatKind.Presentation => (Hex("#FB923C"), Hex("#E11D48")),
+        FormatKind.Archive => (Hex("#A8A29E"), Hex("#78716C")),
+        FormatKind.Subtitle => (Hex("#F472B6"), Hex("#A855F7")),
+        FormatKind.Data => (Hex("#2DD4BF"), Hex("#0891B2")),
         _ => Neutral,
     };
 
@@ -33,6 +36,9 @@ internal static class Palette
         FormatKind.Document => "Document",
         FormatKind.Spreadsheet => "Spreadsheet",
         FormatKind.Presentation => "Slides",
+        FormatKind.Archive => "Archive",
+        FormatKind.Subtitle => "Subtitles",
+        FormatKind.Data => "Data",
         _ => "File",
     };
 

@@ -41,12 +41,6 @@ public partial class App : Application
             return;
         }
 
-        if (e.Args.Contains("--setup-libreoffice"))
-        {
-            SetupLibreOffice();
-            return;
-        }
-
         int previewAt = Array.IndexOf(e.Args, "--preview-wheel");
         if (previewAt >= 0 && previewAt + 1 < e.Args.Length)
         {
@@ -121,33 +115,9 @@ public partial class App : Application
             var target = plan.All.FirstOrDefault(f => f.Ext == Formats.Canonical(ext.TrimStart('.').ToLowerInvariant()))
                 ?? throw new ConversionException($"Can't convert {plan.SourceExt} to {ext}.");
             var output = await new Converter(settings).ConvertAsync(plan, target,
-                () => Task.FromResult(tools.FindFfmpeg() ?? throw new ToolMissingException("FFmpeg")),
+                () => Task.FromResult(BundledTools.HasFfmpeg ? BundledTools.UnpackFfmpeg() : tools.FindFfmpeg() ?? throw new ConversionException("FFmpeg isn't available.")),
                 new Progress<double?>(), CancellationToken.None);
             Console.WriteLine(output);
-            exitCode = 0;
-        }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine(ex.Message);
-            Log.Write(ex);
-        }
-        Shutdown(exitCode);
-    }
-
-    /// <summary>ConvertWheel.exe --setup-libreoffice : fetches the optional LibreOffice helper ahead of time.</summary>
-    async void SetupLibreOffice()
-    {
-        int exitCode = 1;
-        try
-        {
-            int lastPercent = -1;
-            var progress = new Progress<double?>(p =>
-            {
-                int percent = p is double f ? (int)(f * 100) : -1;
-                if (percent / 10 != lastPercent / 10 || (p == null && lastPercent != -1)) Console.WriteLine(p == null ? "Unpacking…" : $"{percent}%");
-                lastPercent = percent;
-            });
-            Console.WriteLine(await ToolLocator.DownloadLibreOfficeAsync(progress, CancellationToken.None));
             exitCode = 0;
         }
         catch (Exception ex)
@@ -196,9 +166,7 @@ public partial class App : Application
         if (_settingsWindow == null)
         {
             _settingsWindow = new SettingsWindow(_settings, _tools,
-                suspend => { if (_controller != null) _controller.Suspended = suspend; },
-                () => _conversions?.PrefetchFfmpeg(),
-                () => _conversions?.EnsureLibreOfficeAsync().ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted));
+                suspend => { if (_controller != null) _controller.Suspended = suspend; });
             _settingsWindow.Closed += (_, _) => _settingsWindow = null;
             _settingsWindow.Show();
         }

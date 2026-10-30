@@ -64,13 +64,19 @@ internal static class WebP
     /// </summary>
     public static void WriteAnimated(List<Media.AnimationFrame> frames, string output)
     {
-        int width = frames[0].Width, height = frames[0].Height;
-        using var body = new MemoryStream();
-        bool alpha = false;
+        using var writer = new AnimatedWriter(output, frames[0].Width, frames[0].Height, 85);
+        foreach (var frame in frames) writer.AddFrame(frame.Bgra, frame.DelayMs);
+    }
 
-        foreach (var frame in frames)
+    /// <summary>Encodes frames as they arrive (only the compressed data is kept), and writes the file on dispose.</summary>
+    internal sealed class AnimatedWriter(string output, int width, int height, int quality) : IDisposable
+    {
+        readonly MemoryStream _body = new();
+        bool _alpha;
+
+        public void AddFrame(byte[] bgra, int delayMs)
         {
-            var still = Encode(frame.Bgra, width, height, 85);
+            var still = Encode(bgra, width, height, quality);
             var bitstream = new MemoryStream();
             // Copy the ALPH/VP8/VP8L chunks; skip the RIFF header and any VP8X.
             for (int pos = 12; pos + 8 <= still.Length;)
@@ -79,17 +85,22 @@ internal static class WebP
                 int chunkSize = BinaryPrimitives.ReadInt32LittleEndian(still.AsSpan(pos + 4));
                 int total = 8 + chunkSize + (chunkSize & 1);
                 if (id is "ALPH" or "VP8 " or "VP8L") bitstream.Write(still, pos, Math.Min(total, still.Length - pos));
-                if (id is "ALPH" or "VP8L") alpha = true;
+                if (id is "ALPH" or "VP8L") _alpha = true;
                 pos += total;
             }
             var frameHeader = new byte[16];
             Put24(frameHeader, 6, width - 1);
             Put24(frameHeader, 9, height - 1);
-            Put24(frameHeader, 12, Math.Min(frame.DelayMs, 0xFFFFFF));
+            Put24(frameHeader, 12, Math.Min(delayMs, 0xFFFFFF));
             frameHeader[15] = 0x02; // don't blend with the previous frame
-            WriteChunk(body, "ANMF", [.. frameHeader, .. bitstream.ToArray()]);
+            WriteChunk(_body, "ANMF", [.. frameHeader, .. bitstream.ToArray()]);
         }
 
+        public void Dispose() => Finish(output, width, height, _alpha, _body);
+    }
+
+    static void Finish(string output, int width, int height, bool alpha, MemoryStream body)
+    {
         using var file = File.Create(output);
         var vp8x = new byte[10];
         vp8x[0] = (byte)(0x02 | (alpha ? 0x10 : 0)); // animation (+ alpha)

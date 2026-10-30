@@ -89,6 +89,8 @@ internal static class FlowBridge
             TextAlignment = p.Align,
             BreakPageBefore = p.PageBreakBefore,
             KeepWithNext = p.Heading > 0,
+            // Line breaks and empty lines take the size of the paragraph's text, not the document default.
+            FontSize = Units.ToDip(baseSize),
         };
         // A fixed line height would clip pictures, so lines with images keep their natural height.
         if (Math.Abs(p.LineSpacing - 1) > 0.01 && !p.Inlines.OfType<DImage>().Any())
@@ -107,14 +109,20 @@ internal static class FlowBridge
             else
             {
                 // A fixed-width box keeps item text aligned with the wrapped lines, like a tab stop would.
+                // The marker takes the colour and font of the item's first text, as Word and PowerPoint draw it.
+                var first = p.Inlines.OfType<DText>().FirstOrDefault(t => t.Text.Length > 0)?.Style;
                 var label = new TextBlock
                 {
                     Text = p.ListLabel,
                     Width = Units.ToDip(Math.Max(hang, 6)),
-                    FontFamily = Family(doc.Font),
-                    FontSize = Units.ToDip(baseSize),
-                    Foreground = Brushes.Black,
+                    FontFamily = Family(p.ListFont ?? first?.Font ?? doc.Font),
+                    FontSize = Units.ToDip(baseSize * (p.ListSize ?? 1)),
+                    Foreground = new SolidColorBrush(p.ListColor ?? first?.Color ?? Colors.Black),
                 };
+                // A long label ("2.2.1.") pushes the text along, as Word's tab after the number does.
+                label.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+                double needed = label.DesiredSize.Width + Units.ToDip(baseSize * 0.35);
+                if (needed > label.Width) label.Width = needed;
                 para.Inlines.Add(new InlineUIContainer(label) { BaselineAlignment = BaselineAlignment.TextBottom });
             }
         }
@@ -126,6 +134,7 @@ internal static class FlowBridge
             {
                 case DText t:
                     var run = Styled(new Run(t.Text), t.Style, heading);
+                    if (t.Style.Size == null && heading == null) run.FontSize = Units.ToDip(doc.FontSize);
                     if (t.Link != null && Uri.TryCreate(t.Link, UriKind.Absolute, out var uri))
                     {
                         var link = new Hyperlink(run) { NavigateUri = uri, Foreground = run.Foreground };
@@ -374,7 +383,10 @@ internal static class FlowBridge
             table.Columns.Add(new TableColumn { Width = widths != null ? new GridLength(Units.ToDip(widths[i])) : new GridLength(1, GridUnitType.Star) });
 
         var group = new TableRowGroup();
-        var border = new SolidColorBrush(Color.FromRgb(0x80, 0x80, 0x80));
+        var border = new SolidColorBrush(t.BorderColor ?? Color.FromRgb(0x80, 0x80, 0x80));
+        var padding = t.CellPadding is { } pad
+            ? new Thickness(Units.ToDip(pad.Left), Units.ToDip(pad.Top), Units.ToDip(pad.Right), Units.ToDip(pad.Bottom))
+            : new Thickness(Units.ToDip(5.4), Units.ToDip(1), Units.ToDip(5.4), Units.ToDip(1));
         foreach (var r in t.Rows)
         {
             var row = new TableRow();
@@ -387,12 +399,12 @@ internal static class FlowBridge
                 var cell = new TableCell
                 {
                     ColumnSpan = span,
-                    Padding = new Thickness(Units.ToDip(5.4), Units.ToDip(1), Units.ToDip(5.4), Units.ToDip(1)),
+                    Padding = padding,
                     BorderBrush = border,
                     BorderThickness = t.Borders ? new Thickness(0.67) : new Thickness(0),
                 };
                 if (c.Shading is { } shade) cell.Background = new SolidColorBrush(shade);
-                foreach (var b in c.Blocks) cell.Blocks.Add(ToBlock(b, ctx, Math.Max(20, cellWidth - 10.8)));
+                foreach (var b in c.Blocks) cell.Blocks.Add(ToBlock(b, ctx, Math.Max(20, cellWidth - Units.ToPoints(padding.Left + padding.Right))));
                 if (cell.Blocks.Count == 0) cell.Blocks.Add(new Paragraph());
                 if (r.Header) foreach (var p in cell.Blocks.OfType<Paragraph>()) p.FontWeight = FontWeights.Bold;
                 row.Cells.Add(cell);
@@ -429,7 +441,7 @@ internal static class FlowBridge
         }
         catch (Exception ex) when (ex is NotSupportedException or FileFormatException or ArgumentException or InvalidOperationException or System.Runtime.InteropServices.COMException)
         {
-            return null;
+            return MagickImages.Decode(data);
         }
     }
 

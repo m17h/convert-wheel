@@ -6,12 +6,12 @@ using System.Windows.Media.Imaging;
 namespace ConvertWheel.Conversion;
 
 /// <summary>
-/// Image conversion through Windows' built-in codecs, with Skia (bundled) for WebP and for images
-/// Windows can't read. Must run on an STA thread.
+/// Image conversion through Windows' built-in codecs, with bundled Skia (WebP) and ImageMagick (HEIC,
+/// AVIF, JPEG XL, PSD, camera RAW, SVG, TGA and dozens more) for everything else. Must run on an STA thread.
 /// </summary>
 internal static class ImageConverter
 {
-    /// <returns>false if neither Windows nor Skia can handle it, so the caller can fall back to FFmpeg.</returns>
+    /// <returns>false if no bundled decoder can read it, so the caller can fall back to FFmpeg.</returns>
     public static bool TryConvert(string input, string output, string ext)
     {
         // Animated GIFs stay animated as WebP.
@@ -25,11 +25,27 @@ internal static class ImageConverter
             }
         }
 
+        // Animated WebPs stay animated as GIF.
+        if (ext == "gif" && MagickImages.IsAnimatedWebP(input))
+        {
+            Media.Animation.WriteGif(MagickImages.ReadAnimatedWebP(input), output);
+            return true;
+        }
+
+        if (ext == "pdf")
+        {
+            var pages = DecodeAllPages(input);
+            if (pages.Count == 0) return false;
+            ImagePdf.Write(pages, output, Path.GetFileNameWithoutExtension(input));
+            return true;
+        }
+
         var image = Decode(input);
         if (image == null) return false;
 
         switch (ext)
         {
+            case "avif" or "jxl" or "tga": MagickImages.Encode(image, output, ext); break;
             case "webp": File.WriteAllBytes(output, WebP.Encode(image, quality: 90)); break;
             case "png": Save(new PngBitmapEncoder(), image, output); break;
             case "gif": Save(new GifBitmapEncoder(), image, output); break;
@@ -42,9 +58,13 @@ internal static class ImageConverter
         return true;
     }
 
-    /// <summary>Decodes with Windows imaging (honouring EXIF orientation), falling back to Skia.</summary>
-    static BitmapSource? Decode(string input)
+    /// <summary>Formats Windows' decoders misread or only partly support; these go straight to ImageMagick.</summary>
+    static readonly HashSet<string> MagickFirst = [".svg", ".svgz", ".psd", ".psb", ".xcf", ".emf", ".wmf", ".exr", ".hdr", ".dds", ".tga", ".pcx", ".qoi", ".jxl"];
+
+    /// <summary>Decodes with Windows imaging (honouring EXIF orientation), then Skia, then ImageMagick.</summary>
+    internal static BitmapSource? Decode(string input)
     {
+        if (MagickFirst.Contains(Path.GetExtension(input).ToLowerInvariant()) && MagickImages.Decode(input) is { } early) return early;
         try
         {
             using var stream = File.OpenRead(input);
@@ -55,8 +75,25 @@ internal static class ImageConverter
         }
         catch (Exception ex) when (ex is NotSupportedException or FileFormatException or COMException or ArgumentException or InvalidOperationException)
         {
-            return WebP.DecodeWithSkia(input);
+            return WebP.DecodeWithSkia(input) ?? MagickImages.Decode(input);
         }
+    }
+
+    /// <summary>Every page of a multi-page TIFF; a single picture otherwise.</summary>
+    static List<BitmapSource> DecodeAllPages(string input)
+    {
+        if (Path.GetExtension(input).ToLowerInvariant() is ".tif" or ".tiff")
+        {
+            try
+            {
+                using var stream = File.OpenRead(input);
+                var decoder = BitmapDecoder.Create(stream, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnLoad);
+                if (decoder.Frames.Count > 1)
+                    return decoder.Frames.Select(f => (BitmapSource)new FormatConvertedBitmap(Orient(f), PixelFormats.Bgra32, null, 0)).ToList();
+            }
+            catch (Exception ex) when (ex is NotSupportedException or FileFormatException or COMException) { }
+        }
+        return Decode(input) is { } single ? [single] : [];
     }
 
     static void Save(BitmapEncoder encoder, BitmapSource image, string output)

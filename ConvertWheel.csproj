@@ -33,14 +33,25 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="AngleSharp" Version="1.8.6" />
+    <PackageReference Include="bblanchon.PDFium.Win32" Version="158.0.8125" />
     <PackageReference Include="Concentus" Version="2.2.2" />
     <PackageReference Include="Concentus.Oggfile" Version="1.0.7" />
     <PackageReference Include="ExcelDataReader" Version="3.9.0" />
+    <PackageReference Include="Magick.NET-Q8-x64" Version="15.0.0" />
+    <PackageReference Include="Markdig" Version="1.5.1" />
     <PackageReference Include="NVorbis" Version="0.10.5" />
     <PackageReference Include="OggVorbisEncoder" Version="1.2.2" />
     <!-- Pinned: 6.2.x is the last MIT-licensed PDFsharp; later versions are AGPL. -->
     <PackageReference Include="PDFsharp" Version="6.2.4" />
+    <PackageReference Include="SharpCompress" Version="0.50.7" />
     <PackageReference Include="SkiaSharp" Version="4.153.1" />
+    <PackageReference Include="YamlDotNet" Version="18.1.0" />
+  </ItemGroup>
+
+  <!-- FFmpeg (LGPL) is embedded compressed and unpacked on first use. Create it with tools\pack-ffmpeg.ps1. -->
+  <ItemGroup Condition="Exists('tools\ffmpeg.tar.xz')">
+    <EmbeddedResource Include="tools\ffmpeg.tar.xz" LogicalName="ffmpeg.tar.xz" />
   </ItemGroup>
 
   <!-- SkiaSharp's package ships a ~96 MB native debug-symbols file; it isn't needed to run. -->

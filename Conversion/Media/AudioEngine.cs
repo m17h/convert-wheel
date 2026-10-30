@@ -3,7 +3,7 @@ namespace ConvertWheel.Conversion.Media;
 /// <summary>Converts audio (including the audio track of videos) without FFmpeg.</summary>
 internal static class AudioEngine
 {
-    static readonly HashSet<string> Outputs = ["mp3", "m4a", "aac", "wav", "flac", "ogg", "opus", "wma", "aiff"];
+    static readonly HashSet<string> Outputs = ["mp3", "m4a", "aac", "wav", "flac", "ogg", "opus", "wma", "aiff", "m4r"];
 
     public static bool CanEncode(string ext) => Outputs.Contains(ext);
 
@@ -37,7 +37,7 @@ internal static class AudioEngine
 
     static void WriteTags(MediaTags tags, string output, string ext)
     {
-        if (ext is "mp3" or "m4a" or "wma" or "flac") tags.WriteWithWindows(output);
+        if (ext is "mp3" or "m4a" or "m4r" or "wma" or "flac") tags.WriteWithWindows(output);
     }
 
     // ------------------------------------------------------------------ sources
@@ -103,7 +103,7 @@ internal static class AudioEngine
         int[]? allowed = ext switch
         {
             "mp3" => [32000, 44100, 48000],
-            "m4a" or "aac" => [44100, 48000],
+            "m4a" or "m4r" or "aac" => [44100, 48000],
             "wma" => [44100], // Windows' WMA encoder only offers 44.1 kHz at good bitrates
             _ => null,
         };
@@ -125,7 +125,7 @@ internal static class AudioEngine
         "ogg" => new VorbisSink(path, format, tags),
         "opus" => new OpusSink(path, format, tags),
         "mp3" => new MfAudioSink(path, MF.ContainerMP3, Mp3Type(format), format, 16),
-        "m4a" => new MfAudioSink(path, MF.ContainerMPEG4, AacType(format), format, 16),
+        "m4a" or "m4r" => new MfAudioSink(path, MF.ContainerMPEG4, AacType(format), format, 16), // M4R is an iPhone ringtone: AAC in MP4
         "aac" => new MfAudioSink(path, MF.ContainerADTS, AacType(format), format, 16),
         "wma" => new MfAudioSink(path, MF.ContainerASF, WmaType(format), format, 16),
         "flac" => new MfAudioSink(path, MF.ContainerFLAC, FlacType(format, bits), format, bits),
@@ -203,7 +203,7 @@ internal static class AudioEngine
     {
         // Formats only our managed decoders read (Ogg, Opus, AIFF) can't be copied through Windows.
         if (Path.GetExtension(input).ToLowerInvariant() is ".ogg" or ".oga" or ".opus" or ".aif" or ".aiff" or ".aifc") return false;
-        Guid? codec = ext switch { "m4a" or "aac" => MF.AudioAAC, "mp3" => MF.AudioMP3, _ => null };
+        Guid? codec = ext switch { "m4a" or "m4r" or "aac" => MF.AudioAAC, "mp3" => MF.AudioMP3, _ => null };
         if (codec == null) return false;
         var container = ext switch { "mp3" => MF.ContainerMP3, "aac" => MF.ContainerADTS, _ => MF.ContainerMPEG4 };
 

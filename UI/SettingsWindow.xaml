@@ -135,41 +135,14 @@
             <TextBlock Text="CONVERTERS" Style="{StaticResource SectionTitle}" />
             <Border Style="{StaticResource Card}">
                 <StackPanel>
-                    <TextBlock Text="Built in, nothing to download" Style="{StaticResource Body}" />
+                    <TextBlock Text="Everything is built in" Style="{StaticResource Body}" />
                     <TextBlock Style="{StaticResource Hint}"
-                               Text="Audio: MP3, M4A, AAC, WAV, FLAC, OGG, Opus, WMA and AIFF. Video: MP4, MOV, MKV, WMV and GIF (using Windows' own codecs). Images: PNG, JPG, WebP, BMP, GIF, TIFF and ICO. Documents: Word, OpenDocument, RTF and text to PDF, DOCX, ODT, RTF, TXT and HTML. Spreadsheets: Excel, OpenDocument and CSV to XLSX, ODS, CSV, PDF and HTML." />
+                               Text="Audio: MP3, M4A, WAV, FLAC, OGG, Opus, AAC, WMA, AIFF, AC3, M4R and more. Video: MP4, MKV, WebM, MOV, AVI, WMV, MPG, GIF and animated WebP. Images: PNG, JPG, WebP, AVIF, JPEG XL, HEIC, GIF, TIFF, ICO, TGA, PSD, SVG, camera RAW and more. Documents: Word (including old .doc), PDF, OpenDocument, RTF, Markdown, HTML, EPUB and text. Presentations: PowerPoint (.pptx and old .ppt) and OpenDocument, to PDF, pictures or each other. Spreadsheets, archives (ZIP, 7z, RAR, TAR), subtitles and JSON/YAML/XML too." />
                     <Border Style="{StaticResource Divider}" />
                     <StackPanel>
                         <TextBlock Text="Microsoft Office" Style="{StaticResource Body}" />
                         <TextBlock x:Name="OfficeStatus" Style="{StaticResource Hint}" />
                     </StackPanel>
-                    <Border Style="{StaticResource Divider}" />
-                    <Grid>
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*" />
-                            <ColumnDefinition Width="Auto" />
-                        </Grid.ColumnDefinitions>
-                        <StackPanel VerticalAlignment="Center" Margin="0,0,12,0">
-                            <TextBlock Text="FFmpeg (optional)" Style="{StaticResource Body}" />
-                            <TextBlock x:Name="FfmpegStatus" Style="{StaticResource Hint}" />
-                        </StackPanel>
-                        <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
-                            <Button x:Name="FfmpegDownload" Content="Download" Click="OnDownloadFfmpeg" Margin="0,0,8,0" />
-                            <Button Content="Choose…" Click="OnChooseFfmpeg" />
-                        </StackPanel>
-                    </Grid>
-                    <Border Style="{StaticResource Divider}" />
-                    <Grid>
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*" />
-                            <ColumnDefinition Width="Auto" />
-                        </Grid.ColumnDefinitions>
-                        <StackPanel VerticalAlignment="Center" Margin="0,0,12,0">
-                            <TextBlock Text="LibreOffice (optional)" Style="{StaticResource Body}" />
-                            <TextBlock x:Name="LibreOfficeStatus" Style="{StaticResource Hint}" />
-                        </StackPanel>
-                        <Button x:Name="LibreOfficeButton" Grid.Column="1" Content="Download" Click="OnGetLibreOffice" VerticalAlignment="Center" />
-                    </Grid>
                 </StackPanel>
             </Border>
 

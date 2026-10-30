@@ -75,6 +75,32 @@ internal static class PdfRenderer
         pdf.Save(output);
     }
 
+    /// <summary>Writes ready-made WPF visuals (e.g. slides), one per page, as vector PDF pages.</summary>
+    /// <param name="page">Builds page <c>i</c>; the returned action releases it once drawn.</param>
+    public static void RenderVisuals(string output, double widthPt, double heightPt, int count, Func<int, (Visual visual, Action release)> page, string? title)
+    {
+        var pdf = new PdfDocument();
+        if (!string.IsNullOrEmpty(title)) pdf.Info.Title = title;
+        pdf.Info.Creator = "Convert Wheel";
+        var images = new Dictionary<ImageSource, XImage>();
+        for (int i = 0; i < count; i++)
+        {
+            var pdfPage = pdf.AddPage();
+            pdfPage.Width = XUnit.FromPoint(widthPt);
+            pdfPage.Height = XUnit.FromPoint(heightPt);
+            var (visual, release) = page(i);
+            try
+            {
+                using var gfx = XGraphics.FromPdfPage(pdfPage);
+                gfx.ScaleTransform(72.0 / 96.0);
+                new PageWriter(gfx, images).Visual(visual, Matrix.Identity);
+            }
+            finally { release(); }
+        }
+        if (pdf.PageCount == 0) pdf.AddPage();
+        pdf.Save(output);
+    }
+
     /// <summary>
     /// The area actually painted (text, pictures, visible lines and fills). WPF's own bounds include the
     /// invisible page rectangle, which is useless for measuring a header or footer.
@@ -146,7 +172,7 @@ internal static class PdfRenderer
     }
 
     /// <summary>Lays out a small flow (header, text box) on one page and measures how tall its content is.</summary>
-    static (DocumentPage page, double height) Layout(FlowDocument flow)
+    internal static (DocumentPage page, double height) Layout(FlowDocument flow)
     {
         var paginator = ((IDocumentPaginatorSource)flow).DocumentPaginator;
         paginator.PageSize = new Size(flow.PageWidth, flow.PageHeight);
@@ -325,7 +351,20 @@ internal static class PdfRenderer
             }
 
             var pen = stroke is { } s ? new XPen(s, Math.Max(0.1, drawing.Pen!.Thickness)) : null;
-            var brush = fill is { } f ? new XSolidBrush(f) : null;
+            if (pen != null && drawing.Pen!.DashStyle is { Dashes.Count: > 0 } dash && dash != DashStyles.Solid) pen.DashStyle = XDashStyle.Dash;
+            XBrush? brush = fill is { } f ? new XSolidBrush(f) : null;
+            // Linear gradients (slide backgrounds, shapes) as real PDF gradients between their end colours.
+            if (drawing.Brush is LinearGradientBrush { GradientStops.Count: >= 2 } lg && ColorOf(lg) != null)
+            {
+                var bounds = flat.Bounds;
+                Point At(Point p) => lg.MappingMode == BrushMappingMode.RelativeToBoundingBox
+                    ? new Point(bounds.X + p.X * bounds.Width, bounds.Y + p.Y * bounds.Height) : p;
+                var stops = lg.GradientStops.OrderBy(g => g.Offset).ToList();
+                XColor C(Color c) => XColor.FromArgb((int)(c.A * lg.Opacity), c.R, c.G, c.B);
+                var (a, b) = (At(lg.StartPoint), At(lg.EndPoint));
+                if ((a - b).Length > 0.01)
+                    brush = new XLinearGradientBrush(new XPoint(a.X, a.Y), new XPoint(b.X, b.Y), C(stops[0].Color), C(stops[^1].Color));
+            }
             WithTransform(matrix, () =>
             {
                 if (pen != null && brush != null) gfx.DrawPath(pen, brush, path);

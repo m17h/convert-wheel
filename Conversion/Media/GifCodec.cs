@@ -285,6 +285,28 @@ internal sealed class ColorHistogram
     }
 }
 
+/// <summary>Animated GIF and WebP as plain frame lists.</summary>
+internal static class Animation
+{
+    public static bool IsAnimated(string path) => Path.GetExtension(path).ToLowerInvariant() switch
+    {
+        ".gif" => true,
+        ".webp" => MagickImages.IsAnimatedWebP(path),
+        _ => false,
+    };
+
+    public static List<AnimationFrame> Read(string path) =>
+        Path.GetExtension(path).Equals(".webp", StringComparison.OrdinalIgnoreCase) ? MagickImages.ReadAnimatedWebP(path) : GifReader.Read(path);
+
+    public static void WriteGif(List<AnimationFrame> frames, string output)
+    {
+        var histogram = new ColorHistogram();
+        foreach (var f in frames.Where((_, i) => i % Math.Max(1, frames.Count / 30) == 0)) histogram.Add(f.Bgra, step: 3);
+        using var gif = new GifWriter(output, frames[0].Width, frames[0].Height, histogram);
+        foreach (var f in frames) gif.AddFrame(f.Bgra, f.DelayMs);
+    }
+}
+
 /// <summary>Reads animated GIFs through Windows imaging and composites each frame onto the canvas.</summary>
 internal static class GifReader
 {

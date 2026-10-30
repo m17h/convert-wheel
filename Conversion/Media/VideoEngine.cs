@@ -13,16 +13,21 @@ internal static class VideoEngine
 
     public static bool CanConvert(ConversionPlan plan, FormatInfo target)
     {
-        if (plan.SourceKind == FormatKind.Video) return VideoTargets.Contains(target.Ext) || target.Ext == "gif";
-        return plan.SourceExt == "gif" && VideoTargets.Contains(target.Ext);
+        if (plan.SourceKind == FormatKind.Video) return VideoTargets.Contains(target.Ext) || target.Ext is "gif" or "webp";
+        return Animation.IsAnimated(plan.SourcePath) && VideoTargets.Contains(target.Ext);
     }
 
     public static void Convert(ConversionPlan plan, FormatInfo target, string output, IProgress<double?> progress, CancellationToken ct)
     {
         MF.EnsureStarted();
-        if (plan.SourceExt == "gif")
+        if (plan.SourceKind == FormatKind.Image)
         {
             GifToVideo(plan.SourcePath, output, target.Ext, progress, ct);
+            return;
+        }
+        if (target.Ext == "webp")
+        {
+            VideoToWebP(plan.SourcePath, output, progress, ct);
             return;
         }
         if (target.Ext == "gif")
@@ -432,6 +437,21 @@ internal static class VideoEngine
 
     // ------------------------------------------------------------------ GIF
 
+    /// <summary>Animated WebP: full colour (no palette) and much smaller than GIF.</summary>
+    static void VideoToWebP(string input, string output, IProgress<double?> progress, CancellationToken ct)
+    {
+        Conversion.WebP.AnimatedWriter? writer = null;
+        try
+        {
+            ReadGifFrames(input, 15, 720, ct, (pixels, w, h, delayMs, _) =>
+            {
+                writer ??= new Conversion.WebP.AnimatedWriter(output, w, h, 75);
+                writer.AddFrame(pixels, delayMs);
+            }, p => progress.Report(p * 0.99));
+        }
+        finally { writer?.Dispose(); }
+    }
+
     static void VideoToGif(string input, string output, IProgress<double?> progress, CancellationToken ct)
     {
         const double Fps = 15;
@@ -541,8 +561,8 @@ internal static class VideoEngine
 
     static void GifToVideo(string input, string output, string ext, IProgress<double?> progress, CancellationToken ct)
     {
-        var frames = GifReader.Read(input);
-        if (frames.Count == 0) throw new ConversionException("This GIF has no frames.");
+        var frames = Animation.Read(input);
+        if (frames.Count == 0) throw new ConversionException("This animation has no frames.");
         if (ext == "mkv")
         {
             // Encode to MP4 first, then rewrap.

@@ -10,7 +10,7 @@ internal sealed class ConversionManager(AppSettings settings, ToolLocator tools,
 {
     readonly Converter _converter = new(settings);
     readonly SemaphoreSlim _slots = new(2);
-    Task<string>? _ffmpegDownload, _libreOfficeDownload;
+    Task<string>? _ffmpegUnpack;
 
     public async void Start(ConversionPlan plan, FormatInfo target)
     {
@@ -49,33 +49,6 @@ internal sealed class ConversionManager(AppSettings settings, ToolLocator tools,
         {
             Finish(toast, ToastGlyph.Info, Palette.More, "Conversion cancelled", name, 3);
         }
-        catch (ToolMissingException ex) when (ex.Tool == "LibreOffice")
-        {
-            // Only reached for formats nothing built in can read (e.g. PowerPoint files without Office).
-            Finish(toast, ToastGlyph.Info, Palette.Neutral, $"{plan.SourceExt.ToUpperInvariant()} files need a free helper",
-                $"LibreOffice: one-time {ToolLocator.LibreOfficeDownloadMb} MB download, nothing to install.", 30);
-            toast.AddAction("Download & convert", () =>
-            {
-                toast.DismissNow();
-                EnsureLibreOfficeAsync().ContinueWith(t => { if (t.IsCompletedSuccessfully) Start(plan, target); },
-                    TaskScheduler.FromCurrentSynchronizationContext());
-            });
-            toast.AddAction("Not now", toast.DismissNow);
-        }
-        catch (ToolMissingException ex) when (ex.Tool == "FFmpeg")
-        {
-            // Only reached for what the built-in engines can't do (WebM, AVI, AVIF, unusual inputs).
-            Finish(toast, ToastGlyph.Info, Palette.Neutral, $"{target.Label} needs a free helper",
-                $"FFmpeg: one-time {ToolLocator.FfmpegDownloadMb} MB download, nothing to install.", 30);
-            toast.AddAction("Download & convert", () =>
-            {
-                toast.DismissNow();
-                PrefetchFfmpeg();
-                _ffmpegDownload?.ContinueWith(t => { if (t.IsCompletedSuccessfully) Start(plan, target); },
-                    TaskScheduler.FromCurrentSynchronizationContext());
-            });
-            toast.AddAction("Not now", toast.DismissNow);
-        }
         catch (Exception ex)
         {
             Log.Write(ex);
@@ -93,73 +66,40 @@ internal sealed class ConversionManager(AppSettings settings, ToolLocator tools,
     }
 
     /// <summary>
-    /// Returns FFmpeg's path. If it isn't there, a download already under way is awaited; otherwise the
-    /// user is asked first (via <see cref="ToolMissingException"/>) rather than downloading silently.
+    /// FFmpeg ships inside the app; the first time it's needed it's unpacked (a few seconds, once).
+    /// Concurrent conversions share the same unpacking.
     /// </summary>
-    Task<string> EnsureFfmpegAsync(CancellationToken ct)
+    Task<string> EnsureFfmpegAsync(CancellationToken ct) => Application.Current.Dispatcher.Invoke(() =>
     {
-        return Application.Current.Dispatcher.Invoke(() =>
-        {
-            var existing = tools.FindFfmpeg();
-            if (existing != null) return Task.FromResult(existing);
-            if (_ffmpegDownload != null) return _ffmpegDownload.WaitAsync(ct);
-            throw new ToolMissingException("FFmpeg");
-        });
-    }
+        if (BundledTools.ReadyFfmpeg() is { } ready) return Task.FromResult(ready);
+        if (!BundledTools.HasFfmpeg)
+            return Task.FromResult(tools.FindFfmpeg() ?? throw new ConversionException("This format needs the video tools, which aren't included in this build."));
+        return (_ffmpegUnpack ??= UnpackFfmpegAsync()).WaitAsync(ct);
+    });
 
-    async Task<string> DownloadFfmpegAsync()
+    async Task<string> UnpackFfmpegAsync()
     {
-        var toast = toasts.Push("Setting up FFmpeg", $"One-time download (about {ToolLocator.FfmpegDownloadMb} MB)", Palette.Neutral, ToastGlyph.Download);
-        toast.SetProgress(0);
+        var toast = toasts.Push("Preparing video tools", "One-time setup, a few seconds", Palette.Neutral, ToastGlyph.Working);
+        toast.SetProgress(null);
         try
         {
-            var path = await tools.DownloadFfmpegAsync(new Progress<double?>(toast.SetProgress), CancellationToken.None);
-            Finish(toast, ToastGlyph.Success, Palette.Success, "FFmpeg is ready", "WebM, AVI, AVIF and rare formats can now be converted.", 4);
+            var path = await Task.Run(BundledTools.UnpackFfmpeg);
+            toast.DismissNow();
             return path;
         }
         catch (Exception ex)
         {
             Log.Write(ex);
-            _ffmpegDownload = null;
-            Finish(toast, ToastGlyph.Error, Palette.Error, "Couldn't download FFmpeg", "Check your connection, or set ffmpeg.exe in Settings.", 15);
-            throw new ConversionException("FFmpeg isn't available.");
+            _ffmpegUnpack = null;
+            Finish(toast, ToastGlyph.Error, Palette.Error, "Couldn't prepare the video tools", ex.Message, 15);
+            throw new ConversionException("The video tools couldn't be prepared.");
         }
     }
 
-    /// <summary>Downloads LibreOffice once; concurrent requests share the same download.</summary>
-    public Task<string> EnsureLibreOfficeAsync()
+    /// <summary>Unpacks the bundled tools ahead of time (from Settings).</summary>
+    public void PrepareFfmpeg()
     {
-        if (ToolLocator.FindLibreOffice() is { } existing) return Task.FromResult(existing);
-        return _libreOfficeDownload ??= DownloadLibreOfficeAsync();
-    }
-
-    async Task<string> DownloadLibreOfficeAsync()
-    {
-        var toast = toasts.Push("Setting up LibreOffice", $"One-time download (about {ToolLocator.LibreOfficeDownloadMb} MB)", Palette.Neutral, ToastGlyph.Download);
-        toast.SetProgress(0);
-        var progress = new Progress<double?>(p =>
-        {
-            toast.SetProgress(p);
-            if (p == null) toast.Update("Setting up LibreOffice", "Unpacking… this takes a minute");
-        });
-        try
-        {
-            var path = await ToolLocator.DownloadLibreOfficeAsync(progress, CancellationToken.None);
-            Finish(toast, ToastGlyph.Success, Palette.Success, "LibreOffice is ready", "Every document format can now be converted.", 4);
-            return path;
-        }
-        catch (Exception ex)
-        {
-            Log.Write(ex);
-            _libreOfficeDownload = null;
-            Finish(toast, ToastGlyph.Error, Palette.Error, "Couldn't set up LibreOffice", ex is ConversionException ? ex.Message : "Check your connection and try again.", 15);
-            throw;
-        }
-    }
-
-    public void PrefetchFfmpeg()
-    {
-        if (tools.FindFfmpeg() == null) _ffmpegDownload ??= DownloadFfmpegAsync();
+        if (BundledTools.HasFfmpeg && BundledTools.ReadyFfmpeg() == null) _ffmpegUnpack ??= UnpackFfmpegAsync();
     }
 
     static bool TryRecycle(string path)

@@ -15,20 +15,16 @@ public partial class SettingsWindow : Window
     readonly AppSettings _settings;
     readonly ToolLocator _tools;
     readonly Action<bool> _suspendTrigger;
-    readonly Action _downloadFfmpeg;
-    readonly Action _downloadLibreOffice;
     readonly HashSet<int> _held = [];
     readonly HashSet<int> _recorded = [];
     bool _recording;
     bool _loading = true; // controls raise change events while InitializeComponent builds them
 
-    internal SettingsWindow(AppSettings settings, ToolLocator tools, Action<bool> suspendTrigger, Action downloadFfmpeg, Action downloadLibreOffice)
+    internal SettingsWindow(AppSettings settings, ToolLocator tools, Action<bool> suspendTrigger)
     {
         _settings = settings;
         _tools = tools;
         _suspendTrigger = suspendTrigger;
-        _downloadFfmpeg = downloadFfmpeg;
-        _downloadLibreOffice = downloadLibreOffice;
         InitializeComponent();
 
         Logo.Source = LoadLogo();
@@ -83,24 +79,11 @@ public partial class SettingsWindow : Window
 
     void RefreshTools()
     {
-        var ffmpeg = _tools.FindFfmpeg();
-        FfmpegStatus.Text = ffmpeg != null
-            ? $"Ready · {ffmpeg}"
-            : $"Only needed for WebM, AVI, AVIF and unusual formats. You'll be asked first ({ToolLocator.FfmpegDownloadMb} MB).";
-        FfmpegDownload.Visibility = ffmpeg == null ? Visibility.Visible : Visibility.Collapsed;
-
         var apps = new[] { "Word", "Excel", "PowerPoint" }.Where(OfficeAutomation.IsInstalled).ToList();
         OfficeStatus.Text = apps.Count > 0
             ? $"Found {string.Join(", ", apps)}. Used automatically for the most faithful conversions of Office files."
-            : "Not installed. That's fine: the built-in converter handles most documents.";
+            : "Not installed. That's fine: everything converts without it.";
 
-        var libreOffice = ToolLocator.FindLibreOffice();
-        LibreOfficeStatus.Text = libreOffice != null
-            ? $"Ready · {libreOffice}"
-            : apps.Contains("PowerPoint")
-                ? "Not needed on this PC."
-                : $"Only needed for PowerPoint slides and old .doc files. You'll be asked first ({ToolLocator.LibreOfficeDownloadMb} MB).";
-        LibreOfficeButton.Visibility = libreOffice == null && !apps.Contains("PowerPoint") ? Visibility.Visible : Visibility.Collapsed;
     }
 
     // ------------------------------------------------------------------ simple settings
@@ -157,28 +140,6 @@ public partial class SettingsWindow : Window
         if (dialog.ShowDialog(this) != true) return false;
         _settings.CustomOutputFolder = dialog.FolderName;
         return true;
-    }
-
-    void OnDownloadFfmpeg(object sender, RoutedEventArgs e)
-    {
-        FfmpegDownload.IsEnabled = false;
-        FfmpegStatus.Text = "Downloading… progress is shown in the corner of your screen.";
-        _downloadFfmpeg();
-    }
-
-    void OnChooseFfmpeg(object sender, RoutedEventArgs e)
-    {
-        var dialog = new OpenFileDialog { Title = "Locate ffmpeg.exe", Filter = "ffmpeg.exe|ffmpeg.exe|Programs (*.exe)|*.exe" };
-        if (dialog.ShowDialog(this) != true) return;
-        _settings.FfmpegPath = dialog.FileName;
-        _settings.Save();
-    }
-
-    void OnGetLibreOffice(object sender, RoutedEventArgs e)
-    {
-        LibreOfficeButton.IsEnabled = false;
-        LibreOfficeStatus.Text = "Downloading… progress is shown in the corner of your screen.";
-        _downloadLibreOffice();
     }
 
     // ------------------------------------------------------------------ shortcut recording

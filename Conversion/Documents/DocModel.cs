@@ -106,6 +106,10 @@ internal sealed class DParagraph : DBlock
     public int ListLevel { get; set; }
     /// <summary>The rendered marker, e.g. "•" or "3.", computed by the reader.</summary>
     public string? ListLabel { get; set; }
+    /// <summary>Marker look when it differs from the item text (PowerPoint's bullet font, colour and size).</summary>
+    public string? ListFont { get; set; }
+    public Color? ListColor { get; set; }
+    public double? ListSize { get; set; }
     public TextAlignment Align { get; set; } = TextAlignment.Left;
     public double SpaceBefore { get; set; }
     public double SpaceAfter { get; set; }
@@ -138,6 +142,9 @@ internal sealed class DTable : DBlock
     public List<DRow> Rows { get; } = [];
     public bool Borders { get; set; }
     public List<double>? ColumnWidths { get; set; }
+    /// <summary>Grid colour and cell padding (points) when they differ from a document table's (slides).</summary>
+    public Color? BorderColor { get; set; }
+    public Thickness? CellPadding { get; set; }
 
     public int ColumnCount => Rows.Count == 0 ? 0 : Rows.Max(r => r.Cells.Sum(c => Math.Max(1, c.ColSpan)));
 }
