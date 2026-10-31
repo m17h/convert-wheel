@@ -32,6 +32,16 @@ internal static class ImageConverter
             return true;
         }
 
+        // Text in the picture (screenshots, photos of pages, scans), read with Windows' OCR.
+        if (ext is "txt" or "docx")
+        {
+            var pictures = DecodeAllPages(input);
+            if (pictures.Count == 0) return false;
+            var doc = Documents.PdfSource.FromPictures(pictures, Path.GetFileNameWithoutExtension(input), CancellationToken.None);
+            Documents.BuiltInDocuments.Write(doc, ext, output);
+            return true;
+        }
+
         if (ext == "pdf")
         {
             var pages = DecodeAllPages(input);

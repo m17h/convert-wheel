@@ -25,54 +25,106 @@ internal static class PdfRenderer
     /// <summary>
     /// Renders a document: WPF lays out the body (footnotes and wrapped floats included); then each page
     /// gets its header/footer (with live page numbers) and any behind/in-front pictures painted around it.
+    /// Sections with their own page size or columns are laid out separately and numbered on.
     /// </summary>
     public static void Render(DDocument doc, string output)
     {
-        var ctx = new FlowBridge.FlowContext(doc);
-        var flow = FlowBridge.ToFlow(ctx);
         var pdf = new PdfDocument();
         if (!string.IsNullOrEmpty(doc.Title)) pdf.Info.Title = doc.Title;
         pdf.Info.Creator = "Convert Wheel";
 
-        var paginator = Paginate(flow);
+        var parts = Sections(doc);
+        var earlierEndnotes = new List<DNote>();
+        var laidOut = new List<(DDocument part, FlowBridge.FlowContext ctx, DynamicDocumentPaginator paginator)>();
+        for (int k = 0; k < parts.Count; k++)
+        {
+            bool last = k == parts.Count - 1;
+            var (ctx, paginator) = LayOut(parts[k], hold: !last, earlierEndnotes);
+            if (!last) earlierEndnotes.AddRange(ctx.Endnotes);
+            laidOut.Add((parts[k], ctx, paginator));
+        }
+        int total = laidOut.Sum(l => l.paginator.PageCount);
 
+        var images = new Dictionary<ImageSource, XImage>();
+        int number = 0;
+        foreach (var (part, ctx, paginator) in laidOut)
+        {
+            // Which page each overlay belongs to: the page holding its anchor.
+            var overlays = ctx.Overlays.Select(o => (o.Float, page: PageOf(paginator, o.Anchor))).ToList();
+            for (int i = 0; i < paginator.PageCount; i++)
+            {
+                number++;
+                using var page = paginator.GetPage(i);
+                var pdfPage = pdf.AddPage();
+                pdfPage.Width = XUnit.FromPoint(part.PageWidth);
+                pdfPage.Height = XUnit.FromPoint(part.PageHeight);
+                using var gfx = XGraphics.FromPdfPage(pdfPage);
+                gfx.ScaleTransform(72.0 / 96.0); // draw in WPF device-independent pixels
+                var writer = new PageWriter(gfx, images);
+                var here = overlays.Where(o => o.page == i).Select(o => o.Float).ToList();
+
+                foreach (var f in here.Where(f => f.Wrap == FloatWrap.Behind)) DrawFloat(writer, part, ctx, f, Units.ToDip(part.Margins.Top));
+                writer.Visual(page.Visual, Matrix.Identity);
+                foreach (var f in here.Where(f => f.Wrap != FloatWrap.Behind)) DrawFloat(writer, part, ctx, f, Units.ToDip(part.Margins.Top));
+
+                var (header, footer) = part.HeaderFooterFor(number, firstOfSection: i == 0);
+                DrawHeaderFooter(writer, part, header, number, total, isHeader: true);
+                DrawHeaderFooter(writer, part, footer, number, total, isHeader: false);
+            }
+        }
+        if (pdf.PageCount == 0) pdf.AddPage();
+        pdf.Save(output);
+    }
+
+    /// <summary>Lays out one section; a first pass finds which page each footnote lands on.</summary>
+    static (FlowBridge.FlowContext ctx, DynamicDocumentPaginator paginator) LayOut(DDocument part, bool hold, List<DNote> earlierEndnotes)
+    {
+        var ctx = new FlowBridge.FlowContext(part) { HoldEndnotes = hold, EarlierEndnotes = [.. earlierEndnotes] };
+        var paginator = Paginate(FlowBridge.ToFlow(ctx));
         // Footnotes: a first layout shows which page each reference lands on; the final layout then gives
         // each page one block holding its notes in order.
         var footnotes = ctx.NoteAnchors.Where(kv => !kv.Key.Endnote).ToList();
         if (footnotes.Count > 1)
         {
             var pagesOfNotes = footnotes.ToDictionary(kv => kv.Key, kv => PageOf(paginator, kv.Value));
-            ctx = new FlowBridge.FlowContext(doc) { NotePages = pagesOfNotes };
-            flow = FlowBridge.ToFlow(ctx);
-            paginator = Paginate(flow);
+            ctx = new FlowBridge.FlowContext(part) { NotePages = pagesOfNotes, HoldEndnotes = hold, EarlierEndnotes = [.. earlierEndnotes] };
+            paginator = Paginate(FlowBridge.ToFlow(ctx));
         }
-        int pages = paginator.PageCount;
+        return (ctx, paginator);
+    }
 
-        // Which page each overlay belongs to: the page holding its anchor.
-        var overlays = ctx.Overlays.Select(o => (o.Float, page: PageOf(paginator, o.Anchor))).ToList();
-
-        var images = new Dictionary<ImageSource, XImage>();
-        for (int i = 0; i < pages; i++)
+    /// <summary>The document split where a section with different page settings begins.</summary>
+    static List<DDocument> Sections(DDocument doc)
+    {
+        if (!doc.Blocks.Skip(1).Any(b => b.Section != null)) return [doc];
+        var parts = new List<DDocument>();
+        DDocument? current = null;
+        foreach (var block in doc.Blocks)
         {
-            using var page = paginator.GetPage(i);
-            var pdfPage = pdf.AddPage();
-            pdfPage.Width = XUnit.FromPoint(doc.PageWidth);
-            pdfPage.Height = XUnit.FromPoint(doc.PageHeight);
-            using var gfx = XGraphics.FromPdfPage(pdfPage);
-            gfx.ScaleTransform(72.0 / 96.0); // draw in WPF device-independent pixels
-            var writer = new PageWriter(gfx, images);
-            var here = overlays.Where(o => o.page == i).Select(o => o.Float).ToList();
-
-            foreach (var f in here.Where(f => f.Wrap == FloatWrap.Behind)) DrawFloat(writer, doc, ctx, f, Units.ToDip(doc.Margins.Top));
-            writer.Visual(page.Visual, Matrix.Identity);
-            foreach (var f in here.Where(f => f.Wrap != FloatWrap.Behind)) DrawFloat(writer, doc, ctx, f, Units.ToDip(doc.Margins.Top));
-
-            var (header, footer) = doc.HeaderFooterFor(i + 1);
-            DrawHeaderFooter(writer, doc, header, i + 1, pages, isHeader: true);
-            DrawHeaderFooter(writer, doc, footer, i + 1, pages, isHeader: false);
+            if (current == null || block.Section != null && current.Blocks.Count > 0)
+            {
+                var setup = current == null ? null : block.Section;
+                current = new DDocument
+                {
+                    Font = doc.Font, FontSize = doc.FontSize, Title = doc.Title,
+                    PageWidth = setup?.Width ?? doc.PageWidth, PageHeight = setup?.Height ?? doc.PageHeight,
+                    Margins = setup?.Margins ?? doc.Margins, Columns = setup?.Columns ?? doc.Columns, ColumnGap = setup?.ColumnGap ?? doc.ColumnGap,
+                    Header = doc.Header, Footer = doc.Footer, FirstHeader = doc.FirstHeader, FirstFooter = doc.FirstFooter,
+                    EvenHeader = doc.EvenHeader, EvenFooter = doc.EvenFooter, DifferentFirstPage = doc.DifferentFirstPage,
+                    HeaderDistance = doc.HeaderDistance, FooterDistance = doc.FooterDistance,
+                };
+                parts.Add(current);
+            }
+            current.Blocks.Add(block);
         }
-        if (pdf.PageCount == 0) pdf.AddPage();
-        pdf.Save(output);
+        return parts;
+    }
+
+    /// <summary>An embeddable Windows font for PDFsharp drawing outside the document renderer.</summary>
+    internal static XFont SystemFont(string family, double size)
+    {
+        if (new Typeface(family).TryGetGlyphTypeface(out var glyphs)) return WindowsFontResolver.Instance.FontFor(glyphs, size);
+        return WindowsFontResolver.Instance.Fallback(size);
     }
 
     /// <summary>Writes ready-made WPF visuals (e.g. slides), one per page, as vector PDF pages.</summary>

@@ -94,7 +94,17 @@ internal sealed class DHeaderFooter
     public bool IsEmpty => Blocks.Count == 0 || Blocks.All(b => b is DParagraph p && p.Inlines.Count == 0);
 }
 
-internal abstract class DBlock;
+/// <summary>Page settings of a document section.</summary>
+internal sealed record PageSetup(double Width, double Height, Thickness Margins, int Columns = 1, double ColumnGap = 36)
+{
+    public double ContentWidth => Width - Margins.Left - Margins.Right;
+}
+
+internal abstract class DBlock
+{
+    /// <summary>A new section starts at this block, on a new page with these settings (landscape pages, a different size, columns).</summary>
+    public PageSetup? Section { get; set; }
+}
 
 internal enum ListKind { None, Bullet, Number }
 
@@ -169,6 +179,9 @@ internal sealed class DDocument
     public double FontSize { get; set; } = 11;
     public double PageWidth { get; set; } = DefaultPage.Width;
     public double PageHeight { get; set; } = DefaultPage.Height;
+    /// <summary>Newspaper-style columns on the (first section's) pages.</summary>
+    public int Columns { get; set; } = 1;
+    public double ColumnGap { get; set; } = 36;
     public Thickness Margins { get; set; } = new(72);
     public string? Title { get; set; }
 
@@ -185,9 +198,10 @@ internal sealed class DDocument
     public double HeaderDistance { get; set; } = 36;
     public double FooterDistance { get; set; } = 36;
 
-    public (DHeaderFooter? header, DHeaderFooter? footer) HeaderFooterFor(int pageNumber)
+    /// <param name="firstOfSection">The page opens a section (each section has its own first page).</param>
+    public (DHeaderFooter? header, DHeaderFooter? footer) HeaderFooterFor(int pageNumber, bool firstOfSection = false)
     {
-        if (pageNumber == 1 && DifferentFirstPage) return (FirstHeader, FirstFooter);
+        if ((pageNumber == 1 || firstOfSection) && DifferentFirstPage) return (FirstHeader, FirstFooter);
         if (pageNumber % 2 == 0 && (EvenHeader != null || EvenFooter != null)) return (EvenHeader ?? Header, EvenFooter ?? Footer);
         return (Header, Footer);
     }

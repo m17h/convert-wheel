@@ -146,8 +146,41 @@ internal static class ImagePdf
             using var stream = Encode(bitmap);
             var image = XImage.FromStream(stream);
             gfx.DrawImage(image, (page.Width.Point - w) / 2, (page.Height.Point - h) / 2, w, h);
+            AddTextLayer(gfx, bitmap, (page.Width.Point - w) / 2, (page.Height.Point - h) / 2, w / bitmap.PixelWidth);
         }
         pdf.Save(output);
+    }
+
+    /// <summary>
+    /// Invisible text over the picture, placed word by word where OCR found it, so the PDF can be searched
+    /// and its text selected and copied, like a scanner's "searchable PDF".
+    /// </summary>
+    static void AddTextLayer(XGraphics gfx, BitmapSource bitmap, double x, double y, double scale)
+    {
+        if (!Ocr.Available) return;
+        List<Ocr.Line> lines;
+        try { lines = Ocr.Recognize(bitmap); }
+        catch (Exception ex) when (ex is ConversionException or System.Runtime.InteropServices.COMException)
+        {
+            Log.Write($"No text layer: {ex.Message}");
+            return;
+        }
+        var clear = new XSolidBrush(XColor.FromArgb(0, 0, 0, 0));
+        foreach (var line in lines)
+        foreach (var word in line.Words)
+        {
+            if (word.Text.Length == 0 || word.Bounds.Width <= 0 || word.Bounds.Height <= 0) continue;
+            // One size per line (from its tallest word), so copied text keeps an even size.
+            double height = line.Words.Max(w => w.Bounds.Height) * scale, width = word.Bounds.Width * scale;
+            var font = Documents.PdfRenderer.SystemFont("Arial", Math.Max(1, height));
+            double natural = gfx.MeasureString(word.Text + " ", font).Width;
+            if (natural <= 0) continue;
+            var state = gfx.Save();
+            gfx.TranslateTransform(x + word.Bounds.X * scale, y + word.Bounds.Bottom * scale);
+            gfx.ScaleTransform(width / natural * (1 + 1.0 / Math.Max(1, word.Text.Length)), 1);
+            gfx.DrawString(word.Text + " ", font, clear, 0, -height * 0.2, XStringFormats.BaseLineLeft);
+            gfx.Restore(state);
+        }
     }
 
     /// <summary>Photos as JPEG, anything with transparency as PNG.</summary>

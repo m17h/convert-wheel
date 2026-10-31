@@ -9,7 +9,7 @@ namespace ConvertWheel.Conversion.Documents;
 /// Reads Word 97–2003 documents (.doc) without Word: text from the piece table, character and paragraph
 /// formatting, styles (headings), lists, tables, hyperlinks, inline pictures, footnotes and page setup.
 /// </summary>
-internal sealed class WordBinaryReader
+internal sealed partial class WordBinaryReader
 {
     readonly byte[] _word, _table, _data;
     readonly List<(int cpStart, int cpEnd, int fc, bool compressed)> _pieces = [];
@@ -20,7 +20,7 @@ internal sealed class WordBinaryReader
     readonly Dictionary<int, (bool simple, List<Level> levels)> _lists = [];
     readonly List<int> _lfoToLsid = [];
     readonly Dictionary<(int lsid, int level), int> _counters = [];
-    int _footnoteNumber;
+    int _footnoteNumber, _endnoteNumber;
     string? _defaultFont;
 
     sealed record Level(int Start, int Format, string Text, double Indent, double Hanging, byte[] Chpx);
@@ -28,6 +28,7 @@ internal sealed class WordBinaryReader
     sealed class CharProps
     {
         public bool Bold, Italic, Underline, Strike, Hidden;
+        public int Lid;
         public int Position;
         public double? Size;
         public Color? Color;
@@ -40,10 +41,16 @@ internal sealed class WordBinaryReader
         public TextAlignment Align = TextAlignment.Left;
         public double Left, First, Before, After, Line = 1;
         public bool InTable, RowEnd, Contextual;
+        public TextAlignment? FrameAlign;
+        /// <summary>Word 6 numbering: the paragraph's autonumber settings and level (0 = not numbered).</summary>
+        public byte[]? Anld;
+        public int NLvlAnm;
         public int ListLevel, ListIndex, Heading;
     }
 
-    WordBinaryReader(byte[] word, byte[] table, byte[] data) => (_word, _table, _data) = (word, table, data);
+    readonly CompoundFile? _file;
+
+    WordBinaryReader(byte[] word, byte[] table, byte[] data, CompoundFile? file = null) => (_word, _table, _data, _file) = (word, table, data, file);
 
     public static DDocument Read(string path)
     {
@@ -56,16 +63,28 @@ internal sealed class WordBinaryReader
 
         var cfb = new CompoundFile(bytes);
         var word = cfb.Stream("WordDocument") ?? throw new ConversionException("This isn't a Word document.");
-        if (word.Length < 0x200 || BinaryPrimitives.ReadUInt16LittleEndian(word) != 0xA5EC) throw new ConversionException("This isn't a Word document.");
+        if (word.Length < 0x200 || BinaryPrimitives.ReadUInt16LittleEndian(word) is not (0xA5EC or 0xA5DC)) throw new ConversionException("This isn't a Word document.");
         int nFib = BinaryPrimitives.ReadUInt16LittleEndian(word.AsSpan(2));
         ushort flags = BinaryPrimitives.ReadUInt16LittleEndian(word.AsSpan(0x0A));
         if ((flags & 0x0100) != 0) throw new ConversionException("This document is password-protected.");
-        if (nFib < 0xC0) return ReadWord6(word, Path.GetFileNameWithoutExtension(path));
+        if (nFib < 0xC0)
+        {
+            // Word 6 and 95: one stream holds text, tables and pictures, and formatting uses the older one-byte codes.
+            try
+            {
+                return new WordBinaryReader(word, word, word, cfb) { _word6 = true }.Build(Path.GetFileNameWithoutExtension(path));
+            }
+            catch (Exception ex) when (ex is IndexOutOfRangeException or ArgumentOutOfRangeException or ArgumentException or ConversionException)
+            {
+                Log.Write($"Word 6 reader fell back to plain text: {ex.Message}");
+                return ReadWord6(word, Path.GetFileNameWithoutExtension(path));
+            }
+        }
         var table = cfb.Stream((flags & 0x0200) != 0 ? "1Table" : "0Table") ?? throw new ConversionException("This Word document is damaged.");
         var data = cfb.Stream("Data") ?? [];
         try
         {
-            return new WordBinaryReader(word, table, data).Build(Path.GetFileNameWithoutExtension(path));
+            return new WordBinaryReader(word, table, data, cfb).Build(Path.GetFileNameWithoutExtension(path));
         }
         catch (Exception ex) when (ex is IndexOutOfRangeException or ArgumentOutOfRangeException or ArgumentException)
         {
@@ -120,14 +139,23 @@ internal sealed class WordBinaryReader
         return (BinaryPrimitives.ReadInt32LittleEndian(_word.AsSpan(at)), BinaryPrimitives.ReadInt32LittleEndian(_word.AsSpan(at + 4)));
     }
 
+    /// <summary>A Word 6/95 file: fixed header layout, one-byte formatting codes, 8-bit text.</summary>
+    bool _word6;
+
+    int I32(int at) => BinaryPrimitives.ReadInt32LittleEndian(_word.AsSpan(at));
+
     DDocument Build(string title)
     {
+        if (_word6) return Build6(title);
         int csw = BinaryPrimitives.ReadUInt16LittleEndian(_word.AsSpan(32));
         int lwAt = 34 + csw * 2;
         int cslw = BinaryPrimitives.ReadUInt16LittleEndian(_word.AsSpan(lwAt));
         int rgLw = lwAt + 2;
         _ccpText = BinaryPrimitives.ReadInt32LittleEndian(_word.AsSpan(rgLw + 3 * 4));
         _ccpFtn = BinaryPrimitives.ReadInt32LittleEndian(_word.AsSpan(rgLw + 4 * 4));
+        _ccpHdd = BinaryPrimitives.ReadInt32LittleEndian(_word.AsSpan(rgLw + 5 * 4));
+        _ccpAtn = BinaryPrimitives.ReadInt32LittleEndian(_word.AsSpan(rgLw + 7 * 4));
+        _ccpEdn = BinaryPrimitives.ReadInt32LittleEndian(_word.AsSpan(rgLw + 8 * 4));
         _fcLcbOffset = rgLw + cslw * 4 + 2;
 
         ReadPieces();
@@ -148,11 +176,19 @@ internal sealed class WordBinaryReader
         }
         else (doc.Font, doc.FontSize) = (_defaultFont ?? "Times New Roman", 10);
 
-        var footnotes = ReadFootnotes(FcLcb(2), FcLcb(3));
-        ReadStory(0, _ccpText, doc.Blocks, footnotes);
+        // Stories follow one another: main text, footnotes, headers, comments, endnotes, text boxes.
+        int footnoteStory = _ccpText, headerStory = footnoteStory + _ccpFtn, endnoteStory = headerStory + _ccpHdd + _ccpAtn;
+        _textboxStory = endnoteStory + _ccpEdn;
+        ReadDrawings();
+        var notes = ReadNotes(FcLcb(2), FcLcb(3), footnoteStory, _ccpFtn, endnote: false);
+        foreach (var (cp, note) in ReadNotes(FcLcb(46), FcLcb(47), endnoteStory, _ccpEdn, endnote: true)) notes[cp] = note;
+        ReadHeaders(doc, headerStory);
+        ReadStory(0, _ccpText, doc.Blocks, notes);
         doc.NormalizeDefaults();
         return doc;
     }
+
+    int _ccpHdd, _ccpAtn, _ccpEdn, _textboxStory;
 
     // ------------------------------------------------------------------ text and formatting runs
 
@@ -172,6 +208,12 @@ internal sealed class WordBinaryReader
                 int cpStart = BinaryPrimitives.ReadInt32LittleEndian(_table.AsSpan(plc + k * 4));
                 int cpEnd = BinaryPrimitives.ReadInt32LittleEndian(_table.AsSpan(plc + (k + 1) * 4));
                 uint fcValue = BinaryPrimitives.ReadUInt32LittleEndian(_table.AsSpan(plc + (n + 1) * 4 + k * 8 + 2));
+                if (_word6)
+                {
+                    // Word 6 text is always 8-bit, and its file offsets carry no flags.
+                    _pieces.Add((cpStart, cpEnd, (int)fcValue, true));
+                    continue;
+                }
                 bool compressed = (fcValue & 0x40000000) != 0;
                 int pieceFc = (int)(fcValue & 0x3FFFFFFF);
                 _pieces.Add((cpStart, cpEnd, compressed ? pieceFc / 2 : pieceFc, compressed));
@@ -199,6 +241,7 @@ internal sealed class WordBinaryReader
             {
                 int at = p.fc + (cp - p.cpStart);
                 byte b = _word[at];
+                if (_byteChars != null) return (_byteChars[b], at);
                 return (b is >= 0x80 and <= 0x9F ? Cp1252High[b - 0x80] : (char)b, at);
             }
             int offset = p.fc + (cp - p.cpStart) * 2;
@@ -207,13 +250,20 @@ internal sealed class WordBinaryReader
         return ('\0', -1);
     }
 
-    void ReadFkps((int fc, int lcb) plc, bool chars)
+    /// <param name="pageCount">Word 6: how many formatting pages there are (more may follow the listed ones).</param>
+    void ReadFkps((int fc, int lcb) plc, bool chars, int pageCount = 0)
     {
-        if (plc.lcb < 8) return;
-        int n = (plc.lcb - 4) / 8;
+        if (plc.lcb < 6) return;
+        // Page numbers are 4 bytes each (Word 6: 2 bytes).
+        int pnSize = _word6 ? 2 : 4;
+        int n = (plc.lcb - 4) / (4 + pnSize);
+        var pages = new List<int>();
         for (int k = 0; k < n; k++)
+            pages.Add(_word6 ? BinaryPrimitives.ReadUInt16LittleEndian(_table.AsSpan(plc.fc + (n + 1) * 4 + k * 2))
+                             : (int)(BinaryPrimitives.ReadUInt32LittleEndian(_table.AsSpan(plc.fc + (n + 1) * 4 + k * 4)) & 0x3FFFFF));
+        while (pages.Count > 0 && pages.Count < pageCount) pages.Add(pages[^1] + 1);
+        foreach (var pn in pages)
         {
-            int pn = (int)(BinaryPrimitives.ReadUInt32LittleEndian(_table.AsSpan(plc.fc + (n + 1) * 4 + k * 4)) & 0x3FFFFF);
             int page = pn * 512;
             if (page + 512 > _word.Length) continue;
             int crun = _word[page + 511];
@@ -226,17 +276,20 @@ internal sealed class WordBinaryReader
                     int b = _word[page + (crun + 1) * 4 + r] * 2;
                     if (b == 0) { _chpx.Add((fcStart, fcEnd, [])); continue; }
                     int cb = _word[page + b];
-                    _chpx.Add((fcStart, fcEnd, _word.AsSpan(page + b + 1, cb).ToArray()));
+                    var grpprl = _word.AsSpan(page + b + 1, cb).ToArray();
+                    _chpx.Add((fcStart, fcEnd, _word6 ? Translate6(grpprl) : grpprl));
                 }
                 else
                 {
-                    int b = _word[page + (crun + 1) * 4 + r * 13] * 2;
+                    // Each run's entry: a word offset and a layout hint (13 bytes; Word 6: 7).
+                    int b = _word[page + (crun + 1) * 4 + r * (_word6 ? 7 : 13)] * 2;
                     if (b == 0) { _papx.Add((fcStart, fcEnd, 0, [])); continue; }
                     int cb = _word[page + b], at = page + b + 1;
-                    int length = cb == 0 ? _word[at++] * 2 : cb * 2 - 1;
+                    int length = _word6 ? cb * 2 : cb == 0 ? _word[at++] * 2 : cb * 2 - 1;
                     if (length < 2) continue;
                     int istd = BinaryPrimitives.ReadUInt16LittleEndian(_word.AsSpan(at));
-                    _papx.Add((fcStart, fcEnd, istd, _word.AsSpan(at + 2, length - 2).ToArray()));
+                    var grpprl = _word.AsSpan(at + 2, Math.Min(length - 2, _word.Length - at - 2)).ToArray();
+                    _papx.Add((fcStart, fcEnd, istd, _word6 ? Translate6(grpprl) : grpprl));
                 }
             }
         }
@@ -289,6 +342,8 @@ internal sealed class WordBinaryReader
             bool Toggle(bool current) => b switch { 0 => false, 1 => true, 0x81 => !current, _ => current };
             switch (sprm)
             {
+                case 0x4A41: c.Lid = BinaryPrimitives.ReadUInt16LittleEndian(grpprl.AsSpan(at)); break;
+                case 0x4A30: StyleChars(BinaryPrimitives.ReadUInt16LittleEndian(grpprl.AsSpan(at)), c); break; // a character style
                 case 0x0835: c.Bold = Toggle(c.Bold); break;
                 case 0x0836: c.Italic = Toggle(c.Italic); break;
                 case 0x0837 or 0x2A53: c.Strike = Toggle(c.Strike); break;
@@ -332,6 +387,10 @@ internal sealed class WordBinaryReader
                 case 0x260A: p.ListLevel = grpprl[at]; break;
                 case 0x460B: p.ListIndex = S16(); break;
                 case 0x246D: p.Contextual = grpprl[at] != 0; break;
+                // A framed paragraph (e.g. a page number) positioned centre/right of its column.
+                case 0xC63E: p.Anld = grpprl.AsSpan(at + 1, Math.Min(grpprl[at], grpprl.Length - at - 1)).ToArray(); break;
+                case 0x26FE: p.NLvlAnm = grpprl[at]; break;
+                case 0x8418: p.FrameAlign = S16() switch { -4 => TextAlignment.Center, -8 or -16 => TextAlignment.Right, _ => null }; break;
             }
         }
     }
@@ -350,6 +409,20 @@ internal sealed class WordBinaryReader
     void ReadFonts((int fc, int lcb) sttb)
     {
         if (sttb.lcb < 4) return;
+        if (_word6)
+        {
+            // Word 6: a byte count, then records with an 8-bit name at offset 6.
+            int stop = sttb.fc + Math.Min(sttb.lcb, BinaryPrimitives.ReadUInt16LittleEndian(_table.AsSpan(sttb.fc)));
+            for (int p = sttb.fc + 2; p < stop;)
+            {
+                int size = _table[p] + 1;
+                var name = new StringBuilder();
+                for (int j = p + 6; j < p + size && _table[j] != 0; j++) name.Append((char)_table[j]);
+                _fonts.Add(name.ToString());
+                p += size;
+            }
+            return;
+        }
         int i = sttb.fc;
         int count = BinaryPrimitives.ReadUInt16LittleEndian(_table.AsSpan(i));
         i += 4; // count, extra-data size
@@ -393,14 +466,16 @@ internal sealed class WordBinaryReader
 
             // Name (length-prefixed UTF-16 with a terminator), then the formatting blocks on even offsets.
             int at = std + baseSize;
-            int nameLength = BinaryPrimitives.ReadUInt16LittleEndian(_table.AsSpan(at));
-            at += 2 + (nameLength + 1) * 2;
+            // (Word 6: a one-byte length and 8-bit characters.)
+            if (_word6) at += 1 + _table[at] + 1;
+            else at += 2 + (BinaryPrimitives.ReadUInt16LittleEndian(_table.AsSpan(at)) + 1) * 2;
             byte[] papx = [], chpx = [];
             for (int u = 0; u < cupx && at + 2 <= i; u++)
             {
                 if ((at - std) % 2 != 0) at++;
                 int cb = BinaryPrimitives.ReadUInt16LittleEndian(_table.AsSpan(at));
                 var block = _table.AsSpan(at + 2, Math.Min(cb, Math.Max(0, i - at - 2))).ToArray();
+                if (_word6) block = u == 0 && stk == 1 ? [.. block.Take(2), .. Translate6(block.Length >= 2 ? block[2..] : [])] : Translate6(block);
                 if (stk == 1 && u == 0) papx = block.Length >= 2 ? block[2..] : [];
                 else if (stk == 1 && u == 1 || stk == 2 && u == 0) chpx = block;
                 at += 2 + cb;
@@ -486,6 +561,7 @@ internal sealed class WordBinaryReader
 
     void ApplyList(DParagraph p, ParaProps props, CharProps chars)
     {
+        if (_word6) { ApplyList6(p, props, chars); return; }
         if (props.ListIndex <= 0 || props.ListIndex > _lfoToLsid.Count || !_lists.TryGetValue(_lfoToLsid[props.ListIndex - 1], out var list)) return;
         int lsid = _lfoToLsid[props.ListIndex - 1];
         int level = Math.Clamp(props.ListLevel, 0, list.levels.Count - 1);
@@ -531,35 +607,69 @@ internal sealed class WordBinaryReader
 
     void ReadPageSetup((int fc, int lcb) plcfSed, DDocument doc)
     {
+        var dop = FcLcb(31);
+        _facingPages = dop.lcb > 0 && dop.fc < _table.Length && (_table[dop.fc] & 1) != 0;
         if (plcfSed.lcb < 16) return;
-        int fcSepx = BinaryPrimitives.ReadInt32LittleEndian(_table.AsSpan(plcfSed.fc + 8 + 2));
-        if (fcSepx <= 0 || fcSepx + 2 > _word.Length) return;
-        int cb = BinaryPrimitives.ReadInt16LittleEndian(_word.AsSpan(fcSepx));
-        var grpprl = _word.AsSpan(fcSepx + 2, Math.Min(cb, _word.Length - fcSepx - 2)).ToArray();
-        double? width = null, height = null, left = null, right = null, top = null, bottom = null;
-        foreach (var (sprm, at, _) in Sprms(grpprl))
+        // One entry per section: where it starts, and where its settings are stored.
+        int n = (plcfSed.lcb - 4) / 16;
+        for (int k = 0; k < n; k++)
         {
-            double Twips() => BinaryPrimitives.ReadInt16LittleEndian(grpprl.AsSpan(at)) / 20.0;
-            double UTwips() => BinaryPrimitives.ReadUInt16LittleEndian(grpprl.AsSpan(at)) / 20.0;
-            switch (sprm)
+            int start = BinaryPrimitives.ReadInt32LittleEndian(_table.AsSpan(plcfSed.fc + k * 4));
+            int fcSepx = BinaryPrimitives.ReadInt32LittleEndian(_table.AsSpan(plcfSed.fc + (n + 1) * 4 + k * 12 + 2));
+            var (setup, newPage) = Section(fcSepx, k == 0 ? doc : null);
+            if (k == 0)
             {
-                case 0xB01F: width = UTwips(); break;
-                case 0xB020: height = UTwips(); break;
-                case 0xB021: left = UTwips(); break;
-                case 0xB022: right = UTwips(); break;
-                case 0x9023: top = Math.Abs(Twips()); break;
-                case 0x9024: bottom = Math.Abs(Twips()); break;
+                (doc.PageWidth, doc.PageHeight, doc.Margins, doc.Columns, doc.ColumnGap) = (setup.Width, setup.Height, setup.Margins, setup.Columns, setup.ColumnGap);
+                continue;
             }
+            // A continuous section break keeps to the same page (its settings can't change mid-page here).
+            _sectionStarts[start] = newPage ? setup : null;
         }
-        if (width is > 72 && height is > 72) (doc.PageWidth, doc.PageHeight) = (width.Value, height.Value);
-        doc.Margins = new Thickness(left ?? 90, top ?? 72, right ?? 90, bottom ?? 72);
     }
 
-    /// <summary>Footnote texts keyed by the position of their reference mark in the body.</summary>
-    Dictionary<int, List<DBlock>> ReadFootnotes((int fc, int lcb) refs, (int fc, int lcb) texts)
+    /// <summary>Section starts in the main text: the settings of a section that begins on a new page, or null if it continues.</summary>
+    readonly Dictionary<int, PageSetup?> _sectionStarts = [];
+
+    (PageSetup setup, bool newPage) Section(int fcSepx, DDocument? first)
     {
-        var notes = new Dictionary<int, List<DBlock>>();
-        if (refs.lcb < 4 || texts.lcb < 8 || _ccpFtn <= 0) return notes;
+        double width = 612, height = 792, left = 90, right = 90, top = 72, bottom = 72, gap = 36;
+        int columns = 1, breakKind = 2;
+        if (fcSepx > 0 && fcSepx + 2 <= _word.Length)
+        {
+            int cb = BinaryPrimitives.ReadInt16LittleEndian(_word.AsSpan(fcSepx));
+            var grpprl = _word.AsSpan(fcSepx + 2, Math.Clamp(cb, 0, _word.Length - fcSepx - 2)).ToArray();
+            if (_word6) grpprl = Translate6(grpprl);
+            foreach (var (sprm, at, _) in Sprms(grpprl))
+            {
+                double Twips() => BinaryPrimitives.ReadInt16LittleEndian(grpprl.AsSpan(at)) / 20.0;
+                double UTwips() => BinaryPrimitives.ReadUInt16LittleEndian(grpprl.AsSpan(at)) / 20.0;
+                switch (sprm)
+                {
+                    case 0xB01F: width = UTwips(); break;
+                    case 0xB020: height = UTwips(); break;
+                    case 0xB021: left = UTwips(); break;
+                    case 0xB022: right = UTwips(); break;
+                    case 0x9023: top = Math.Abs(Twips()); break;
+                    case 0x9024: bottom = Math.Abs(Twips()); break;
+                    case 0x500B: columns = BinaryPrimitives.ReadUInt16LittleEndian(grpprl.AsSpan(at)) + 1; break;
+                    case 0x900C: gap = UTwips(); break;
+                    case 0x3009: breakKind = grpprl[at]; break;
+                    case 0xB017 when first != null: first.HeaderDistance = UTwips(); break;
+                    case 0xB018 when first != null: first.FooterDistance = UTwips(); break;
+                    case 0x300A when first != null: _titlePage = grpprl[at] != 0; break;
+                    case 0x3014 when first != null: _sectionHeaders = grpprl[at]; break;
+                }
+            }
+        }
+        if (width <= 72 || height <= 72) (width, height) = (612, 792);
+        return (new PageSetup(width, height, new Thickness(left, top, right, bottom), Math.Clamp(columns, 1, 12), gap), breakKind != 0);
+    }
+
+    /// <summary>Footnote or endnote texts keyed by the position of their reference mark in the body.</summary>
+    Dictionary<int, (List<DBlock> blocks, bool endnote)> ReadNotes((int fc, int lcb) refs, (int fc, int lcb) texts, int story, int storyLength, bool endnote)
+    {
+        var notes = new Dictionary<int, (List<DBlock>, bool)>();
+        if (refs.lcb < 4 || texts.lcb < 8 || storyLength <= 0) return notes;
         int n = (refs.lcb - 4) / 6;
         for (int k = 0; k < n; k++)
         {
@@ -567,27 +677,81 @@ internal sealed class WordBinaryReader
             int start = BinaryPrimitives.ReadInt32LittleEndian(_table.AsSpan(texts.fc + k * 4));
             int end = BinaryPrimitives.ReadInt32LittleEndian(_table.AsSpan(texts.fc + (k + 1) * 4));
             var blocks = new List<DBlock>();
-            ReadStory(_ccpText + start, _ccpText + Math.Min(end, _ccpFtn), blocks, []);
+            // The note's text opens with its own reference character: print the number there, in its own style.
+            _noteMark = endnote ? ListLabels.Format(k + 1, "lowerRoman") : (k + 1).ToString(System.Globalization.CultureInfo.InvariantCulture);
+            ReadStory(story + start, story + Math.Min(end, storyLength), blocks, []);
+            _noteMark = null;
             // The note's own copy of its number is dropped; the reference mark carries it.
             if (blocks.FirstOrDefault() is DParagraph first && first.Inlines.FirstOrDefault() is DText { Text: var t } mark && t.Trim().Length == 0)
                 first.Inlines.Remove(mark);
-            notes[refCp] = blocks;
+            notes[refCp] = (blocks, endnote);
         }
         return notes;
     }
 
+    /// <summary>
+    /// Headers and footers of the first section. The header story starts with six separator stories, then
+    /// six per section: even header, odd header, even footer, odd footer, first-page header and footer.
+    /// </summary>
+    void ReadHeaders(DDocument doc, int story)
+    {
+        var (fc, lcb) = FcLcb(11);
+        if (_ccpHdd <= 0 || lcb < (_word6 ? 2 : 13) * 4) return;
+        var cps = Enumerable.Range(0, lcb / 4).Select(i => BinaryPrimitives.ReadInt32LittleEndian(_table.AsSpan(fc + i * 4))).ToList();
+        // Word 6 stores only the stories that exist: separators flagged in the document settings, then the
+        // section's own, in the same order. Map the fixed story numbers onto that compact list.
+        var dopRange = FcLcb(31);
+        int separators = _word6 && dopRange.lcb > 1 ? System.Numerics.BitOperations.PopCount((uint)_table[dopRange.fc + 1]) : 6;
+        int Slot(int i)
+        {
+            if (!_word6) return i;
+            int bit = i - 6;
+            if ((_sectionHeaders & (1 << bit)) == 0) return -1;
+            return separators + System.Numerics.BitOperations.PopCount((uint)(_sectionHeaders & ((1 << bit) - 1)));
+        }
+        DHeaderFooter? Part(int fixedIndex)
+        {
+            int i = Slot(fixedIndex);
+            if (i < 0) return null;
+            if (i + 1 >= cps.Count || cps[i + 1] - cps[i] <= 1) return null;
+            var part = new DHeaderFooter();
+            ReadStory(story + cps[i], story + cps[i + 1], part.Blocks, []);
+            while (part.Blocks.Count > 0 && part.Blocks[^1] is DParagraph { Inlines.Count: 0 }) part.Blocks.RemoveAt(part.Blocks.Count - 1);
+            return part.Blocks.Count > 0 ? part : null;
+        }
+        doc.Header = Part(7);
+        doc.Footer = Part(9);
+        if (_facingPages)
+        {
+            doc.EvenHeader = Part(6);
+            doc.EvenFooter = Part(8);
+        }
+        if (_titlePage)
+        {
+            doc.DifferentFirstPage = true;
+            doc.FirstHeader = Part(10);
+            doc.FirstFooter = Part(11);
+        }
+    }
+
+    bool _titlePage, _facingPages;
+    /// <summary>Word 6: which header/footer stories the first section has (bit per story).</summary>
+    int _sectionHeaders;
+    string? _noteMark;
+
     // ------------------------------------------------------------------ the story
 
-    void ReadStory(int cpStart, int cpEnd, List<DBlock> into, Dictionary<int, List<DBlock>> footnotes)
+    void ReadStory(int cpStart, int cpEnd, List<DBlock> into, Dictionary<int, (List<DBlock> blocks, bool endnote)> notes)
     {
         var paragraph = new DParagraph();
         var row = new List<DCell>();
         var cell = new DCell();
         DTable? table = null;
         bool pageBreak = false;
+        PageSetup? section = null; // a new section starts with the next block
         DParagraph? previous = null;
         int previousIstd = -1;
-        var fields = new Stack<(StringBuilder code, bool inResult, string? link)>();
+        var fields = new Stack<(StringBuilder code, bool inResult, string? link, FieldKind? kind)>();
 
         void Finish(char mark, int fc, CharProps chars)
         {
@@ -604,7 +768,7 @@ internal sealed class WordBinaryReader
                 ApplyPara(props, px.grpprl);
                 if (_styles.TryGetValue(px.istd, out var style) && style.sti is >= 1 and <= 9) props.Heading = style.sti;
             }
-            paragraph.Align = props.Align;
+            paragraph.Align = props.FrameAlign ?? props.Align;
             paragraph.IndentLeft = props.Left;
             paragraph.IndentFirst = props.First;
             paragraph.SpaceBefore = props.Before;
@@ -620,6 +784,7 @@ internal sealed class WordBinaryReader
             previous = paragraph;
             previousIstd = istd;
             paragraph.PageBreakBefore = pageBreak;
+            if (section != null && !props.InTable) { paragraph.Section = section; section = null; }
             paragraph.MarkSize = chars.Size;
             pageBreak = false;
             if (paragraph.Inlines.OfType<DText>().Any(t => t.Text.Trim().Length > 0)) ApplyList(paragraph, props, chars);
@@ -628,7 +793,11 @@ internal sealed class WordBinaryReader
             {
                 if (props.RowEnd)
                 {
-                    table ??= new DTable { Borders = true };
+                    if (table == null)
+                    {
+                        table = new DTable { Borders = true, Section = section };
+                        section = null;
+                    }
                     var r = new DRow();
                     r.Cells.AddRange(row);
                     if (r.Cells.Count > 0) table.Rows.Add(r);
@@ -688,12 +857,13 @@ internal sealed class WordBinaryReader
                 lastChpx = key;
             }
 
+            if (_word6 && ch >= 0x80 && chars.Lid != 0) ch = Decode6(_word[fc], chars.Lid);
             bool inCode = fields.Count > 0 && !fields.Peek().inResult;
             switch (ch)
             {
                 case '\x13':
                     Flush();
-                    fields.Push((new StringBuilder(), false, null));
+                    fields.Push((new StringBuilder(), false, null, null));
                     continue;
                 case '\x14' when fields.Count > 0:
                     var f = fields.Pop();
@@ -704,11 +874,15 @@ internal sealed class WordBinaryReader
                         var quoted = System.Text.RegularExpressions.Regex.Match(code, "\"([^\"]+)\"");
                         if (quoted.Success && Uri.TryCreate(quoted.Groups[1].Value, UriKind.Absolute, out _)) link = quoted.Groups[1].Value;
                     }
-                    fields.Push((f.code, true, link));
+                    // Page numbers are live fields; their saved result is replaced when laid out.
+                    var word = code.Split(' ', 2)[0].ToUpperInvariant();
+                    FieldKind? kind = word switch { "PAGE" => FieldKind.Page, "NUMPAGES" or "SECTIONPAGES" => FieldKind.NumPages, _ => null };
+                    fields.Push((f.code, true, link, kind));
                     continue;
                 case '\x15' when fields.Count > 0:
                     Flush();
-                    fields.Pop();
+                    if (fields.Pop() is { kind: { } fieldKind })
+                        paragraph.Inlines.Add(new DField(fieldKind, new TextStyle { Size = chars.Size, Bold = chars.Bold, Italic = chars.Italic, Font = chars.Font, Color = chars.Color }));
                     continue;
             }
             if (inCode)
@@ -716,6 +890,7 @@ internal sealed class WordBinaryReader
                 fields.Peek().code.Append(ch);
                 continue;
             }
+            if (fields.Any(x => x.inResult && x.kind != null)) continue; // the stale page number
             var currentLink = fields.FirstOrDefault(x => x.inResult && x.link != null).link;
             if (!ReferenceEquals(runProps, chars) || currentLink != runLink)
             {
@@ -741,7 +916,12 @@ internal sealed class WordBinaryReader
                 case '\f':
                     Flush();
                     if (paragraph.Inlines.Count > 0) Finish('\r', fc, chars);
-                    pageBreak = true;
+                    // A section mark: the next section may bring its own page settings (or continue on this page).
+                    if (cpStart == 0 && _sectionStarts.TryGetValue(cp + 1, out var next))
+                    {
+                        if (next != null) section = next;
+                    }
+                    else pageBreak = true;
                     break;
                 case '\x01':
                     Flush();
@@ -749,12 +929,17 @@ internal sealed class WordBinaryReader
                     break;
                 case '\x02':
                     Flush();
-                    if (footnotes.TryGetValue(cp, out var note))
+                    if (_noteMark != null) text.Append(_noteMark);
+                    if (notes.TryGetValue(cp, out var note))
                     {
-                        var dnote = new DNote(++_footnoteNumber, false, new TextStyle { Size = chars.Size });
-                        dnote.Blocks.AddRange(note);
+                        var dnote = new DNote(note.endnote ? ++_endnoteNumber : ++_footnoteNumber, note.endnote, new TextStyle { Size = chars.Size });
+                        dnote.Blocks.AddRange(note.blocks);
                         paragraph.Inlines.Add(dnote);
                     }
+                    break;
+                case '':
+                    Flush();
+                    if (Drawing(cp) is { } drawing) paragraph.Inlines.Add(drawing);
                     break;
                 case '\t':
                     text.Append('\t');
@@ -762,7 +947,7 @@ internal sealed class WordBinaryReader
                 case '\x1E':
                     text.Append('‑');
                     break;
-                case '\x1F' or '\x08' or '\x05' or '\x0E' or '\0':
+                case '\x1F' or '\x05' or '\x0E' or '\0':
                     break;
                 default:
                     if (ch >= ' ' || ch == ' ') text.Append(ch);
@@ -782,8 +967,31 @@ internal sealed class WordBinaryReader
     {
         if (grpprl == null) return null;
         int? location = null;
+        bool ole = false;
         foreach (var (sprm, at, size) in Sprms(grpprl))
+        {
             if (sprm == 0x6A03 && size >= 4) location = BinaryPrimitives.ReadInt32LittleEndian(grpprl.AsSpan(at));
+            if (sprm == 0x080A) ole = grpprl[at] != 0;
+        }
+        // An embedded object (classic WordArt, Equation, a chart): its preview lives in the object's own storage.
+        if (ole && location is int objectId && _file != null)
+        {
+            var folder = new[] { "ObjectPool", "_" + (uint)objectId };
+            if (_file.Stream([.. folder, "\u0003META"]) is { Length: > 0 } meta)
+            {
+                var (mw, mh) = DocxReader.ImageSize(meta);
+                return new DImage(meta, "wmf", Math.Max(1, mw), Math.Max(1, mh));
+            }
+            if (_file.Stream([.. folder, "\u0003PIC"]) is { Length: > 68 } pic)
+            {
+                int header = BinaryPrimitives.ReadUInt16LittleEndian(pic.AsSpan(4));
+                short P(int o) => BinaryPrimitives.ReadInt16LittleEndian(pic.AsSpan(o));
+                double pw = (P(28) - P(36) - P(40)) * BinaryPrimitives.ReadUInt16LittleEndian(pic.AsSpan(32)) / 1000.0 / 20;
+                double ph = (P(30) - P(38) - P(42)) * BinaryPrimitives.ReadUInt16LittleEndian(pic.AsSpan(34)) / 1000.0 / 20;
+                if (header > 0 && header < pic.Length)
+                    return new DImage(pic[header..], "wmf", pw > 1 ? pw : 144, ph > 1 ? ph : 72);
+            }
+        }
         if (location is not int start || start < 0 || start + 44 > _data.Length) return null;
         int length = BinaryPrimitives.ReadInt32LittleEndian(_data.AsSpan(start));
         int end = Math.Min(_data.Length, start + Math.Max(0, length));
@@ -795,7 +1003,17 @@ internal sealed class WordBinaryReader
         double width = (S(28) - S(36) - S(40)) * U(32) / 1000.0 / 20;
         double height = (S(30) - S(38) - S(42)) * U(34) / 1000.0 / 20;
 
+        int headerSize = BinaryPrimitives.ReadUInt16LittleEndian(block[4..]), mapMode = BinaryPrimitives.ReadUInt16LittleEndian(block[6..]);
+        // Word 97+ stores inline pictures and shapes as an OfficeArt shape after the header (0x66: with a name first).
+        if (mapMode is 0x64 or 0x66 && headerSize < block.Length)
+        {
+            int shapeAt = start + headerSize + (mapMode == 0x66 ? 1 + block[headerSize] : 0);
+            if (InlineShape(shapeAt, width, height) is { } drawn) return drawn;
+        }
         var (data, ext) = Blip(block);
+        // Older pictures and embedded objects' previews are a bare Windows metafile after the header.
+        if (data == null && mapMode is >= 1 and <= 8 && headerSize >= 44 && headerSize < block.Length)
+            (data, ext) = (block[headerSize..].ToArray(), "wmf");
         if (data == null) return null;
         var (w, h) = DocxReader.ImageSize(data);
         if (width > 1 && height > 1) (w, h) = (width, height);
@@ -948,13 +1166,16 @@ internal sealed class WordBinaryReader
             return ms.ToArray();
         }
 
-        IEnumerable<(string name, int type, int start, long size, int left, int right, int child)> RootChildren()
+        IEnumerable<(string name, int type, int start, long size, int left, int right, int child)> RootChildren() => ChildrenOf(0);
+
+        /// <summary>The entries directly inside a storage (its children form a little binary tree).</summary>
+        List<(string name, int type, int start, long size, int left, int right, int child)> ChildrenOf(int storage)
         {
-            if (_entries.Count == 0) return [];
+            if (storage < 0 || storage >= _entries.Count) return [];
             var found = new List<(string, int, int, long, int, int, int)>();
             var pending = new Stack<int>();
             var seen = new HashSet<int>();
-            pending.Push(_entries[0].child);
+            pending.Push(_entries[storage].child);
             while (pending.Count > 0)
             {
                 int id = pending.Pop();
@@ -965,6 +1186,24 @@ internal sealed class WordBinaryReader
                 pending.Push(e.right);
             }
             return found;
+        }
+
+        /// <summary>A stream inside nested storages, e.g. ("ObjectPool", "_1234", "\u0003META").</summary>
+        public byte[]? Stream(string[] path)
+        {
+            int storage = 0;
+            for (int i = 0; i < path.Length; i++)
+            {
+                int index = -1;
+                foreach (var e in ChildrenOf(storage))
+                    if (string.Equals(e.name, path[i], StringComparison.OrdinalIgnoreCase)) { index = _entries.IndexOf(e); break; }
+                if (index < 0) return null;
+                var entry = _entries[index];
+                if (i == path.Length - 1)
+                    return entry.type != 2 ? null : entry.size < _miniCutoff ? MiniChain(entry.start, entry.size) : Chain(entry.start, entry.size);
+                storage = index;
+            }
+            return null;
         }
 
         public byte[]? Stream(string name)

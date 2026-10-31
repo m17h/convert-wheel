@@ -38,10 +38,12 @@ Microsoft Office is used when it happens to be installed, because it's the most 
 | WebM, AVI, MPG, AC3, and inputs Windows can't decode (FLV, old codecs) | FFmpeg (LGPL build), bundled compressed and unpacked once on first use |
 | Images: PNG, JPG, BMP, GIF, TIFF, ICO, WebP | Windows imaging and Skia |
 | Images: HEIC, AVIF, JPEG XL, PSD, TGA, SVG, camera RAW, EXR, DDS, EMF/WMF and more | ImageMagick (Magick.NET) |
-| Images → multi-page PDF; multi-page TIFF → PDF | Our image-to-PDF writer |
-| Documents: DOCX, DOC (Word 97–2003), ODT, RTF, TXT, Markdown, HTML, EPUB → PDF, DOCX, ODT, RTF, TXT, HTML, Markdown, EPUB | Built-in document engine |
-| PDF → DOCX, ODT, RTF, TXT, HTML, Markdown, EPUB (text reflowed into paragraphs, headings, lists and pictures) or PNG/JPG/TIFF pages | PDFium plus our layout analysis |
-| Spreadsheets: XLSX, XLS, ODS, CSV, TSV → XLSX, ODS, CSV, TSV, JSON, PDF, HTML | Built-in spreadsheet engine |
+| Images → multi-page PDF (searchable: an invisible text layer from OCR); multi-page TIFF → PDF | Our image-to-PDF writer |
+| Text in pictures (screenshots, photos of pages) → TXT or DOCX; scanned PDFs → any document format | Windows' built-in OCR (Windows.Media.Ocr), called directly |
+| Documents: DOCX, DOC (Word 6, 95 and 97–2003), ODT, RTF, TXT, Markdown, HTML, EPUB → PDF, DOCX, ODT, RTF, TXT, HTML, Markdown, EPUB | Built-in document engine |
+| PDF → DOCX, ODT, RTF, TXT, HTML, Markdown, EPUB (text reflowed into paragraphs, headings, lists and pictures; scanned pages read with OCR) or PNG/JPG/TIFF pages | PDFium plus our layout analysis |
+| Spreadsheets: XLSX, XLS, ODS, CSV, TSV → XLSX, ODS, CSV, TSV, JSON, PDF, HTML (charts and pictures included) | Built-in spreadsheet engine |
+| Charts in PPTX, DOCX, XLSX, ODP, ODT and ODS (column, bar, line, area, pie, doughnut, scatter, radar; stacked and combo) | Our chart reader and renderer |
 | Presentations: PPTX, PPT (97–2003), ODP → PDF, PNG/JPG per slide, PPTX, ODP | Built-in presentation engine |
 | Archives: ZIP, 7z, RAR, TAR, GZ, BZ2, XZ → ZIP, TAR, TAR.GZ | SharpCompress |
 | Subtitles: SRT, VTT, ASS/SSA, SBV → SRT, VTT, ASS, TXT | Our subtitle reader/writer |
@@ -68,11 +70,17 @@ model (`Conversion/Documents/DocModel.cs`) and writes every output from that. PD
 own pagination and written with [PDFsharp](https://github.com/empira/PDFsharp), with the real Windows fonts embedded.
 
 The built-in engine keeps headers and footers (including first-page and even-page versions, with live
-"Page X of Y" fields), footnotes and endnotes, page breaks, lists, tables, and positioned pictures and text
-boxes (wrapped, behind or in front of text) across DOCX, ODT, RTF and PDF. Old `.doc` files bring their text,
-formatting, styles, lists, tables, hyperlinks, inline pictures and footnotes. Not yet handled: multiple
-sections with different page sizes, columns, charts, comments and tracked changes (accepted text is kept),
-floating drawings in `.doc`, and OCR (a scanned PDF has no text to extract; convert it to PNG instead).
+"Page X of Y" fields), footnotes and endnotes, page breaks, sections with their own page size, orientation
+and columns, lists, tables, charts, and positioned pictures and text boxes (wrapped, behind or in front of
+text) across DOCX, ODT, RTF and PDF. Old `.doc` files (Word 6 to 2003) bring their text in its original code
+page, formatting, styles, lists, tables, hyperlinks, pictures, floating drawings (shapes, text boxes, WordArt,
+groups), headers, footers, footnotes and endnotes. Scanned PDFs and photos of pages are read with the OCR
+engine built into Windows, in the languages installed there.
+
+Not carried over: comments (tracked changes are shown accepted, as Word's "Simple Markup" does), a change to
+columns at a *continuous* section break (the page keeps one layout), RTF output's sections, and WordArt's
+3D/perspective effects (drawn flat with its colours). Charts become pictures when written to another
+editable format (they look the same but aren't editable charts there).
 
 ### How presentations are converted
 
@@ -80,7 +88,8 @@ Slides are read into positioned shapes (`Conversion/Presentations/SlideModel.cs`
 placeholders inheriting from their layout and master, text styles and bullets, shapes and connectors,
 pictures (with crops and outlines), tables with their table styles, gradients, picture and duotone fills,
 groups and SmartArt. Each slide is then drawn with WPF into a vector PDF page or a picture, or written out
-as PPTX/ODP. Charts show their saved preview picture; animations and speaker notes are not carried over.
+as PPTX/ODP. Charts are drawn from their data, and speaker notes carry across PPTX, ODP and PPT. Slide
+transitions and animations don't apply to PDF or pictures and aren't carried between PPTX and ODP.
 
 ### Third-party libraries
 
@@ -103,13 +112,13 @@ All permissively licensed and bundled into the exe. See [THIRD-PARTY-NOTICES.md]
 Requires the .NET 10 SDK.
 
 ```powershell
-.\tools\pack-ffmpeg.ps1                    # once: fetches the LGPL FFmpeg build and packs tools\ffmpeg.tar.xz
 dotnet run -c Release                      # run from source
 dotnet publish -c Release -r win-x64 -p:SelfContained=false -p:PublishSingleFile=true -p:DebugType=none -o dist
 ```
 
-`tools\ffmpeg.tar.xz` is embedded into the exe when present (it isn't committed). Without it the app still
-builds; the FFmpeg-only formats then use an `ffmpeg.exe` found next to the app or on `PATH`.
+The first build fetches the LGPL FFmpeg build and packs it into `tools\ffmpeg.tar.xz` (see `tools\pack-ffmpeg.ps1`;
+the file isn't committed), which is then embedded into the exe. Offline, or with `-p:SkipFfmpegPack=true`, the app
+still builds; the FFmpeg-only formats then use an `ffmpeg.exe` found next to the app or on `PATH`.
 
 Command-line extras:
 

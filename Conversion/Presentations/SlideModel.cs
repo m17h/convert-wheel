@@ -17,6 +17,8 @@ internal sealed class Deck
 internal sealed class Slide
 {
     public SlideFill? Background { get; set; }
+    /// <summary>Speaker notes, one string per paragraph.</summary>
+    public List<string> Notes { get; } = [];
     /// <summary>Bottom to top: master and layout decorations first, then the slide's own shapes.</summary>
     public List<SlideShape> Shapes { get; } = [];
 }

@@ -110,6 +110,30 @@ internal sealed class OdpWriter
                 Log.Write($"Skipped writing a shape: {ex.Message}");
             }
         }
+        if (slide.Notes.Count > 0)
+        {
+            // Speaker notes: a portrait notes page with the slide picture above the text.
+            double slideHeight = Math.Min(270, 432 * _deck.Height / Math.Max(1, _deck.Width));
+            var box = new XElement(Draw + "text-box");
+            foreach (var note in slide.Notes)
+            {
+                var p = new XElement(Text + "p");
+                var lines = note.Split('\n');
+                for (int i = 0; i < lines.Length; i++)
+                {
+                    if (i > 0) p.Add(new XElement(Text + "line-break"));
+                    AddText(p, lines[i]);
+                }
+                box.Add(p);
+            }
+            page.Add(new XElement(Pres + "notes",
+                new XElement(Draw + "page-thumbnail", new XAttribute(Draw + "page-number", index + 1), new XAttribute(Pres + "class", "page"),
+                    new XAttribute(Svg + "x", Len(54)), new XAttribute(Svg + "y", Len(54)), new XAttribute(Svg + "width", Len(432)), new XAttribute(Svg + "height", Len(slideHeight))),
+                new XElement(Draw + "frame", new XAttribute(Pres + "class", "notes"),
+                    new XAttribute(Svg + "x", Len(54)), new XAttribute(Svg + "y", Len(72 + slideHeight)),
+                    new XAttribute(Svg + "width", Len(432)), new XAttribute(Svg + "height", Len(594 - slideHeight)),
+                    box)));
+        }
         return page;
     }
 

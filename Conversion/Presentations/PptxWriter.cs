@@ -48,10 +48,13 @@ internal sealed class PptxWriter
         presRels.Add(Rel($"rId{count + 2}", "theme", "theme/theme1.xml"));
         presRels.Add(Rel($"rId{count + 3}", "presProps", "presProps.xml"));
         presRels.Add(Rel($"rId{count + 4}", "tableStyles", "tableStyles.xml"));
+        bool notes = _deck.Slides.Any(s => s.Notes.Count > 0);
+        if (notes) presRels.Add(Rel("rIdNotesMaster", "notesMaster", "notesMasters/notesMaster1.xml"));
         Save("ppt/_rels/presentation.xml.rels", Rels(presRels));
 
         Save("ppt/presentation.xml", new XElement(P + "presentation", Ns(), new XAttribute("saveSubsetFonts", 1),
             new XElement(P + "sldMasterIdLst", new XElement(P + "sldMasterId", new XAttribute("id", 2147483648), new XAttribute(R + "id", "rId1"))),
+            notes ? new XElement(P + "notesMasterIdLst", new XElement(P + "notesMasterId", new XAttribute(R + "id", "rIdNotesMaster"))) : null,
             new XElement(P + "sldIdLst", Enumerable.Range(0, count).Select(i =>
                 new XElement(P + "sldId", new XAttribute("id", 256 + i), new XAttribute(R + "id", $"rId{i + 2}")))),
             new XElement(P + "sldSz", new XAttribute("cx", Emu(_deck.Width)), new XAttribute("cy", Emu(_deck.Height))),
@@ -59,6 +62,7 @@ internal sealed class PptxWriter
 
         WriteMasterAndLayout();
         Save("ppt/theme/theme1.xml", Theme());
+        if (notes) WriteNotesMaster();
         Save("ppt/presProps.xml", new XElement(P + "presentationPr", Ns()));
         Save("ppt/tableStyles.xml", new XElement(A + "tblStyleLst", new XAttribute(XNamespace.Xmlns + "a", A),
             new XAttribute("def", "{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}")));
@@ -108,6 +112,11 @@ internal sealed class PptxWriter
         cSld.Add(tree);
         Save($"ppt/slides/slide{index + 1}.xml", new XElement(P + "sld", Ns(), cSld,
             new XElement(P + "clrMapOvr", new XElement(A + "masterClrMapping"))));
+        if (slide.Notes.Count > 0)
+        {
+            _rels.Add(Rel($"rId{_rels.Count + 1}", "notesSlide", $"../notesSlides/notesSlide{index + 1}.xml"));
+            WriteNotes(slide, index);
+        }
         Save($"ppt/slides/_rels/slide{index + 1}.xml.rels", Rels(_rels));
     }
 
@@ -473,6 +482,75 @@ internal sealed class PptxWriter
         return ms.ToArray();
     }
 
+    // ------------------------------------------------------------------ speaker notes
+
+    static XElement Placeholder(int id, string name, string type, int idx, Rect bounds, XElement? body) => new(P + "sp",
+        new XElement(P + "nvSpPr",
+            new XElement(P + "cNvPr", new XAttribute("id", id), new XAttribute("name", name)),
+            new XElement(P + "cNvSpPr", new XElement(A + "spLocks", new XAttribute("noGrp", 1))),
+            new XElement(P + "nvPr", new XElement(P + "ph", new XAttribute("type", type), idx > 0 ? new XAttribute("idx", idx) : null))),
+        new XElement(P + "spPr", Xfrm(bounds, 0, false, false)),
+        body);
+
+    /// <summary>A notes page per slide: the slide picture above, the notes text below (PowerPoint's own layout).</summary>
+    void WriteNotes(Slide slide, int index)
+    {
+        var body = new XElement(P + "txBody", new XElement(A + "bodyPr"), new XElement(A + "lstStyle"),
+            slide.Notes.Select(n => new XElement(A + "p",
+                n.Split('\n').SelectMany((line, i) => new[]
+                {
+                    i > 0 ? new XElement(A + "br", new XElement(A + "rPr", new XAttribute("lang", "en-US"))) : null,
+                    line.Length > 0 ? new XElement(A + "r", new XElement(A + "rPr", new XAttribute("lang", "en-US"), new XAttribute("dirty", 0)), new XElement(A + "t", Clean(line))) : null,
+                }.OfType<XElement>()))));
+        var tree = new XElement(P + "spTree",
+            new XElement(P + "nvGrpSpPr", new XElement(P + "cNvPr", new XAttribute("id", 1), new XAttribute("name", "")), new XElement(P + "cNvGrpSpPr"), new XElement(P + "nvPr")),
+            new XElement(P + "grpSpPr", Xfrm(new Rect(), 0, false, false, group: true)),
+            new XElement(P + "sp",
+                new XElement(P + "nvSpPr",
+                    new XElement(P + "cNvPr", new XAttribute("id", 2), new XAttribute("name", "Slide Image")),
+                    new XElement(P + "cNvSpPr", new XElement(A + "spLocks", new XAttribute("noGrp", 1), new XAttribute("noRot", 1), new XAttribute("noChangeAspect", 1))),
+                    new XElement(P + "nvPr", new XElement(P + "ph", new XAttribute("type", "sldImg")))),
+                new XElement(P + "spPr")),
+            new XElement(P + "sp",
+                new XElement(P + "nvSpPr",
+                    new XElement(P + "cNvPr", new XAttribute("id", 3), new XAttribute("name", "Notes")),
+                    new XElement(P + "cNvSpPr", new XElement(A + "spLocks", new XAttribute("noGrp", 1))),
+                    new XElement(P + "nvPr", new XElement(P + "ph", new XAttribute("type", "body"), new XAttribute("idx", 1)))),
+                new XElement(P + "spPr"),
+                body));
+        Save($"ppt/notesSlides/notesSlide{index + 1}.xml", new XElement(P + "notes", Ns(), new XElement(P + "cSld", tree),
+            new XElement(P + "clrMapOvr", new XElement(A + "masterClrMapping"))));
+        Save($"ppt/notesSlides/_rels/notesSlide{index + 1}.xml.rels", Rels([
+            Rel("rId1", "notesMaster", "../notesMasters/notesMaster1.xml"),
+            Rel("rId2", "slide", $"../slides/slide{index + 1}.xml"),
+        ]));
+    }
+
+    void WriteNotesMaster()
+    {
+        const double H = 720; // a portrait notes page (7.5 × 10 in)
+        double slideH = Math.Min(270, 432 * _deck.Height / Math.Max(1, _deck.Width));
+        var tree = new XElement(P + "spTree",
+            new XElement(P + "nvGrpSpPr", new XElement(P + "cNvPr", new XAttribute("id", 1), new XAttribute("name", "")), new XElement(P + "cNvGrpSpPr"), new XElement(P + "nvPr")),
+            new XElement(P + "grpSpPr", Xfrm(new Rect(), 0, false, false, group: true)),
+            Placeholder(2, "Slide Image", "sldImg", 2, new Rect(54, 54, 432, slideH), null),
+            Placeholder(3, "Notes", "body", 1, new Rect(54, 72 + slideH, 432, H - 126 - slideH),
+                new XElement(P + "txBody", new XElement(A + "bodyPr"), new XElement(A + "lstStyle"), new XElement(A + "p"))));
+        XElement Level(int n) => new(A + $"lvl{n}pPr", new XAttribute("marL", (n - 1) * 457200), new XElement(A + "defRPr", new XAttribute("sz", 1200),
+            new XElement(A + "solidFill", new XElement(A + "schemeClr", new XAttribute("val", "tx1"))), new XElement(A + "latin", new XAttribute("typeface", "+mn-lt"))));
+        Save("ppt/notesMasters/notesMaster1.xml", new XElement(P + "notesMaster", Ns(),
+            new XElement(P + "cSld",
+                new XElement(P + "bg", new XElement(P + "bgRef", new XAttribute("idx", 1001), new XElement(A + "schemeClr", new XAttribute("val", "bg1")))),
+                tree),
+            new XElement(P + "clrMap", new XAttribute("bg1", "lt1"), new XAttribute("tx1", "dk1"), new XAttribute("bg2", "lt2"), new XAttribute("tx2", "dk2"),
+                new XAttribute("accent1", "accent1"), new XAttribute("accent2", "accent2"), new XAttribute("accent3", "accent3"),
+                new XAttribute("accent4", "accent4"), new XAttribute("accent5", "accent5"), new XAttribute("accent6", "accent6"),
+                new XAttribute("hlink", "hlink"), new XAttribute("folHlink", "folHlink")),
+            new XElement(P + "notesStyle", Enumerable.Range(1, 3).Select(Level))));
+        Save("ppt/notesMasters/_rels/notesMaster1.xml.rels", Rels([Rel("rId1", "theme", "../theme/theme2.xml")]));
+        Save("ppt/theme/theme2.xml", Theme());
+    }
+
     // ------------------------------------------------------------------ fixed parts
 
     void WriteMasterAndLayout()
@@ -543,6 +621,13 @@ internal sealed class PptxWriter
         Override("/ppt/slideMasters/slideMaster1.xml", Ml + "slideMaster+xml");
         Override("/ppt/slideLayouts/slideLayout1.xml", Ml + "slideLayout+xml");
         Override("/ppt/theme/theme1.xml", "application/vnd.openxmlformats-officedocument.theme+xml");
+        if (_deck.Slides.Any(s => s.Notes.Count > 0))
+        {
+            Override("/ppt/notesMasters/notesMaster1.xml", Ml + "notesMaster+xml");
+            Override("/ppt/theme/theme2.xml", "application/vnd.openxmlformats-officedocument.theme+xml");
+            for (int i = 0; i < slides; i++)
+                if (_deck.Slides[i].Notes.Count > 0) Override($"/ppt/notesSlides/notesSlide{i + 1}.xml", Ml + "notesSlide+xml");
+        }
         Override("/ppt/presProps.xml", Ml + "presProps+xml");
         Override("/ppt/tableStyles.xml", Ml + "tableStyles+xml");
         Override("/docProps/core.xml", "application/vnd.openxmlformats-package.core-properties+xml");

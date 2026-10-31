@@ -37,6 +37,9 @@ internal static class FlowBridge
         public Dictionary<DNote, TextElement> NoteAnchors { get; } = [];
         /// <summary>From a first pass: the page of each footnote. Notes sharing a page are then laid out together.</summary>
         public Dictionary<DNote, int>? NotePages { get; init; }
+        /// <summary>Multi-section documents: endnotes wait for the last section, which also receives the earlier ones.</summary>
+        public bool HoldEndnotes { get; init; }
+        public List<DNote> EarlierEndnotes { get; init; } = [];
     }
 
     public static FlowDocument ToFlow(DDocument doc, bool forRtf = false) => ToFlow(new FlowContext(doc) { ForRtf = forRtf });
@@ -46,6 +49,16 @@ internal static class FlowBridge
         var doc = ctx.Doc;
         var flow = NewFlow(doc, doc.PageWidth, doc.PageHeight, doc.Margins);
         foreach (var block in doc.Blocks) flow.Blocks.Add(ToBlock(block, ctx, doc.ContentWidth));
+        if (doc.Columns > 1)
+        {
+            // Newspaper columns: WPF fits as many columns of this width as the page holds.
+            double gap = Units.ToDip(doc.ColumnGap);
+            flow.ColumnGap = gap;
+            flow.ColumnWidth = (Units.ToDip(doc.ContentWidth) - gap * (doc.Columns - 1)) / doc.Columns - 0.5;
+            flow.IsColumnWidthFlexible = true;
+        }
+        if (ctx.HoldEndnotes) return flow;
+        ctx.Endnotes.InsertRange(0, ctx.EarlierEndnotes);
         AppendEndnotes(flow, ctx);
         return flow;
     }
@@ -160,7 +173,7 @@ internal static class FlowBridge
                     else if (FootnotesToPlace(n, ctx) is { Count: > 0 } group) para.Inlines.Add(FootnoteFigure(group, ctx));
                     break;
                 case DFloat f:
-                    AddFloat(para, f, ctx, available);
+                    AddFloat(para, f, ctx, available, crowded: p.Inlines.OfType<DFloat>().Count(o => o.VerticalFrom != FloatFrom.Paragraph) > 1);
                     break;
             }
         }
@@ -267,7 +280,8 @@ internal static class FlowBridge
             foreach (var block in WithMark(note)) flow.Blocks.Add(ToBlock(block, ctx, ctx.Doc.ContentWidth));
     }
 
-    static void AddFloat(Paragraph para, DFloat f, FlowContext ctx, double available)
+    /// <param name="crowded">Several page/margin-positioned floats share this paragraph.</param>
+    static void AddFloat(Paragraph para, DFloat f, FlowContext ctx, double available, bool crowded)
     {
         if (ctx.ForRtf)
         {
@@ -282,7 +296,9 @@ internal static class FlowBridge
         }
         // Floats that sit behind/in front of the text at a page position are painted by the PDF renderer;
         // a zero-width anchor tells it which page they belong to.
-        if (ctx.AllFloatsAsOverlays || (f.Wrap is FloatWrap.Behind or FloatWrap.InFront && f.VerticalFrom != FloatFrom.Paragraph))
+        // Several floats placed against the page or margin in one paragraph are painted at their exact spots too:
+        // WPF's figures can't overlap one another, so they would otherwise be pushed apart.
+        if (ctx.AllFloatsAsOverlays || (f.Wrap is FloatWrap.Behind or FloatWrap.InFront || crowded) && f.VerticalFrom != FloatFrom.Paragraph)
         {
             var anchor = new Run("​");
             para.Inlines.Add(anchor);
@@ -294,7 +310,7 @@ internal static class FlowBridge
 
     static Figure FloatFigure(DFloat f, FlowContext ctx)
     {
-        bool textBox = f.Image == null;
+        bool textBox = f.Blocks.Count > 0;
         var figure = new Figure
         {
             Width = new FigureLength(Units.ToDip(f.Width)),
@@ -336,7 +352,11 @@ internal static class FlowBridge
         }
 
         if (f.Image != null && Decode(f.Image.Data) is { } source)
-            figure.Blocks.Add(new BlockUIContainer(new Image { Source = source, Stretch = Stretch.Fill, Width = Units.ToDip(f.Width), Height = Units.ToDip(f.Height) }));
+        {
+            // A shape with text: its drawing becomes the background the text sits on.
+            if (f.Blocks.Count > 0) figure.Background = new ImageBrush(source) { Stretch = Stretch.Fill };
+            else figure.Blocks.Add(new BlockUIContainer(new Image { Source = source, Stretch = Stretch.Fill, Width = Units.ToDip(f.Width), Height = Units.ToDip(f.Height) }));
+        }
         foreach (var block in f.Blocks) figure.Blocks.Add(ToBlock(block, ctx, Math.Max(20, f.Width - 14.4)));
         if (figure.Blocks.Count == 0) figure.Blocks.Add(new Paragraph());
         return figure;

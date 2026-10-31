@@ -41,32 +41,47 @@ internal sealed class DocxWriter
 
     public static void Write(DDocument doc, string path) => new DocxWriter(doc).Save(path);
 
+    PageSetup _section = null!;
+    List<XElement>? _headerReferences;
+
+    /// <summary>A section's settings: header/footer references (shared by all sections), page size, margins and columns.</summary>
+    XElement SectPr(PageSetup setup)
+    {
+        if (_headerReferences == null)
+        {
+            _headerReferences = [];
+            foreach (var (kind, type, part) in new[]
+            {
+                ("header", "default", _doc.Header), ("header", "first", _doc.FirstHeader), ("header", "even", _doc.EvenHeader),
+                ("footer", "default", _doc.Footer), ("footer", "first", _doc.FirstFooter), ("footer", "even", _doc.EvenFooter),
+            })
+            {
+                if (part == null || (type == "first" && !_doc.DifferentFirstPage)) continue;
+                _headerReferences.Add(new XElement(W + (kind + "Reference"), new XAttribute(W + "type", type), new XAttribute(R + "id", HeaderFooterPart(kind, part))));
+            }
+        }
+        var sectPr = new XElement(W + "sectPr", _headerReferences.Select(r => new XElement(r)));
+        sectPr.Add(
+            new XElement(W + "pgSz", new XAttribute(W + "w", Units.ToTwips(setup.Width)), new XAttribute(W + "h", Units.ToTwips(setup.Height)),
+                setup.Width > setup.Height ? new XAttribute(W + "orient", "landscape") : null),
+            new XElement(W + "pgMar",
+                new XAttribute(W + "top", Units.ToTwips(setup.Margins.Top)), new XAttribute(W + "right", Units.ToTwips(setup.Margins.Right)),
+                new XAttribute(W + "bottom", Units.ToTwips(setup.Margins.Bottom)), new XAttribute(W + "left", Units.ToTwips(setup.Margins.Left)),
+                new XAttribute(W + "header", Units.ToTwips(_doc.HeaderDistance)), new XAttribute(W + "footer", Units.ToTwips(_doc.FooterDistance)),
+                new XAttribute(W + "gutter", 0)));
+        if (setup.Columns > 1)
+            sectPr.Add(new XElement(W + "cols", new XAttribute(W + "num", setup.Columns), new XAttribute(W + "space", Units.ToTwips(setup.ColumnGap))));
+        if (_doc.DifferentFirstPage) sectPr.Add(new XElement(W + "titlePg"));
+        return sectPr;
+    }
+
     void Save(string path)
     {
+        _section = new PageSetup(_doc.PageWidth, _doc.PageHeight, _doc.Margins, _doc.Columns, _doc.ColumnGap);
         var body = new XElement(W + "body");
         Blocks(_doc.Blocks, body, _doc.ContentWidth, topLevel: true);
 
-        // Section: header/footer references first, then page size and margins.
-        var sectPr = new XElement(W + "sectPr");
-        foreach (var (kind, type, part) in new[]
-        {
-            ("header", "default", _doc.Header), ("header", "first", _doc.FirstHeader), ("header", "even", _doc.EvenHeader),
-            ("footer", "default", _doc.Footer), ("footer", "first", _doc.FirstFooter), ("footer", "even", _doc.EvenFooter),
-        })
-        {
-            if (part == null || (type == "first" && !_doc.DifferentFirstPage)) continue;
-            sectPr.Add(new XElement(W + (kind + "Reference"), new XAttribute(W + "type", type), new XAttribute(R + "id", HeaderFooterPart(kind, part))));
-        }
-        sectPr.Add(
-            new XElement(W + "pgSz", new XAttribute(W + "w", Units.ToTwips(_doc.PageWidth)), new XAttribute(W + "h", Units.ToTwips(_doc.PageHeight)),
-                _doc.PageWidth > _doc.PageHeight ? new XAttribute(W + "orient", "landscape") : null),
-            new XElement(W + "pgMar",
-                new XAttribute(W + "top", Units.ToTwips(_doc.Margins.Top)), new XAttribute(W + "right", Units.ToTwips(_doc.Margins.Right)),
-                new XAttribute(W + "bottom", Units.ToTwips(_doc.Margins.Bottom)), new XAttribute(W + "left", Units.ToTwips(_doc.Margins.Left)),
-                new XAttribute(W + "header", Units.ToTwips(_doc.HeaderDistance)), new XAttribute(W + "footer", Units.ToTwips(_doc.FooterDistance)),
-                new XAttribute(W + "gutter", 0)));
-        if (_doc.DifferentFirstPage) sectPr.Add(new XElement(W + "titlePg"));
-        body.Add(sectPr);
+        body.Add(SectPr(_section));
 
         var document = new XElement(W + "document", Namespaces(), body);
 
@@ -117,6 +132,13 @@ internal sealed class DocxWriter
     {
         for (int i = 0; i < blocks.Count; i++)
         {
+            if (topLevel && i > 0 && blocks[i].Section is { } next)
+            {
+                // A section ends: Word keeps its settings in the last paragraph of the section.
+                parent.Add(new XElement(W + "p", new XElement(W + "pPr", SectPr(_section))));
+                _section = next;
+                available = next.ContentWidth;
+            }
             if (blocks[i] is DParagraph p) parent.Add(Paragraph(p, available));
             else if (blocks[i] is DTable t)
             {

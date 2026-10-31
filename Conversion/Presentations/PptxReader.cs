@@ -156,6 +156,14 @@ internal sealed class PptxReader
         if (showMaster && layout != null)
             ReadTree(Tree(layout), Inherit(ctx, layout), null, slide.Shapes, placeholders: false);
         ReadTree(Tree(slidePart), ctx, null, slide.Shapes, placeholders: true);
+
+        // Speaker notes: the body placeholder of the slide's notes page.
+        if (Related(slidePart, "/notesSlide") is { } notes)
+            foreach (var sp in Tree(notes)?.Descendants(P + "sp") ?? [])
+                if (Attr(PlaceholderOf(sp), "type") == "body")
+                    foreach (var para in sp.Descendants(A + "p"))
+                        slide.Notes.Add(string.Concat(para.Elements().Select(e => e.Name.LocalName switch { "r" or "fld" => (string?)e.Element(A + "t") ?? "", "br" => "\n", _ => "" })));
+        while (slide.Notes.Count > 0 && slide.Notes[^1].Length == 0) slide.Notes.RemoveAt(slide.Notes.Count - 1);
         return slide;
     }
 
@@ -328,6 +336,16 @@ internal sealed class PptxReader
             var shape = new SlideShape { Bounds = bounds, Insets = new Thickness(0) };
             shape.Text.Add(ReadTable(tbl, ctx));
             into.Add(shape);
+            return;
+        }
+
+        // Charts: drawn from the data PowerPoint keeps with them (there is no saved picture).
+        if (((string?)data.Attribute("uri"))?.EndsWith("/chart") == true
+            && Attr(data.Elements().FirstOrDefault(e => e.Name.LocalName == "chart"), R + "id") is { } chartId
+            && ctx.Part.Rels.TryGetValue(chartId, out var chartRel) && LoadPart(chartRel.Target) is { } chartPart
+            && Charts.ReadDrawingML(chartPart.Root, name => Scheme(name, ctx, null), ctx.Theme.Minor) is { } chart)
+        {
+            into.Add(new SlideShape { Bounds = bounds, Picture = Charts.ToImage(chart, bounds.Width, bounds.Height) });
             return;
         }
 

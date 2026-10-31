@@ -49,10 +49,20 @@
     <PackageReference Include="YamlDotNet" Version="18.1.0" />
   </ItemGroup>
 
-  <!-- FFmpeg (LGPL) is embedded compressed and unpacked on first use. Create it with tools\pack-ffmpeg.ps1. -->
-  <ItemGroup Condition="Exists('tools\ffmpeg.tar.xz')">
-    <EmbeddedResource Include="tools\ffmpeg.tar.xz" LogicalName="ffmpeg.tar.xz" />
-  </ItemGroup>
+  <!--
+    FFmpeg (LGPL) is embedded compressed and unpacked on first use. The first build fetches and packs it
+    (tools\pack-ffmpeg.ps1); pass -p:SkipFfmpegPack=true to build without it (e.g. offline).
+  -->
+  <Target Name="PackFfmpeg" BeforeTargets="PrepareForBuild" Condition="!Exists('tools\ffmpeg.tar.xz') And '$(SkipFfmpegPack)' != 'true'">
+    <Message Importance="high" Text="Fetching the LGPL FFmpeg build and packing tools\ffmpeg.tar.xz (first build only)..." />
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\tools\pack-ffmpeg.ps1&quot;" ContinueOnError="true" />
+    <Warning Condition="!Exists('tools\ffmpeg.tar.xz')" Text="FFmpeg couldn't be packed (offline?). The app still builds; WebM, AVI, MPG and AC3 will then need an ffmpeg.exe next to the app or on PATH." />
+  </Target>
+  <Target Name="EmbedFfmpeg" BeforeTargets="AssignTargetPaths" AfterTargets="PackFfmpeg" Condition="Exists('tools\ffmpeg.tar.xz')">
+    <ItemGroup>
+      <EmbeddedResource Include="tools\ffmpeg.tar.xz" LogicalName="ffmpeg.tar.xz" />
+    </ItemGroup>
+  </Target>
 
   <!-- SkiaSharp's package ships a ~96 MB native debug-symbols file; it isn't needed to run. -->
   <Target Name="DropSkiaSymbols" AfterTargets="Publish">

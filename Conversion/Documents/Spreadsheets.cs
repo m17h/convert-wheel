@@ -12,6 +12,9 @@ namespace ConvertWheel.Conversion.Documents;
 /// <summary>Cell values are string, double, DateTime, bool or null.</summary>
 internal sealed record Sheet(string Name, List<object?[]> Rows)
 {
+    /// <summary>The sheet's charts, already drawn (for PDF and HTML output).</summary>
+    public List<DImage> Charts { get; init; } = [];
+
     public int ColumnCount => Rows.Count == 0 ? 0 : Rows.Max(r => r.Length);
 }
 
@@ -141,6 +144,11 @@ internal static class Spreadsheets
             }
             sheets.Add(new Sheet(reader.Name, Trim(rows)));
         } while (reader.NextResult());
+        if (Path.GetExtension(path).ToLowerInvariant() is ".xlsx" or ".xlsm")
+        {
+            var charts = SpreadsheetCharts.Xlsx(path);
+            sheets = sheets.Select(s => charts.TryGetValue(s.Name, out var c) ? s with { Charts = c } : s).ToList();
+        }
         return sheets.Count > 0 ? sheets : [new Sheet("Sheet1", [])];
     }
 
@@ -169,6 +177,8 @@ internal static class Spreadsheets
             }
             sheets.Add(new Sheet((string?)table.Attribute(Table + "name") ?? $"Sheet{sheets.Count + 1}", Trim(rows)));
         }
+        var odsCharts = SpreadsheetCharts.Ods(zip, root);
+        sheets = sheets.Select(s => odsCharts.TryGetValue(s.Name, out var c) ? s with { Charts = c } : s).ToList();
         return sheets.Count > 0 ? sheets : [new Sheet("Sheet1", [])];
     }
 
@@ -203,6 +213,7 @@ internal static class Spreadsheets
     }
 
     /// <summary>Drops trailing empty rows and columns.</summary>
+
     static List<object?[]> Trim(List<object?[]> rows)
     {
         static bool Empty(object? v) => v is null || (v is string s && s.Length == 0);
@@ -322,6 +333,42 @@ internal static class Spreadsheets
                 worksheet.Add(new XElement(S + "cols", widths.Select((w, c) => new XElement(S + "col",
                     new XAttribute("min", c + 1), new XAttribute("max", c + 1), new XAttribute("width", w.ToString("0.##", CultureInfo.InvariantCulture)), new XAttribute("customWidth", 1)))));
             worksheet.Add(data);
+            if (sheet.Charts.Count > 0)
+            {
+                // Charts come along as pictures stacked below the data.
+                XNamespace Xdr = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing";
+                XNamespace Dml = "http://schemas.openxmlformats.org/drawingml/2006/main";
+                worksheet.Add(new XElement(S + "drawing", new XAttribute(R + "id", "rIdDrawing")));
+                Put(zip, $"xl/worksheets/_rels/sheet{n}.xml.rels", new XElement(PR + "Relationships",
+                    new XElement(PR + "Relationship", new XAttribute("Id", "rIdDrawing"), new XAttribute("Type", RelBase + "drawing"), new XAttribute("Target", $"../drawings/drawing{n}.xml"))));
+                var drawing = new XElement(Xdr + "wsDr", new XAttribute(XNamespace.Xmlns + "xdr", Xdr), new XAttribute(XNamespace.Xmlns + "a", Dml), new XAttribute(XNamespace.Xmlns + "r", R));
+                var drawingRels = new XElement(PR + "Relationships");
+                int row = sheet.Rows.Count + 1;
+                for (int k = 0; k < sheet.Charts.Count; k++)
+                {
+                    var chart = sheet.Charts[k];
+                    var media = $"chart{n}_{k + 1}.png";
+                    using (var s = zip.CreateEntry($"xl/media/{media}", CompressionLevel.NoCompression).Open()) s.Write(chart.Data);
+                    drawingRels.Add(new XElement(PR + "Relationship", new XAttribute("Id", $"rIdImg{k + 1}"), new XAttribute("Type", RelBase + "image"), new XAttribute("Target", $"../media/{media}")));
+                    long cx = (long)(chart.Width * 12700), cy = (long)(chart.Height * 12700);
+                    drawing.Add(new XElement(Xdr + "oneCellAnchor",
+                        new XElement(Xdr + "from", new XElement(Xdr + "col", 0), new XElement(Xdr + "colOff", 0), new XElement(Xdr + "row", row), new XElement(Xdr + "rowOff", 0)),
+                        new XElement(Xdr + "ext", new XAttribute("cx", cx), new XAttribute("cy", cy)),
+                        new XElement(Xdr + "pic",
+                            new XElement(Xdr + "nvPicPr", new XElement(Xdr + "cNvPr", new XAttribute("id", k + 2), new XAttribute("name", $"Chart {k + 1}")), new XElement(Xdr + "cNvPicPr")),
+                            new XElement(Xdr + "blipFill", new XElement(Dml + "blip", new XAttribute(R + "embed", $"rIdImg{k + 1}")), new XElement(Dml + "stretch", new XElement(Dml + "fillRect"))),
+                            new XElement(Xdr + "spPr",
+                                new XElement(Dml + "xfrm", new XElement(Dml + "off", new XAttribute("x", 0), new XAttribute("y", 0)), new XElement(Dml + "ext", new XAttribute("cx", cx), new XAttribute("cy", cy))),
+                                new XElement(Dml + "prstGeom", new XAttribute("prst", "rect"), new XElement(Dml + "avLst")))),
+                        new XElement(Xdr + "clientData")));
+                    row += (int)Math.Ceiling(chart.Height / 15) + 1;
+                }
+                Put(zip, $"xl/drawings/drawing{n}.xml", drawing);
+                Put(zip, $"xl/drawings/_rels/drawing{n}.xml.rels", drawingRels);
+                types.Add(new XElement(CT + "Override", new XAttribute("PartName", $"/xl/drawings/drawing{n}.xml"), new XAttribute("ContentType", "application/vnd.openxmlformats-officedocument.drawing+xml")));
+                if (!types.Elements(CT + "Default").Any(d => (string?)d.Attribute("Extension") == "png"))
+                    types.AddFirst(new XElement(CT + "Default", new XAttribute("Extension", "png"), new XAttribute("ContentType", "image/png")));
+            }
             Put(zip, $"xl/worksheets/sheet{n}.xml", worksheet);
         }
 
@@ -353,6 +400,7 @@ internal static class Spreadsheets
     {
         var names = UniqueSheetNames(sheets, 100, "[]*?:/\\'");
         var spreadsheet = new XElement(Office + "spreadsheet");
+        var pictures = new List<(string name, byte[] data, string type)>();
         var autoStyles = new XElement(Office + "automatic-styles",
             new XElement(OdtReader.St + "style", new XAttribute(OdtReader.St + "name", "dateCell"), new XAttribute(OdtReader.St + "family", "table-cell"),
                 new XAttribute(OdtReader.St + "data-style-name", "dateFormat")));
@@ -407,13 +455,32 @@ internal static class Spreadsheets
                 table.Add(tr);
             }
             if (sheet.Rows.Count == 0) table.Add(new XElement(Table + "table-row", new XElement(Table + "table-cell")));
+            if (sheet.Charts.Count > 0)
+            {
+                // Charts come along as pictures stacked below the data (shapes go before the columns).
+                var shapes = new XElement(Table + "shapes");
+                double y = (sheet.Rows.Count + 1) * 12.8;
+                for (int k = 0; k < sheet.Charts.Count; k++)
+                {
+                    var chart = sheet.Charts[k];
+                    var name = $"Pictures/chart{i + 1}_{k + 1}.png";
+                    pictures.Add((name, chart.Data, "image/png"));
+                    shapes.Add(new XElement(Draw + "frame", new XAttribute(Draw + "name", $"Chart {k + 1}"),
+                        new XAttribute(Svg + "x", "0cm"), new XAttribute(Svg + "y", OdfPackage.Len(y)),
+                        new XAttribute(Svg + "width", OdfPackage.Len(chart.Width)), new XAttribute(Svg + "height", OdfPackage.Len(chart.Height)),
+                        new XElement(Draw + "image", new XAttribute(XLink + "href", name), new XAttribute(XLink + "type", "simple"),
+                            new XAttribute(XLink + "show", "embed"), new XAttribute(XLink + "actuate", "onLoad"))));
+                    y += chart.Height + 12;
+                }
+                table.AddFirst(shapes);
+            }
             spreadsheet.Add(table);
         }
 
         var content = new XElement(Office + "document-content", OdfPackage.Namespaces(), new XAttribute(XNamespace.Xmlns + "number", Number),
             autoStyles, new XElement(Office + "body", spreadsheet));
         var styles = new XElement(Office + "document-styles", OdfPackage.Namespaces(), new XElement(Office + "styles"));
-        OdfPackage.Save(path, "application/vnd.oasis.opendocument.spreadsheet", content, styles, []);
+        OdfPackage.Save(path, "application/vnd.oasis.opendocument.spreadsheet", content, styles, pictures);
     }
 
     static void WriteHtml(List<Sheet> sheets, string path, string title)
@@ -439,6 +506,9 @@ internal static class Spreadsheets
                 sb.Append("</tr>\n");
             }
             sb.Append("</table>\n");
+            foreach (var chart in sheet.Charts)
+                sb.Append("<p><img alt=\"Chart\" style=\"max-width:100%\" width=\"").Append((int)(chart.Width * 4 / 3))
+                  .Append("\" src=\"data:image/png;base64,").Append(Convert.ToBase64String(chart.Data)).Append("\"></p>\n");
         }
         sb.Append("</body>\n</html>\n");
         File.WriteAllText(path, sb.ToString(), new UTF8Encoding(false));
@@ -461,7 +531,7 @@ internal static class Spreadsheets
                 doc.Blocks.Add(heading);
             }
             int width = sheet.ColumnCount;
-            if (width == 0) continue;
+            if (width == 0) { AddCharts(doc, sheet); continue; }
             var widths = ColumnWidths(sheet);
             double total = widths.Sum();
             var table = new DTable { Borders = true, ColumnWidths = widths.Select(w => w / total * doc.ContentWidth).ToList() };
@@ -481,8 +551,21 @@ internal static class Spreadsheets
                 table.Rows.Add(r);
             }
             doc.Blocks.Add(table);
+            AddCharts(doc, sheet);
         }
         return doc;
+    }
+
+    /// <summary>A sheet's charts below its data, shrunk to fit the page width.</summary>
+    static void AddCharts(DDocument doc, Sheet sheet)
+    {
+        foreach (var chart in sheet.Charts)
+        {
+            double scale = Math.Min(1, doc.ContentWidth / chart.Width);
+            var p = new DParagraph { SpaceBefore = 12, SpaceAfter = 6 };
+            p.Inlines.Add(new DImage(chart.Data, chart.Ext, chart.Width * scale, chart.Height * scale));
+            doc.Blocks.Add(p);
+        }
     }
 
     /// <summary>Approximate column widths in characters, from the longest value in each column.</summary>

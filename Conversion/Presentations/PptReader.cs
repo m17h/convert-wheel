@@ -17,6 +17,7 @@ internal sealed class PptReader
     readonly byte[] _doc;
     readonly byte[]? _pictures;
     readonly Dictionary<int, int> _persist = [];
+    readonly Dictionary<int, int> _notesPersist = [];
     readonly List<string> _fonts = [];
     readonly List<(int offset, int size)> _blips = [];
     readonly Dictionary<int, TextDefaults[]> _masterStyles = [];
@@ -144,6 +145,8 @@ internal sealed class PptReader
             if (Scheme(master.Value) is { } masterScheme) _scheme = masterScheme;
         }
 
+        foreach (var r in lists.Where(l => l.Instance == 2).SelectMany(Children).Where(r => r.Type == 0x03F3 && r.Length >= 16))
+            _notesPersist[I32(r.Start + 12)] = I32(r.Start);
         var slideList = lists.FirstOrDefault(l => l.Instance == 0);
         if (slideList.Length == 0) throw new ConversionException("This presentation has no slides.");
 
@@ -160,10 +163,40 @@ internal sealed class PptReader
             var slide = At(offset);
             if (slide.Type != 0x03EE) continue;
             var scheme = Scheme(slide) ?? _scheme;
-            deck.Slides.Add(ReadSlide(slide, master, scheme, Grouped(texts)));
+            var read = ReadSlide(slide, master, scheme, Grouped(texts));
+            read.Notes.AddRange(Notes(slide));
+            deck.Slides.Add(read);
         }
         if (deck.Slides.Count == 0) throw new ConversionException("This presentation has no slides.");
         return deck;
+    }
+
+    /// <summary>Speaker notes: the notes-type text on the slide's notes page.</summary>
+    List<string> Notes(Rec slide)
+    {
+        var notes = new List<string>();
+        // The slide names its notes page by notes id; the notes list maps that id to where the page is stored.
+        if (Child(slide, 0x03EF) is not { } atom || !_notesPersist.TryGetValue(I32(atom.Start + 16), out var persist)
+            || !_persist.TryGetValue(persist, out var offset) || offset <= 0) return notes;
+        var page = At(offset);
+        if (page.Type != 0x03F0) return notes;
+        foreach (var box in Descendants(page, 0xF00D))
+        {
+            var records = Children(box).ToList();
+            if (records.FirstOrDefault() is not { Type: 0x0F9F } header || I32(header.Start) != 2) continue;
+            foreach (var r in records)
+            {
+                var text = r.Type switch
+                {
+                    0x0FA0 => Encoding.Unicode.GetString(_doc, r.Start, r.Length & ~1),
+                    0x0FA8 => Encoding.Latin1.GetString(_doc, r.Start, r.Length),
+                    _ => null,
+                };
+                if (text != null) notes.AddRange(text.Split('\r').Select(line => line.Replace('\v', '\n')));
+            }
+        }
+        while (notes.Count > 0 && notes[^1].Length == 0) notes.RemoveAt(notes.Count - 1);
+        return notes;
     }
 
     /// <summary>Splits a slide's text records into one group per text block (each starts with a text header).</summary>

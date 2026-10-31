@@ -84,8 +84,34 @@ internal sealed class OdtReader
         return doc;
     }
 
+    XElement? _stylesRoot;
+    DDocument? _document;
+    string _currentMaster = "Standard";
+
+    /// <summary>A page style's settings (size, margins, columns), for sections that switch to it.</summary>
+    PageSetup? SetupOf(string masterName)
+    {
+        var master = _stylesRoot!.Descendants(St + "master-page").FirstOrDefault(m => (string?)m.Attribute(St + "name") == masterName);
+        var layoutName = (string?)master?.Attribute(St + "page-layout-name");
+        var layout = _stylesRoot.Descendants(St + "page-layout").FirstOrDefault(l => (string?)l.Attribute(St + "name") == layoutName);
+        var props = layout?.Element(St + "page-layout-properties");
+        if (props == null) return null;
+        double w = Len(props, Fo + "page-width") ?? 595, h = Len(props, Fo + "page-height") ?? 842;
+        // The body starts below the header (and ends above the footer), like the first page style.
+        double top = Len(props, Fo + "margin-top") ?? 56.7, bottom = Len(props, Fo + "margin-bottom") ?? 56.7;
+        var headerProps = layout!.Element(St + "header-style")?.Element(St + "header-footer-properties");
+        var footerProps = layout.Element(St + "footer-style")?.Element(St + "header-footer-properties");
+        if (master!.Element(St + "header") != null) top += (Len(headerProps, Fo + "min-height") ?? 14) + (Len(headerProps, Fo + "margin-bottom") ?? 0);
+        if (master.Element(St + "footer") != null) bottom += (Len(footerProps, Fo + "min-height") ?? 14) + (Len(footerProps, Fo + "margin-top") ?? 0);
+        var columns = props.Element(St + "columns");
+        return new PageSetup(w, h, new Thickness(Len(props, Fo + "margin-left") ?? 56.7, top, Len(props, Fo + "margin-right") ?? 56.7, bottom),
+            Math.Max(1, (int?)columns?.Attribute(Fo + "column-count") ?? 1), Len(columns, Fo + "column-gap") ?? 36);
+    }
+
     void ReadPageLayout(XElement styles, DDocument doc)
     {
+        _stylesRoot = styles;
+        _document = doc;
         var master = styles.Descendants(St + "master-page").FirstOrDefault(m => (string?)m.Attribute(St + "name") == "Standard")
                      ?? styles.Descendants(St + "master-page").FirstOrDefault();
         var layoutName = (string?)master?.Attribute(St + "page-layout-name");
@@ -93,6 +119,11 @@ internal sealed class OdtReader
                      ?? styles.Descendants(St + "page-layout").FirstOrDefault();
         var props = layout?.Element(St + "page-layout-properties");
         if (props == null) return;
+        if (props.Element(St + "columns") is { } cols)
+        {
+            doc.Columns = Math.Max(1, (int?)cols.Attribute(Fo + "column-count") ?? 1);
+            doc.ColumnGap = Len(cols, Fo + "column-gap") ?? 36;
+        }
         if (Len(props, Fo + "page-width") is double w && Len(props, Fo + "page-height") is double h && w > 72 && h > 72)
         {
             doc.PageWidth = w;
@@ -192,6 +223,15 @@ internal sealed class OdtReader
         var styleName = (string?)el.Attribute(Text + "style-name");
         var para = new DParagraph();
         var chain = StyleChain(styleName).ToList();
+        // A paragraph whose style names another page style starts a new section with that page's settings.
+        if (chain.Select(s => (string?)s.Attribute(St + "master-page-name")).FirstOrDefault(n => !string.IsNullOrEmpty(n)) is { } masterName
+            && masterName != _currentMaster && _stylesRoot != null && SetupOf(masterName) is { } setup)
+        {
+            _currentMaster = masterName;
+            if (_document is { Blocks.Count: 0 } first)
+                (first.PageWidth, first.PageHeight, first.Margins, first.Columns, first.ColumnGap) = (setup.Width, setup.Height, setup.Margins, setup.Columns, setup.ColumnGap);
+            else para.Section = setup;
+        }
         ApplyParagraph(para, _defaultParagraphStyle);
         foreach (var s in chain) ApplyParagraph(para, s);
 
@@ -387,16 +427,34 @@ internal sealed class OdtReader
 
     (byte[] data, string ext, double w, double h)? LoadFrameImage(XElement frame)
     {
-        var href = (string?)frame.Element(Draw + "image")?.Attribute(XLink + "href");
+        // Charts are drawn from their own data; their saved preview is usually a format nothing else reads.
+        if ((string?)frame.Element(Draw + "object")?.Attribute(XLink + "href") is { } objectHref && Charts.ReadOdf(_zip, objectHref) is { } chart)
+        {
+            double cw = Len(frame, Svg + "width") ?? 360, ch = Len(frame, Svg + "height") ?? 216;
+            var picture = Charts.ToImage(chart, cw, ch);
+            return (picture.Data, "png", cw, ch);
+        }
+        var href = frame.Elements(Draw + "image").Select(i => (string?)i.Attribute(XLink + "href"))
+            .OrderBy(h => h != null && h.EndsWith(".svg", StringComparison.OrdinalIgnoreCase) ? 1 : 0).FirstOrDefault();
         if (href == null || href.Contains("://")) return null;
         var entry = _zip.GetEntry(href.TrimStart('.', '/'));
+        if (entry == null) return null;
         var ext = Path.GetExtension(href).TrimStart('.').ToLowerInvariant();
         ext = ext switch { "jpg" or "jpeg" => "jpeg", "tif" => "tiff", _ => ext };
-        if (entry == null || ext is not ("png" or "jpeg" or "gif" or "bmp" or "tiff")) return null;
         using var stream = entry.Open();
         using var ms = new MemoryStream();
         stream.CopyTo(ms);
         var data = ms.ToArray();
+        if (ext is not ("png" or "jpeg" or "gif" or "bmp" or "tiff"))
+        {
+            // Metafiles and SVG become PNG so every output format can show them.
+            if (MagickImages.Decode(data) is not { } bitmap) return null;
+            var png = new System.Windows.Media.Imaging.PngBitmapEncoder();
+            png.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(bitmap));
+            using var output = new MemoryStream();
+            png.Save(output);
+            (data, ext) = (output.ToArray(), "png");
+        }
         var (pw, ph) = DocxReader.ImageSize(data);
         return (data, ext, pw, ph);
     }

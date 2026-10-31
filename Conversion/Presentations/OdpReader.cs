@@ -99,6 +99,17 @@ internal sealed partial class OdpReader
             bool showMaster = (string?)pageStyle?.Element(St + "drawing-page-properties")?.Attribute(Pres + "background-objects-visible") != "false";
             if (master != null && showMaster) ReadShapes(master.Elements(), slide.Shapes, onMaster: true);
             ReadShapes(page.Elements(), slide.Shapes, onMaster: false);
+            foreach (var frame in page.Element(Pres + "notes")?.Elements(Draw + "frame").Where(f => (string?)f.Attribute(Pres + "class") == "notes") ?? [])
+                foreach (var p in frame.Descendants().Where(e => e.Name == Text + "p" || e.Name == Text + "h"))
+                    slide.Notes.Add(string.Concat(p.DescendantNodes().Select(n => n switch
+                    {
+                        XText t => t.Value,
+                        XElement { Name.LocalName: "line-break" } => "\n",
+                        XElement { Name.LocalName: "tab" } => "\t",
+                        XElement { Name.LocalName: "s" } s => new string(' ', int.TryParse((string?)s.Attribute(Text + "c"), out var c) ? c : 1),
+                        _ => "",
+                    })));
+            while (slide.Notes.Count > 0 && slide.Notes[^1].Length == 0) slide.Notes.RemoveAt(slide.Notes.Count - 1);
             deck.Slides.Add(slide);
         }
         if (deck.Slides.Count == 0) throw new ConversionException("This presentation has no slides.");
@@ -153,9 +164,18 @@ internal sealed partial class OdpReader
             return;
         }
 
+        // Charts: drawn from their own data (the saved preview is often a format nothing else reads).
+        if (frame.Element(Draw + "object") is { } obj && (string?)obj.Attribute(XLink + "href") is { } objectHref
+            && Charts.ReadOdf(_zip, objectHref) is { } chart)
+        {
+            var shape = NewShape(frame);
+            shape.Picture = Charts.ToImage(chart, shape.Bounds.Width, shape.Bounds.Height);
+            into.Add(shape);
+            return;
+        }
+
         // Pictures (an SVG may come with a bitmap copy for older readers: prefer the bitmap).
         var images = frame.Elements(Draw + "image").ToList();
-        if (frame.Element(Draw + "object") != null || frame.Element(Draw + "object-ole") != null) images = frame.Elements(Draw + "image").ToList();
         var image = images.FirstOrDefault(i => !((string?)i.Attribute(XLink + "href") ?? "").EndsWith(".svg", StringComparison.OrdinalIgnoreCase)) ?? images.FirstOrDefault();
         if (image != null && Picture((string?)image.Attribute(XLink + "href")) is { } picture)
         {

@@ -72,21 +72,97 @@ internal static partial class PdfSource
         public string Text => string.Concat(Runs.Select(r => r.text));
     }
 
+    internal sealed record PageText(List<Line> Lines, List<(double top, DImage image)> Images, double Width, double Height);
+
     static DDocument Reflow(Pdfium pdf, string title, IProgress<double?> progress, CancellationToken ct)
     {
-        var doc = new DDocument { Title = title };
-        var pages = new List<(List<Line> lines, List<(double top, DImage image)> images, double width, double height)>();
+        var pages = new List<PageText>();
+        bool usedOcr = false;
         for (int i = 0; i < pdf.PageCount; i++)
         {
             ct.ThrowIfCancellationRequested();
-            pages.Add(pdf.ReadPage(i));
+            var (lines, images, width, height) = pdf.ReadPage(i);
+            // A page with no text but a picture covering most of it is a scan: read it with OCR.
+            double covered = images.Sum(im => im.image.Width * im.image.Height) / Math.Max(1, width * height);
+            if (lines.Count == 0 && (images.Count == 0 || covered > 0.4) && Ocr.Available)
+            {
+                var ocrLines = OcrLines(pdf.Render(i, 300), 300, height, i);
+                if (ocrLines.Count > 0)
+                {
+                    lines = ocrLines;
+                    images = images.Where(im => im.image.Width * im.image.Height < width * height * 0.4).ToList();
+                    usedOcr = true;
+                }
+            }
+            pages.Add(new PageText(lines, images, width, height));
             progress.Report(0.8 * (i + 1) / pdf.PageCount);
         }
-        if (pages.Count > 0) (doc.PageWidth, doc.PageHeight) = (pages[0].width, pages[0].height);
+        if (pages.All(p => p.Lines.Count == 0 && p.Images.Count == 0))
+            throw new ConversionException(Ocr.Available
+                ? "No text was found in this PDF. Try converting it to PNG instead."
+                : "This PDF has no text (it may be scanned) and Windows text recognition isn't available. Try converting it to PNG instead.");
+        if (usedOcr) Log.Write($"{title}: scanned pages read with Windows OCR.");
+        return Reflow(pages, title);
+    }
 
-        var allLines = pages.SelectMany(p => p.lines).ToList();
-        if (allLines.Count == 0 && pages.All(p => p.images.Count == 0))
-            throw new ConversionException("This PDF has no text to convert (it may be scanned). Try converting it to PNG instead.");
+    /// <summary>Recognises text in pictures (photos of pages, screenshots, scans) and lays it out as a document.</summary>
+    public static DDocument FromPictures(IReadOnlyList<BitmapSource> pictures, string title, CancellationToken ct)
+    {
+        var pages = new List<PageText>();
+        for (int i = 0; i < pictures.Count; i++)
+        {
+            ct.ThrowIfCancellationRequested();
+            var picture = pictures[i];
+            double dpi = Math.Max(72, Math.Max(picture.DpiX, 96));
+            double width = picture.PixelWidth * 72 / dpi, height = picture.PixelHeight * 72 / dpi;
+            pages.Add(new PageText(OcrLines(picture, dpi, height, i), [], width, height));
+        }
+        if (pages.All(p => p.Lines.Count == 0)) throw new ConversionException("No text was found in this picture.");
+        var doc = Reflow(pages, title);
+        doc.PageWidth = DDocument.DefaultPage.Width;
+        doc.PageHeight = DDocument.DefaultPage.Height;
+        return doc;
+    }
+
+    /// <summary>OCR lines in PDF coordinates (points, y up from the bottom), with font sizes estimated from the word boxes.</summary>
+    static List<Line> OcrLines(BitmapSource image, double dpi, double pageHeight, int page)
+    {
+        double k = 72 / dpi;
+        var lines = new List<Line>();
+        foreach (var ocr in Ocr.Recognize(image))
+        {
+            var b = ocr.Bounds;
+            if (b.IsEmpty) continue;
+            // The tallest word spans ascenders to descenders: about 1.15 em.
+            double tallest = ocr.Words.Max(w => w.Bounds.Height) * k;
+            var line = new Line
+            {
+                Page = page, Left = b.Left * k, Right = b.Right * k,
+                Top = pageHeight - b.Top * k, Bottom = pageHeight - b.Bottom * k,
+                Size = Math.Max(4, Math.Round(tallest / 1.15 * 2) / 2),
+            };
+            line.Runs.Add((ocr.Text, new TextStyle { Size = line.Size }));
+            lines.Add(line);
+        }
+        // Body lines vary a little in measured height; snap the ones near the common size to it.
+        if (lines.Count > 2)
+        {
+            var sizes = lines.Select(l => l.Size).OrderBy(s => s).ToList();
+            double median = sizes[sizes.Count / 2];
+            foreach (var l in lines.Where(l => Math.Abs(l.Size - median) <= median * 0.2))
+            {
+                l.Size = median;
+                l.Runs[0] = (l.Runs[0].text, l.Runs[0].style with { Size = median });
+            }
+        }
+        return lines;
+    }
+
+    static DDocument Reflow(List<PageText> pages, string title)
+    {
+        var doc = new DDocument { Title = title };
+        if (pages.Count > 0) (doc.PageWidth, doc.PageHeight) = (pages[0].Width, pages[0].Height);
+        var allLines = pages.SelectMany(p => p.Lines).ToList();
 
         double bodySize = allLines.SelectMany(l => l.Runs.Select(r => (size: Math.Round(r.style.Size ?? l.Size), r.text.Length)))
             .GroupBy(x => x.size).OrderByDescending(g => g.Sum(x => x.Length)).Select(g => g.Key).FirstOrDefault(11);
@@ -95,7 +171,7 @@ internal static partial class PdfSource
         // Running headers/footers and page numbers repeat on most pages near the edges; leave them out.
         var repeating = new HashSet<string>();
         if (pages.Count >= 3)
-            repeating = pages.SelectMany(p => p.lines.Where(l => l.Top > p.height * 0.92 || l.Bottom < p.height * 0.08).Select(l => Normalize(l.Text)).Distinct())
+            repeating = pages.SelectMany(p => p.Lines.Where(l => l.Top > p.Height * 0.92 || l.Bottom < p.Height * 0.08).Select(l => Normalize(l.Text)).Distinct())
                 .GroupBy(t => t).Where(g => g.Count() >= pages.Count / 2.0).Select(g => g.Key).ToHashSet();
 
         DParagraph? current = null;

@@ -168,7 +168,7 @@ public static class Formats
     {
         [FormatKind.Audio] = AudioTargets,
         [FormatKind.Video] = ["mp4", "mkv", "webm", "mov", "avi", "wmv", "mpg", "gif", "webp", .. AudioTargets],
-        [FormatKind.Image] = ["png", "jpg", "webp", "avif", "jxl", "gif", "bmp", "tiff", "ico", "tga", "pdf"],
+        [FormatKind.Image] = ["png", "jpg", "webp", "avif", "jxl", "gif", "bmp", "tiff", "ico", "tga", "pdf", "txt", "docx"],
         [FormatKind.Document] = ["pdf", "docx", "odt", "rtf", "txt", "html", "md", "epub"],
         [FormatKind.Spreadsheet] = ["xlsx", "ods", "csv", "tsv", "json", "pdf", "html"],
         [FormatKind.Presentation] = ["pdf", "pptx", "odp", "png", "jpg"],

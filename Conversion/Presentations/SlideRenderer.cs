@@ -13,6 +13,30 @@ namespace ConvertWheel.Conversion.Presentations;
 internal sealed class SlideRenderer(Deck deck)
 {
     readonly Dictionary<DImage, BitmapSource?> _bitmaps = [];
+    bool _transparent;
+
+    /// <summary>Draws loose shapes (a Word drawing, a group) as one transparent picture of the given size in points.</summary>
+    public static DImage ToPicture(IEnumerable<SlideShape> shapes, double widthPt, double heightPt)
+    {
+        var deck = new Deck { Width = Math.Max(1, widthPt), Height = Math.Max(1, heightPt) };
+        var slide = new Slide();
+        slide.Shapes.AddRange(shapes);
+        var renderer = new SlideRenderer(deck) { _transparent = true };
+        var (visual, release) = renderer.Build(slide);
+        try
+        {
+            double w = Units.ToDip(deck.Width), h = Units.ToDip(deck.Height);
+            double scale = Math.Clamp(1600 / Math.Max(w, h), 1, 4);
+            var bitmap = new RenderTargetBitmap((int)Math.Ceiling(w * scale), (int)Math.Ceiling(h * scale), 96 * scale, 96 * scale, PixelFormats.Pbgra32);
+            bitmap.Render(visual);
+            var png = new PngBitmapEncoder();
+            png.Frames.Add(BitmapFrame.Create(bitmap));
+            using var ms = new MemoryStream();
+            png.Save(ms);
+            return new DImage(ms.ToArray(), "png", deck.Width, deck.Height);
+        }
+        finally { release(); }
+    }
 
     public void ToPdf(string output, IProgress<double?> progress, CancellationToken ct)
     {
@@ -79,7 +103,7 @@ internal sealed class SlideRenderer(Deck deck)
         var background = new DrawingVisual();
         using (var dc = background.RenderOpen())
         {
-            dc.DrawRectangle(Brushes.White, null, area);
+            if (!_transparent) dc.DrawRectangle(Brushes.White, null, area);
             Paint(dc, slide.Background, new RectangleGeometry(area), area);
         }
         root.Children.Add(background);

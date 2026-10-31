@@ -137,7 +137,7 @@
                 <StackPanel>
                     <TextBlock Text="Everything is built in" Style="{StaticResource Body}" />
                     <TextBlock Style="{StaticResource Hint}"
-                               Text="Audio: MP3, M4A, WAV, FLAC, OGG, Opus, AAC, WMA, AIFF, AC3, M4R and more. Video: MP4, MKV, WebM, MOV, AVI, WMV, MPG, GIF and animated WebP. Images: PNG, JPG, WebP, AVIF, JPEG XL, HEIC, GIF, TIFF, ICO, TGA, PSD, SVG, camera RAW and more. Documents: Word (including old .doc), PDF, OpenDocument, RTF, Markdown, HTML, EPUB and text. Presentations: PowerPoint (.pptx and old .ppt) and OpenDocument, to PDF, pictures or each other. Spreadsheets, archives (ZIP, 7z, RAR, TAR), subtitles and JSON/YAML/XML too." />
+                               Text="Audio: MP3, M4A, WAV, FLAC, OGG, Opus, AAC, WMA, AIFF, AC3, M4R and more. Video: MP4, MKV, WebM, MOV, AVI, WMV, MPG, GIF and animated WebP. Images: PNG, JPG, WebP, AVIF, JPEG XL, HEIC, GIF, TIFF, ICO, TGA, PSD, SVG, camera RAW and more. Documents: Word (back to Word 6), PDF, OpenDocument, RTF, Markdown, HTML, EPUB and text, with charts. Text from scanned PDFs, screenshots and photos of pages is read with Windows' own text recognition. Presentations: PowerPoint (.pptx and old .ppt) and OpenDocument, to PDF, pictures or each other. Spreadsheets, archives (ZIP, 7z, RAR, TAR), subtitles and JSON/YAML/XML too." />
                     <Border Style="{StaticResource Divider}" />
                     <StackPanel>
                         <TextBlock Text="Microsoft Office" Style="{StaticResource Body}" />

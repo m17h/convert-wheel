@@ -20,6 +20,7 @@ internal sealed class DocxReader
     readonly ZipArchive _zip;
     // Relationships (images, links) are per part: the body, each header/footer and the notes all have their own.
     string _docDir;
+    readonly Dictionary<string, System.Windows.Media.Color> _themeColors = [];
     Dictionary<string, (string target, bool external)> _rels = [];
     readonly Dictionary<string, (string target, bool external)> _mainRels;
     readonly Dictionary<string, XElement> _footnotes = [], _endnotes = [];
@@ -40,6 +41,10 @@ internal sealed class DocxReader
     readonly string? _defaultParaStyle;
     string? _majorFont, _minorFont;
     bool _pendingPageBreak;
+    /// <summary>The page settings of each section in order (Word stores them at the end of each section).</summary>
+    List<XElement> _sections = [];
+    int _sectionIndex;
+    PageSetup? _pendingSection;
     DParagraph? _previous;
     string? _previousStyle;
 
@@ -128,6 +133,9 @@ internal sealed class DocxReader
         {
             _majorFont = (string?)theme.Descendants(A + "majorFont").Elements(A + "latin").FirstOrDefault()?.Attribute("typeface");
             _minorFont = (string?)theme.Descendants(A + "minorFont").Elements(A + "latin").FirstOrDefault()?.Attribute("typeface");
+            foreach (var c in theme.Descendants(A + "clrScheme").Elements())
+                if (Units.ParseHex((string?)c.Element(A + "srgbClr")?.Attribute("val") ?? (string?)c.Element(A + "sysClr")?.Attribute("lastClr")) is { } color)
+                    _themeColors[c.Name.LocalName] = color;
         }
 
         if (Load(stylesPath ?? "word/styles.xml")?.Root is { } styles)
@@ -190,10 +198,15 @@ internal sealed class DocxReader
         doc.Font = baseRun.Font ?? _minorFont ?? "Calibri";
         doc.FontSize = baseRun.Size ?? 11;
 
+        _sections = body.Descendants(W + "sectPr").Where(s => s.Parent?.Name == W + "pPr" || s.Parent == body).ToList();
         ReadBlocks(body.Elements(), doc.Blocks, null);
 
-        if (body.Element(W + "sectPr") is { } sect)
+        // The document's page settings are its first section's; later sections carry their own.
+        if (_sections.FirstOrDefault() is { } sect)
         {
+            var columns = sect.Element(W + "cols");
+            doc.Columns = Math.Max(1, Int(Attr(columns, "num")) ?? 1);
+            doc.ColumnGap = Twips(Attr(columns, "space")) ?? 36;
             var size = sect.Element(W + "pgSz");
             var margin = sect.Element(W + "pgMar");
             if (Twips(Attr(size, "w")) is double w && Twips(Attr(size, "h")) is double h && w > 72 && h > 72)
@@ -281,7 +294,12 @@ internal sealed class DocxReader
         foreach (var el in elements)
         {
             if (el.Name == W + "p") ReadParagraph(el, output, tableStyle);
-            else if (el.Name == W + "tbl") output.Add(ReadTable(el));
+            else if (el.Name == W + "tbl")
+            {
+                var table = ReadTable(el);
+                if (_pendingSection != null) { table.Section = _pendingSection; _pendingSection = null; }
+                output.Add(table);
+            }
             else if (el.Name == W + "sdt") ReadBlocks(el.Element(W + "sdtContent")?.Elements() ?? [], output, tableStyle);
             else if (el.Name == W + "customXml" || el.Name == W + "ins" || el.Name == W + "smartTag") ReadBlocks(el.Elements(), output, tableStyle);
             else if (el.Name == MC + "AlternateContent") ReadBlocks(Alternate(el), output, tableStyle);
@@ -353,8 +371,14 @@ internal sealed class DocxReader
         }
         output.AddRange(pending);
 
-        if (pPr?.Element(W + "sectPr") is { } sect && Attr(sect.Element(W + "type"), "val") != "continuous")
-            _pendingPageBreak = true;
+        if (pPr?.Element(W + "sectPr") is { } sect && _sections.Contains(sect))
+        {
+            // The next section's own settings say how it starts: on a new page (page size, orientation and
+            // columns may change) or continuing on the same page.
+            var next = ++_sectionIndex < _sections.Count ? _sections[_sectionIndex] : null;
+            if (next != null && Attr(next.Element(W + "type"), "val") != "continuous") _pendingSection = Setup(next);
+            else if (Attr(sect.Element(W + "type"), "val") != "continuous" && next == null) _pendingPageBreak = true;
+        }
 
         _previous = current;
         _previousStyle = styleId;
@@ -373,6 +397,7 @@ internal sealed class DocxReader
             PageBreakBefore = props.PageBreakBefore || _pendingPageBreak,
         };
         _pendingPageBreak = false;
+        if (_pendingSection != null) { para.Section = _pendingSection; _pendingSection = null; }
 
         var name = styles.LastOrDefault()?.Name?.ToLowerInvariant();
         if (props.OutlineLevel is int outline and < 9) para.Heading = Math.Min(6, outline + 1);
@@ -567,6 +592,7 @@ internal sealed class DocxReader
             var blip = container.Descendants(A + "blip").FirstOrDefault();
             if (blip != null && Attr(blip, R + "embed") is { } rid && LoadImage(rid) is { } data)
                 image = new DImage(data.data, data.ext, width, height);
+            else if (Chart(container) is { } chart) image = Charts.ToImage(chart, width, height);
             var boxes = container.Descendants(W + "txbxContent").Where(b => !b.Ancestors(W + "txbxContent").Any()).ToList();
 
             if (container.Name == WP + "anchor")
@@ -653,19 +679,49 @@ internal sealed class DocxReader
         }
     }
 
+    /// <summary>A chart drawn from the data Word keeps with it.</summary>
+    Chart? Chart(XElement container)
+    {
+        var data = container.Descendants(A + "graphicData").FirstOrDefault();
+        if (((string?)data?.Attribute("uri"))?.EndsWith("/chart") != true) return null;
+        var reference = data!.Elements().FirstOrDefault(e => e.Name.LocalName == "chart");
+        if (Attr(reference, R + "id") is not { } rid || !_rels.TryGetValue(rid, out var rel) || rel.external) return null;
+        if (Load(Resolve(rel.target))?.Root is not { } root) return null;
+        System.Windows.Media.Color? Scheme(string name) => _themeColors.TryGetValue(name switch { "tx1" => "dk1", "bg1" => "lt1", "tx2" => "dk2", "bg2" => "lt2", _ => name }, out var c) ? c : null;
+        return Charts.ReadDrawingML(root, Scheme, _minorFont ?? "Calibri");
+    }
+
+    /// <summary>A section's page size, margins and columns.</summary>
+    static PageSetup Setup(XElement sect)
+    {
+        var size = sect.Element(W + "pgSz");
+        var margin = sect.Element(W + "pgMar");
+        var columns = sect.Element(W + "cols");
+        double w = Twips(Attr(size, "w")) ?? 612, h = Twips(Attr(size, "h")) ?? 792;
+        return new PageSetup(w, h,
+            new Thickness(Twips(Attr(margin, "left")) ?? 72, Twips(Attr(margin, "top")) ?? 72, Twips(Attr(margin, "right")) ?? 72, Twips(Attr(margin, "bottom")) ?? 72),
+            Math.Max(1, Int(Attr(columns, "num")) ?? 1), Twips(Attr(columns, "space")) ?? 36);
+    }
+
     (byte[] data, string ext)? LoadImage(string rid)
     {
         if (!_rels.TryGetValue(rid, out var rel) || rel.external) return null;
         var path = Resolve(rel.target);
         var ext = Path.GetExtension(path).TrimStart('.').ToLowerInvariant();
         ext = ext switch { "jpg" or "jpeg" => "jpeg", "tif" => "tiff", _ => ext };
-        if (ext is not ("png" or "jpeg" or "gif" or "bmp" or "tiff")) return null; // EMF/WMF/SVG aren't supported
         var entry = _zip.GetEntry(path);
         if (entry == null) return null;
         using var stream = entry.Open();
         using var ms = new MemoryStream();
         stream.CopyTo(ms);
-        return (ms.ToArray(), ext);
+        if (ext is "png" or "jpeg" or "gif" or "bmp" or "tiff") return (ms.ToArray(), ext);
+        // Metafiles (clip art, pasted charts) and SVG become PNG so every output format can show them.
+        if (MagickImages.Decode(ms.ToArray()) is not { } bitmap) return null;
+        var png = new System.Windows.Media.Imaging.PngBitmapEncoder();
+        png.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(bitmap));
+        using var output = new MemoryStream();
+        png.Save(output);
+        return (output.ToArray(), "png");
     }
 
     internal static (double w, double h) ImageSize(byte[] data)
