@@ -5,6 +5,8 @@ license texts are available at the linked projects.
 
 | Component | Version | License | Project |
 | --- | --- | --- | --- |
+| .NET desktop runtime (only on PCs without .NET 10; its LICENSE.txt and ThirdPartyNotices.txt sit in `runtime\`) | 10.0 | MIT | https://github.com/dotnet/runtime, https://github.com/dotnet/windowsdesktop |
+| Inno Setup (builds the installer; its uninstaller is part of every install) | 6.7.1 | Inno Setup License (free, including commercial use) | https://jrsoftware.org/isinfo.php |
 | FFmpeg (shared LGPL build by BtbN) | n8.1 | LGPL 2.1 or later | https://ffmpeg.org, builds: https://github.com/BtbN/FFmpeg-Builds |
 | ImageMagick via Magick.NET-Q8-x64 | 15.0.0 | Apache 2.0 (ImageMagick License) | https://github.com/dlemstra/Magick.NET |
 | PDFium via bblanchon.PDFium.Win32 | 158.0.8125 | Apache 2.0 / BSD-3 | https://pdfium.googlesource.com/pdfium, https://github.com/bblanchon/pdfium-binaries |

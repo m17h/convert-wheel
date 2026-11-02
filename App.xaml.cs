@@ -11,9 +11,10 @@ public partial class App : Application
 {
     const string InstanceName = "ConvertWheel.SingleInstance";
     const string ShowSettingsEvent = "ConvertWheel.ShowSettings";
+    const string ExitEvent = "ConvertWheel.Exit";
 
     Mutex? _instanceMutex;
-    EventWaitHandle? _showSettingsSignal;
+    EventWaitHandle? _showSettingsSignal, _exitSignal;
     AppSettings _settings = null!;
     ToolLocator _tools = null!;
     ShellResolver? _resolver;
@@ -30,6 +31,14 @@ public partial class App : Application
         if (exportAt >= 0 && exportAt + 1 < e.Args.Length)
         {
             File.WriteAllBytes(e.Args[exportAt + 1], IconFactory.BuildIco());
+            Shutdown();
+            return;
+        }
+
+        // ConvertWheel.exe --exit : asks a running copy to close (the installer uses this before updating).
+        if (e.Args.Contains("--exit"))
+        {
+            if (EventWaitHandle.TryOpenExisting(ExitEvent, out var exit)) exit.Set();
             Shutdown();
             return;
         }
@@ -85,6 +94,13 @@ public partial class App : Application
             while (_showSettingsSignal.WaitOne()) Dispatcher.BeginInvoke(ShowSettings);
         })
         { IsBackground = true, Name = "Single instance listener" }.Start();
+
+        _exitSignal = new EventWaitHandle(false, EventResetMode.AutoReset, ExitEvent);
+        new Thread(() =>
+        {
+            if (_exitSignal.WaitOne()) Dispatcher.BeginInvoke(() => Shutdown());
+        })
+        { IsBackground = true, Name = "Exit listener" }.Start();
 
         bool background = e.Args.Contains("--background");
         if (!_settings.HasShownWelcome)

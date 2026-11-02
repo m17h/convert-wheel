@@ -107,14 +107,33 @@ All permissively licensed and bundled into the exe. See [THIRD-PARTY-NOTICES.md]
   audio and misbehaves above quality 0.5, so the app pads the start and uses 0.5 (~160 kbps).
 - **Concentus** and **Concentus.OggFile** (BSD / MIT) for Opus.
 
+## Installing
+
+Users run `ConvertWheel-Setup-<version>.exe`. It needs nothing else and no administrator rights:
+
+- Installs for the current user into `%LOCALAPPDATA%\Programs\Convert Wheel`, with a Start menu shortcut
+  and (optional, on by default) a "start with Windows" entry.
+- The .NET runtime travels inside the installer, but is only copied when the PC doesn't already have .NET 10
+  for desktop apps. Then it goes into the app's own `runtime` folder (nothing system-wide changes); the app
+  looks there first, then for the system's .NET. The Ready page says which case applies.
+- A running copy is closed first (politely via `ConvertWheel.exe --exit`, forcefully if it doesn't respond).
+- The last page offers to open the app and to delete the installer file; both are ticked by default.
+- Uninstalling (Settings › Apps) also removes the settings, log, unpacked video tools and startup entry.
+- Silent installs work as usual: `ConvertWheel-Setup-1.0.0.exe /VERYSILENT [/TASKS="startup,desktopicon"]`.
+
 ## Build & run
 
 Requires the .NET 10 SDK.
 
 ```powershell
 dotnet run -c Release                      # run from source
-dotnet publish -c Release -r win-x64 -p:SelfContained=false -p:PublishSingleFile=true -p:DebugType=none -o dist
+powershell -ExecutionPolicy Bypass -File tools\build-installer.ps1   # dist\ConvertWheel-Setup-<version>.exe
 ```
+
+`build-installer.ps1` publishes the app, copies the .NET 10 desktop runtime from this machine's .NET install,
+fetches [Inno Setup](https://jrsoftware.org/isinfo.php) from NuGet into `tools\.innosetup` (nothing is installed)
+and compiles `installer\ConvertWheel.iss`. Compiling that script with `/DForceRuntime` makes an installer that
+always includes the runtime, for testing the "no .NET" path on a PC that has it.
 
 The first build fetches the LGPL FFmpeg build and packs it into `tools\ffmpeg.tar.xz` (see `tools\pack-ffmpeg.ps1`;
 the file isn't committed), which is then embedded into the exe. Offline, or with `-p:SkipFfmpegPack=true`, the app
@@ -124,6 +143,7 @@ Command-line extras:
 
 - `ConvertWheel.exe --convert "file.ogg" mp3` converts without any UI and prints the output path.
 - `ConvertWheel.exe --background` starts without opening the settings window (used by "Start with Windows").
+- `ConvertWheel.exe --exit` closes a running copy (used by the installer).
 - `ConvertWheel.exe --export-icon Assets\ConvertWheel.ico` regenerates the app icon.
 - Setting `CONVERTWHEEL_DOC_ENGINE` to `built-in`, `Microsoft Office` or `LibreOffice` forces one document
   engine, which is handy for testing.

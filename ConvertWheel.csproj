@@ -17,6 +17,9 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <!-- Single-file publish: also embed native libraries (Skia), extracted on first run. -->
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <!-- The installer adds a private .NET runtime in "runtime\" only on PCs that lack .NET 10; look there first. -->
+    <AppHostDotNetSearch>AppRelative;Global</AppHostDotNetSearch>
+    <AppHostRelativeDotNet>runtime</AppHostRelativeDotNet>
     <!-- WPF reads DPI awareness from app.manifest; the WinForms tray menu follows it. -->
     <NoWarn>$(NoWarn);WFO0003</NoWarn>
   </PropertyGroup>

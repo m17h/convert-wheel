@@ -39,6 +39,7 @@ public sealed class AppSettings
                     settings.TriggerKeys = settings.TriggerKeys.Select(VirtualKeys.Normalize).Distinct().ToList();
                     if (settings.TriggerKeys.Count == 0) settings.TriggerKeys = [VirtualKeys.Ctrl];
                     settings.HoldDelayMs = Math.Clamp(settings.HoldDelayMs, 100, 2000);
+                    settings.StartWithWindows = StartupRegistered();
                     return settings;
                 }
             }
@@ -47,7 +48,23 @@ public sealed class AppSettings
         {
             Log.Write(ex);
         }
-        return new AppSettings();
+        return new AppSettings { StartWithWindows = StartupRegistered() };
+    }
+
+    const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+
+    /// <summary>The Windows startup entry is the truth (the installer may have added it).</summary>
+    static bool StartupRegistered()
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(RunKey);
+            return key?.GetValue("ConvertWheel") is string;
+        }
+        catch (Exception ex) when (ex is System.Security.SecurityException or UnauthorizedAccessException or IOException)
+        {
+            return false;
+        }
     }
 
     public void Save()
@@ -66,7 +83,6 @@ public sealed class AppSettings
 
     public void ApplyStartup()
     {
-        const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
         try
         {
             using var key = Registry.CurrentUser.OpenSubKey(RunKey, writable: true);
