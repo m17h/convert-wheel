@@ -413,17 +413,15 @@ internal sealed class DocxWriter
         if (s.Strike) rPr.Add(new XElement(W + "strike"));
         if (s.Color is { } c) rPr.Add(new XElement(W + "color", new XAttribute(W + "val", Units.Hex(c))));
         if (s.Size is double size) rPr.Add(new XElement(W + "sz", new XAttribute(W + "val", (int)Math.Round(size * 2))));
+        if (s.Underline) rPr.Add(new XElement(W + "u", new XAttribute(W + "val", "single")));
         if (s.Highlight is { } h)
             rPr.Add(new XElement(W + "shd", new XAttribute(W + "val", "clear"), new XAttribute(W + "color", "auto"), new XAttribute(W + "fill", Units.Hex(h))));
-        if (s.Underline) rPr.Add(new XElement(W + "u", new XAttribute(W + "val", "single")));
         if (s.Superscript || s.Subscript) rPr.Add(new XElement(W + "vertAlign", new XAttribute(W + "val", s.Superscript ? "superscript" : "subscript")));
         return rPr;
     }
 
     /// <summary>Removes characters that are illegal in XML.</summary>
-    static string Clean(string s) => s.Any(c => c < 0x20 && c is not ('\t' or '\n' or '\r'))
-        ? new string(s.Where(c => c >= 0x20 || c is '\t' or '\n' or '\r').ToArray())
-        : s;
+    static string Clean(string s) => SafeXml.Text(s);
 
     XElement Image(DImage img, double available)
     {
@@ -608,6 +606,7 @@ internal sealed class DocxWriter
 
     static void Put(ZipArchive zip, string name, XElement root)
     {
+        SafeXml.Clean(root);
         using var stream = zip.CreateEntry(name, CompressionLevel.Optimal).Open();
         new XDocument(new XDeclaration("1.0", "UTF-8", "yes"), root).Save(stream);
     }

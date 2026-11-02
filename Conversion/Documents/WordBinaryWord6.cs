@@ -181,7 +181,7 @@ internal sealed partial class WordBinaryReader
         int nfc = anld[0], before = anld[1], after = anld[2];
         int start = BinaryPrimitives.ReadUInt16LittleEndian(anld.AsSpan(12));
         string text = Encoding.Latin1.GetString(anld, 20, Math.Min(anld.Length - 20, 32)).TrimEnd('\0');
-        string prefix = text[..Math.Min(before, text.Length)], suffix = text[Math.Min(before, text.Length)..Math.Min(after, text.Length)];
+        string prefix = text[..Math.Min(before, text.Length)], suffix = text[Math.Min(before, text.Length)..Math.Min(before + after, text.Length)];
         int ftc = BinaryPrimitives.ReadUInt16LittleEndian(anld.AsSpan(6));
         if (nfc == 23)
         {

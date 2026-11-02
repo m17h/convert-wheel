@@ -52,6 +52,7 @@ internal sealed class TriggerController : IDisposable
         {
             _trigger = [.. _settings.TriggerKeys];
             if (_phase == Phase.Holding) EndHolding();
+            if (_settings.Paused) _wheel.Cancel(restoreCursor: false);
         };
         wheel.ConvertRequested += conversions.Start;
         wheel.Dismissed += OnWheelClosed;
@@ -158,8 +159,10 @@ internal sealed class TriggerController : IDisposable
     void OnKeyUp(int vk)
     {
         int key = VirtualKeys.Normalize(vk);
-        _down.Remove(key);
-        if (_phase == Phase.Open && !_wheel.IsSticky && _trigger.Contains(key)) _wheel.ReleaseTrigger();
+        // Keep e.g. Ctrl down if the other Ctrl is still held. Only ask about the other side: the released
+        // key's own state isn't updated until the hook returns, which may be after this runs.
+        if (VirtualKeys.OtherSide(vk) is not int other || !VirtualKeys.Down(other)) _down.Remove(key);
+        if (_phase == Phase.Open && !_wheel.IsSticky && _trigger.Contains(key) && !_down.Contains(key)) _wheel.ReleaseTrigger();
         Evaluate(justPressed: null);
     }
 
@@ -234,6 +237,12 @@ internal sealed class TriggerController : IDisposable
 
     void Tick()
     {
+        if (Suspended || _settings.Paused)
+        {
+            if (_phase == Phase.Holding) EndHolding();
+            _wheel.Cancel(restoreCursor: false);
+            return;
+        }
         bool held = _trigger.All(VirtualKeys.IsPhysicallyDown);
         if (_phase == Phase.Open)
         {
@@ -286,6 +295,8 @@ internal sealed class TriggerController : IDisposable
         }
 
         if (generation != _generation || _phase != Phase.Holding || path == null) return;
+        if (Suspended || _settings.Paused || !_trigger.All(VirtualKeys.IsPhysicallyDown)) return;
+        if (!Win32.GetCursorPos(out var current) || Distance(current, point) > 3) return;
         var plan = Formats.Plan(path);
         if (plan == null) return;
 
@@ -323,6 +334,9 @@ internal sealed class TriggerController : IDisposable
 
     public void Dispose()
     {
+        _generation++;
+        _phase = Phase.Idle;
+        _wheel.Cancel(restoreCursor: false);
         _timer.Stop();
         _hooks.Dispose();
     }

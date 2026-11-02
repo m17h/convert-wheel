@@ -105,27 +105,36 @@ internal static class MatroskaRemuxer
 
             long duration = MF.Duration(reader) ?? 0;
             using var mkv = new MatroskaWriter(output, tracks);
+            var ended = new HashSet<int>();
             while (true)
             {
                 ct.ThrowIfCancellationRequested();
                 reader.ReadSample(MF.SourceReaderAnyStream, 0, out int index, out int flags, out long ts, out var sample);
-                if ((flags & MF.ReaderError) != 0) return false;
-                if (sample != null)
+                try
                 {
-                    var track = tracks.FirstOrDefault(t => t.ReaderStream == index);
-                    if (track != null)
+                    if ((flags & MF.ReaderError) != 0) return false;
+                    if (sample != null)
                     {
-                        var data = MF.Bytes(sample);
-                        bool key = !track.Video || (sample.GetInt(CleanPoint) ?? 0) != 0;
-                        if (track.Video) data = ToLengthPrefixed(data, track);
-                        else if (track.AdtsHeader && data.Length > 7 && data[0] == 0xFF && (data[1] & 0xF0) == 0xF0)
-                            data = data[((data[1] & 1) == 0 ? 9 : 7)..];
-                        mkv.Add(track, ts, data, key);
+                        var track = tracks.FirstOrDefault(t => t.ReaderStream == index);
+                        if (track != null)
+                        {
+                            var data = MF.Bytes(sample);
+                            bool key = !track.Video || (sample.GetInt(CleanPoint) ?? 0) != 0;
+                            if (track.Video) data = ToLengthPrefixed(data, track);
+                            else if (track.AdtsHeader && data.Length > 7 && data[0] == 0xFF && (data[1] & 0xF0) == 0xF0)
+                                data = data[((data[1] & 1) == 0 ? 9 : 7)..];
+                            mkv.Add(track, ts, data, key);
+                        }
+                        if (duration > 0) progress?.Report(Math.Min(0.99, (double)ts / duration));
                     }
-                    MF.Release(sample);
-                    if (duration > 0) progress?.Report(Math.Min(0.99, (double)ts / duration));
                 }
-                if ((flags & MF.ReaderEndOfStream) != 0) break;
+                finally { MF.Release(sample); }
+                if ((flags & MF.ReaderEndOfStream) != 0)
+                {
+                    ended.Add(index);
+                    if (tracks.All(t => ended.Contains(t.ReaderStream))) break;
+                    reader.SetStreamSelection(index, false);
+                }
             }
             return true;
         }

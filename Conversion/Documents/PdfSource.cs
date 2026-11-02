@@ -343,7 +343,7 @@ internal static partial class PdfSource
                     FlushRun();
                     if (line.Runs.Count > 0 && line.Text.Trim().Length > 0)
                     {
-                        line.Size = sizes.OrderByDescending(kv => kv.Value).First().Key;
+                        line.Size = sizes.OrderByDescending(kv => kv.Value).Select(kv => kv.Key).FirstOrDefault(11);
                         lines.Add(line);
                     }
                     line = new Line { Page = index };
@@ -356,7 +356,8 @@ internal static partial class PdfSource
                     uint code = FPDFText_GetUnicode(text, i);
                     if (code == '\n') { FlushLine(); continue; }
                     if (code is '\r' or 0 or 0xFFFE or 0xFFFF) continue;
-                    var ch = code > 0xFFFF ? char.ConvertFromUtf32((int)code) : ((char)code).ToString();
+                    var ch = code > 0x10FFFF || code is >= 0xD800 and <= 0xDFFF ? "\uFFFD"
+                        : code > 0xFFFF ? char.ConvertFromUtf32((int)code) : ((char)code).ToString();
                     if (ch == "\u0002") ch = "-"; // soft hyphen marker
 
                     double size = Math.Round(FPDFText_GetFontSize(text, i) * 2) / 2;
@@ -370,7 +371,7 @@ internal static partial class PdfSource
                         sizes[size] = sizes.GetValueOrDefault(size) + 1;
                     }
                     int nameLength = (int)FPDFText_GetFontInfo(text, i, fontName, (uint)fontName.Length, out int flags);
-                    var name = nameLength > 1 ? Encoding.UTF8.GetString(fontName, 0, nameLength - 1) : "";
+                    var name = nameLength > 1 && nameLength <= fontName.Length ? Encoding.UTF8.GetString(fontName, 0, nameLength - 1) : "";
                     bool bold = FPDFText_GetFontWeight(text, i) >= 600 || name.Contains("Bold", StringComparison.OrdinalIgnoreCase) || (flags & (1 << 18)) != 0;
                     bool italic = (flags & (1 << 6)) != 0 || name.Contains("Italic", StringComparison.OrdinalIgnoreCase) || name.Contains("Oblique", StringComparison.OrdinalIgnoreCase);
                     var style = new TextStyle { Bold = bold, Italic = italic, Size = size };

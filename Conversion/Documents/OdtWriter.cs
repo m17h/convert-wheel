@@ -39,6 +39,7 @@ internal static class OdfPackage
 
     static void Put(ZipArchive zip, string name, XElement root)
     {
+        SafeXml.Clean(root);
         using var stream = zip.CreateEntry(name, CompressionLevel.Optimal).Open();
         new XDocument(new XDeclaration("1.0", "UTF-8", null), root).Save(stream, SaveOptions.DisableFormatting);
     }
@@ -219,8 +220,9 @@ internal sealed class OdtWriter
     }
 
     /// <summary>ODF collapses whitespace, so runs of spaces and tabs need explicit elements.</summary>
-    static List<object> TextNodes(string text)
+    internal static List<object> TextNodes(string text)
     {
+        text = SafeXml.Text(text);
         var nodes = new List<object>();
         var sb = new StringBuilder();
         for (int i = 0; i < text.Length; i++)
@@ -239,7 +241,13 @@ internal sealed class OdtWriter
                 Flush();
                 nodes.Add(count == 1 ? new XElement(Text + "s") : new XElement(Text + "s", new XAttribute(Text + "c", count)));
             }
-            else if (c >= 0x20 || c == '\n') sb.Append(c);
+            else if (c == '\n' || c == '\r')
+            {
+                if (c == '\r' && i + 1 < text.Length && text[i + 1] == '\n') i++;
+                Flush();
+                nodes.Add(new XElement(Text + "line-break"));
+            }
+            else if (c >= 0x20) sb.Append(c);
         }
         Flush();
         return nodes;
@@ -309,7 +317,7 @@ internal sealed class OdtWriter
         if (s.Font != null)
         {
             _fonts.Add(s.Font);
-            props.Add(new XAttribute(St + "font-name", s.Font));
+            props.Add(new XAttribute(St + "font-name", SafeXml.Text(s.Font)));
         }
         if (!props.HasAttributes) return null;
 

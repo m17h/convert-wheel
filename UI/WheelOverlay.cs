@@ -228,6 +228,7 @@ internal sealed class WheelOverlay : Window
 
         var accent = Palette.Accent(plan.SourceKind);
         _badge.Background = Palette.Gradient(accent);
+        _badge.BeginAnimation(OpacityProperty, null);
         _badge.Opacity = 1;
         _badgeText.Text = plan.SourceExt.ToUpperInvariant();
         _thumb.BeginAnimation(OpacityProperty, null);
@@ -321,6 +322,7 @@ internal sealed class WheelOverlay : Window
     public void ReleaseTrigger()
     {
         if (!IsOpen || IsSticky) return;
+        if (Win32.GetCursorPos(out var cursor)) SetHot(Directional(cursor));
         if (_hot?.Format != null)
         {
             Commit(_hot);

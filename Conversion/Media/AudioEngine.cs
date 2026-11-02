@@ -158,10 +158,10 @@ internal static class AudioEngine
     {
         var subtype = MF.AudioWMAV8;
         MF.MFTranscodeGetAudioOutputAvailableTypes(ref subtype, 0x3F, null, out var types);
+        IMFMediaType? best = null;
         try
         {
             types.GetElementCount(out int count);
-            IMFMediaType? best = null;
             int bestScore = int.MaxValue;
             for (int i = 0; i < count; i++)
             {
@@ -179,9 +179,11 @@ internal static class AudioEngine
                 else MF.Release(t);
             }
             if (best == null || bestScore >= 1_000_000) throw new NotSupportedException($"Windows has no WMA encoder for {f.SampleRate} Hz, {f.Channels} channels.");
-            return best;
+            var result = best;
+            best = null;
+            return result;
         }
-        finally { MF.Release(types); }
+        finally { MF.Release(best); MF.Release(types); }
     }
 
     static IMFMediaType FlacType(AudioFormat f, int bits)
@@ -220,10 +222,13 @@ internal static class AudioEngine
             if (reader.SetCurrentMediaType(MF.SourceReaderFirstAudio, IntPtr.Zero, native) < 0) return false;
 
             MF.MFCreateAttributes(out var attrs, 2);
-            attrs.SetGUID(MF.TRANSCODE_CONTAINERTYPE, container);
-            attrs.SetInt(MF.SINK_WRITER_DISABLE_THROTTLING, 1);
-            MF.MFCreateSinkWriterFromURL(output, IntPtr.Zero, attrs, out writer);
-            MF.Release(attrs);
+            try
+            {
+                attrs.SetGUID(MF.TRANSCODE_CONTAINERTYPE, container);
+                attrs.SetInt(MF.SINK_WRITER_DISABLE_THROTTLING, 1);
+                MF.MFCreateSinkWriterFromURL(output, IntPtr.Zero, attrs, out writer);
+            }
+            finally { MF.Release(attrs); }
             writer.AddStream(native, out int stream);
             writer.SetInputMediaType(stream, native, null);
             writer.BeginWriting();
@@ -232,13 +237,16 @@ internal static class AudioEngine
             {
                 ct.ThrowIfCancellationRequested();
                 reader.ReadSample(MF.SourceReaderFirstAudio, 0, out _, out int flags, out _, out var sample);
-                if ((flags & MF.ReaderError) != 0) return false;
-                if (sample != null)
+                try
                 {
-                    writer.WriteSample(stream, sample);
-                    MF.Release(sample);
-                    written++;
+                    if ((flags & MF.ReaderError) != 0) return false;
+                    if (sample != null)
+                    {
+                        writer.WriteSample(stream, sample);
+                        written++;
+                    }
                 }
+                finally { MF.Release(sample); }
                 if ((flags & MF.ReaderEndOfStream) != 0) break;
             }
             if (written == 0) return false;

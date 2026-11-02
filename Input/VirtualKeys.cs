@@ -21,7 +21,17 @@ internal static class VirtualKeys
         ? Down(0x5B) || Down(0x5C)
         : Down(vk);
 
-    static bool Down(int vk) => (Win32.GetAsyncKeyState(vk) & 0x8000) != 0;
+    public static bool Down(int vk) => (Win32.GetAsyncKeyState(vk) & 0x8000) != 0;
+
+    /// <summary>The other side of a left/right modifier (left Ctrl → right Ctrl), or null.</summary>
+    public static int? OtherSide(int vk) => vk switch
+    {
+        0xA0 => 0xA1, 0xA1 => 0xA0,
+        0xA2 => 0xA3, 0xA3 => 0xA2,
+        0xA4 => 0xA5, 0xA5 => 0xA4,
+        0x5B => 0x5C, 0x5C => 0x5B,
+        _ => null,
+    };
 
     public static bool IsAltOrWin(int vk) => Normalize(vk) is Alt or Win;
 

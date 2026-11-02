@@ -12,8 +12,9 @@ namespace ConvertWheel.Conversion;
 internal static class ImageConverter
 {
     /// <returns>false if no bundled decoder can read it, so the caller can fall back to FFmpeg.</returns>
-    public static bool TryConvert(string input, string output, string ext)
+    public static bool TryConvert(string input, string output, string ext, CancellationToken ct)
     {
+        ct.ThrowIfCancellationRequested();
         // Animated GIFs stay animated as WebP.
         if (ext == "webp" && Path.GetExtension(input).Equals(".gif", StringComparison.OrdinalIgnoreCase))
         {
@@ -37,7 +38,7 @@ internal static class ImageConverter
         {
             var pictures = DecodeAllPages(input);
             if (pictures.Count == 0) return false;
-            var doc = Documents.PdfSource.FromPictures(pictures, Path.GetFileNameWithoutExtension(input), CancellationToken.None);
+            var doc = Documents.PdfSource.FromPictures(pictures, Path.GetFileNameWithoutExtension(input), ct);
             Documents.BuiltInDocuments.Write(doc, ext, output);
             return true;
         }
@@ -46,7 +47,7 @@ internal static class ImageConverter
         {
             var pages = DecodeAllPages(input);
             if (pages.Count == 0) return false;
-            ImagePdf.Write(pages, output, Path.GetFileNameWithoutExtension(input));
+            ImagePdf.Write(pages, output, Path.GetFileNameWithoutExtension(input), ct);
             return true;
         }
 

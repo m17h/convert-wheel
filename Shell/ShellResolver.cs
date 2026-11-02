@@ -73,11 +73,12 @@ internal sealed class ShellResolver : IDisposable
         try
         {
             var candidates = new List<string>();
+            string? direct = null;
             var folder = FolderPath(view);
             if (folder != null)
             {
-                var direct = Path.Combine(folder, name);
-                if (File.Exists(direct)) return direct;
+                direct = Path.Combine(folder, name);
+                if (File.Exists(direct)) candidates.Add(direct);
                 try
                 {
                     // Extensions are hidden in Explorer: "song" could be song.ogg, song.mp3, ...
@@ -95,7 +96,10 @@ internal sealed class ShellResolver : IDisposable
                 var typed = candidates.Where(c => string.Equals(TypeName(c), itemType, StringComparison.OrdinalIgnoreCase)).ToList();
                 if (typed.Count > 0) candidates = typed;
             }
-            return candidates.FirstOrDefault(File.Exists);
+            var existing = candidates.Where(File.Exists).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            if (existing.Count == 1) return existing[0];
+            // Still ambiguous: an exact name match (extensions shown) wins; otherwise don't guess.
+            return existing.FirstOrDefault(c => string.Equals(c, direct, StringComparison.OrdinalIgnoreCase));
         }
         finally
         {
@@ -223,7 +227,7 @@ internal sealed class ShellResolver : IDisposable
     static string? DisplayName(IShellItem item, uint sigdn)
     {
         if (item.GetDisplayName(sigdn, out var ptr) != 0 || ptr == 0) return null;
-        try { return Clean(Marshal.PtrToStringUni(ptr)); }
+        try { return sigdn == ShellIds.SIGDN_FILESYSPATH ? Marshal.PtrToStringUni(ptr) : Clean(Marshal.PtrToStringUni(ptr)); }
         finally { Marshal.FreeCoTaskMem(ptr); }
     }
 

@@ -1,6 +1,7 @@
 using System.Text;
 using System.Windows;
 using System.Windows.Media;
+using System.Xml.Linq;
 
 namespace ConvertWheel.Conversion.Documents;
 
@@ -156,7 +157,20 @@ internal sealed class DTable : DBlock
     public Color? BorderColor { get; set; }
     public Thickness? CellPadding { get; set; }
 
-    public int ColumnCount => Rows.Count == 0 ? 0 : Rows.Max(r => r.Cells.Sum(c => Math.Max(1, c.ColSpan)));
+    public int ColumnCount
+    {
+        get
+        {
+            int columns = 0;
+            foreach (var row in Rows)
+            {
+                long count = row.Cells.Sum(c => (long)Math.Max(1, c.ColSpan));
+                if (count > 16384) throw new ConversionException("This table has too many columns.");
+                columns = Math.Max(columns, (int)count);
+            }
+            return columns;
+        }
+    }
 }
 
 internal sealed class DRow
@@ -315,6 +329,30 @@ internal static class Units
     }
 
     public static string Hex(Color c) => $"{c.R:X2}{c.G:X2}{c.B:X2}";
+
+    public static int OdfSpaceCount(string? value)
+    {
+        // A bad count shouldn't fail the whole document; just keep it within reason.
+        return int.TryParse(value, out var n) ? Math.Clamp(n, 1, 100_000) : 1;
+    }
+}
+
+internal static class SafeXml
+{
+    public static string Text(string text)
+    {
+        var sb = new StringBuilder(text.Length);
+        foreach (var rune in text.EnumerateRunes())
+            if (rune.Value is 9 or 10 or 13 || rune.Value >= 0x20 && rune.Value is not (0xFFFE or 0xFFFF))
+                sb.Append(rune.ToString());
+        return sb.ToString();
+    }
+
+    public static void Clean(XElement root)
+    {
+        foreach (var text in root.DescendantNodes().OfType<XText>()) text.Value = Text(text.Value);
+        foreach (var attribute in root.DescendantsAndSelf().Attributes()) attribute.Value = Text(attribute.Value);
+    }
 }
 
 internal static class ListLabels

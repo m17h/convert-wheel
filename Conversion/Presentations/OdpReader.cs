@@ -106,7 +106,7 @@ internal sealed partial class OdpReader
                         XText t => t.Value,
                         XElement { Name.LocalName: "line-break" } => "\n",
                         XElement { Name.LocalName: "tab" } => "\t",
-                        XElement { Name.LocalName: "s" } s => new string(' ', int.TryParse((string?)s.Attribute(Text + "c"), out var c) ? c : 1),
+                        XElement { Name.LocalName: "s" } s => new string(' ', Units.OdfSpaceCount((string?)s.Attribute(Text + "c"))),
                         _ => "",
                     })));
             while (slide.Notes.Count > 0 && slide.Notes[^1].Length == 0) slide.Notes.RemoveAt(slide.Notes.Count - 1);
@@ -683,7 +683,7 @@ internal sealed partial class OdpReader
                     Inlines(child, p, linked, (string?)child.Attribute(XLink + "href"));
                     break;
                 case "s":
-                    int count = int.TryParse((string?)child.Attribute(Text + "c"), out var c) ? c : 1;
+                    int count = Units.OdfSpaceCount((string?)child.Attribute(Text + "c"));
                     p.Inlines.Add(new DText(new string(' ', count), Style(run, link)));
                     break;
                 case "tab":

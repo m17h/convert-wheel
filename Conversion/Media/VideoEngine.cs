@@ -143,12 +143,15 @@ internal static class VideoEngine
     static IMFSinkWriter CreateWriter(string path, Guid container)
     {
         MF.MFCreateAttributes(out var attrs, 3);
-        attrs.SetGUID(MF.TRANSCODE_CONTAINERTYPE, container);
-        attrs.SetInt(MF.READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1);
-        attrs.SetInt(MF.SINK_WRITER_DISABLE_THROTTLING, 1);
-        MF.MFCreateSinkWriterFromURL(path, IntPtr.Zero, attrs, out var writer);
-        MF.Release(attrs);
-        return writer;
+        try
+        {
+            attrs.SetGUID(MF.TRANSCODE_CONTAINERTYPE, container);
+            attrs.SetInt(MF.READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1);
+            attrs.SetInt(MF.SINK_WRITER_DISABLE_THROTTLING, 1);
+            MF.MFCreateSinkWriterFromURL(path, IntPtr.Zero, attrs, out var writer);
+            return writer;
+        }
+        finally { MF.Release(attrs); }
     }
 
     /// <summary>A sensible bitrate for visually clean H.264/WMV at this size and frame rate.</summary>
@@ -204,10 +207,8 @@ internal static class VideoEngine
         }
         catch (Exception ex) when (ex is NotSupportedException or COMException)
         {
-            // Audio Windows can't decode (or encode for this container): keep the video rather than fail.
-            Log.Write($"Dropping audio track: {ex.Message}");
             source?.Dispose();
-            return null;
+            throw new NotSupportedException("Windows couldn't convert the audio track.", ex);
         }
     }
 
@@ -379,20 +380,29 @@ internal static class VideoEngine
 
             long duration = MF.Duration(reader) ?? 0;
             int samples = 0;
+            var ended = new HashSet<int>();
             while (true)
             {
                 ct.ThrowIfCancellationRequested();
                 reader.ReadSample(MF.SourceReaderAnyStream, 0, out int index, out int flags, out long ts, out var sample);
-                if ((flags & MF.ReaderError) != 0) return Fail("read error");
-                if (sample != null)
+                try
                 {
-                    int target = index == readerVideo ? vs : index == readerAudio ? @as : -1;
-                    if (target >= 0) writer.WriteSample(target, sample);
-                    MF.Release(sample);
-                    samples++;
-                    if (duration > 0) progress.Report(Math.Min(0.99, (double)ts / duration));
+                    if ((flags & MF.ReaderError) != 0) return Fail("read error");
+                    if (sample != null)
+                    {
+                        int target = index == readerVideo ? vs : index == readerAudio ? @as : -1;
+                        if (target >= 0) writer.WriteSample(target, sample);
+                        samples++;
+                        if (duration > 0) progress.Report(Math.Min(0.99, (double)ts / duration));
+                    }
                 }
-                if ((flags & MF.ReaderEndOfStream) != 0) break; // all selected streams ended
+                finally { MF.Release(sample); }
+                if ((flags & MF.ReaderEndOfStream) != 0)
+                {
+                    ended.Add(index);
+                    if (ended.Contains(readerVideo) && (audio == null || ended.Contains(readerAudio))) break;
+                    reader.SetStreamSelection(index, false);
+                }
             }
             if (samples == 0) return Fail("no samples");
             writer.DoFinalize();

@@ -36,7 +36,8 @@ public sealed class AppSettings
                 var settings = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(FilePath));
                 if (settings != null)
                 {
-                    settings.TriggerKeys = settings.TriggerKeys.Select(VirtualKeys.Normalize).Distinct().ToList();
+                    settings.TriggerKeys = (settings.TriggerKeys ?? []).Where(k => k is > 0 and < 256)
+                        .Select(VirtualKeys.Normalize).Distinct().ToList();
                     if (settings.TriggerKeys.Count == 0) settings.TriggerKeys = [VirtualKeys.Ctrl];
                     settings.HoldDelayMs = Math.Clamp(settings.HoldDelayMs, 100, 2000);
                     settings.StartWithWindows = StartupRegistered();
@@ -69,14 +70,21 @@ public sealed class AppSettings
 
     public void Save()
     {
+        string? temp = null;
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!);
-            File.WriteAllText(FilePath, JsonSerializer.Serialize(this, JsonOptions));
+            temp = FilePath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            File.WriteAllText(temp, JsonSerializer.Serialize(this, JsonOptions));
+            File.Move(temp, FilePath, overwrite: true);
         }
         catch (Exception ex)
         {
             Log.Write(ex);
+        }
+        finally
+        {
+            if (temp != null) try { File.Delete(temp); } catch { }
         }
         Changed?.Invoke();
     }
@@ -85,8 +93,7 @@ public sealed class AppSettings
     {
         try
         {
-            using var key = Registry.CurrentUser.OpenSubKey(RunKey, writable: true);
-            if (key == null) return;
+            using var key = Registry.CurrentUser.CreateSubKey(RunKey);
             if (StartWithWindows) key.SetValue("ConvertWheel", $"\"{Environment.ProcessPath}\" --background");
             else key.DeleteValue("ConvertWheel", throwOnMissingValue: false);
         }

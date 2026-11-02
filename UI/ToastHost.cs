@@ -45,7 +45,12 @@ internal sealed class ToastHost : Window
             if (_stack.Children.Count == 0) Hide();
         };
         _stack.Children.Add(card);
-        while (_stack.Children.Count > 5) ((ToastCard)_stack.Children[0]).DismissNow();
+        while (_stack.Children.Count > 5)
+        {
+            var oldest = (ToastCard)_stack.Children[0];
+            _stack.Children.RemoveAt(0);
+            oldest.DismissNow();
+        }
         if (!IsVisible) Show();
         Reposition();
         Topmost = false;
@@ -135,7 +140,7 @@ internal sealed class ToastCard : Border
         Child = grid;
 
         MouseEnter += (_, _) => _timer?.Stop();
-        MouseLeave += (_, _) => _timer?.Start();
+        MouseLeave += (_, _) => { if (!_removing) _timer?.Start(); };
 
         Update(title, subtitle);
         SetState(glyph, accent);
@@ -232,6 +237,7 @@ internal sealed class ToastCard : Border
 
     public void DismissAfter(TimeSpan delay)
     {
+        if (_removing) return;
         _timer?.Stop();
         _timer = new DispatcherTimer { Interval = delay };
         _timer.Tick += (_, _) => DismissNow();
@@ -250,6 +256,8 @@ internal sealed class ToastCard : Border
         if (_removing) return;
         _removing = true;
         _timer?.Stop();
+        _spin.BeginAnimation(RotateTransform.AngleProperty, null);
+        HideProgress();
         var fade = WheelOverlay.Anim(0, 160);
         fade.Completed += (_, _) => Removed?.Invoke();
         BeginAnimation(OpacityProperty, fade);

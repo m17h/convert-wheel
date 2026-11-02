@@ -66,19 +66,19 @@ internal sealed class HtmlWriter(bool xhtml, Func<DImage, string> imageSource)
             {
                 while (openLists.Count > 0 && (openLists.Peek().level > item.ListLevel ||
                        (openLists.Peek().level == item.ListLevel && openLists.Peek().kind != item.List)))
-                    sb.Append(openLists.Pop().kind == ListKind.Number ? "</ol>\n" : "</ul>\n");
-                while (openLists.Count == 0 || openLists.Peek().level < item.ListLevel)
+                    sb.Append(openLists.Pop().kind == ListKind.Number ? "</li>\n</ol>\n" : "</li>\n</ul>\n");
+                if (openLists.Count == 0 || openLists.Peek().level < item.ListLevel)
                 {
-                    int level = openLists.Count == 0 ? item.ListLevel : openLists.Peek().level + 1;
                     sb.Append(item.List == ListKind.Number ? "<ol>\n" : "<ul>\n");
-                    openLists.Push((item.List, level));
+                    openLists.Push((item.List, item.ListLevel));
                 }
+                else sb.Append("</li>\n");
                 sb.Append("<li>");
                 Inlines(item, sb);
-                sb.Append("</li>\n");
+                sb.Append('\n');
                 continue;
             }
-            while (openLists.Count > 0) sb.Append(openLists.Pop().kind == ListKind.Number ? "</ol>\n" : "</ul>\n");
+            while (openLists.Count > 0) sb.Append(openLists.Pop().kind == ListKind.Number ? "</li>\n</ol>\n" : "</li>\n</ul>\n");
 
             if (block is DParagraph p)
             {
@@ -116,7 +116,7 @@ internal sealed class HtmlWriter(bool xhtml, Func<DImage, string> imageSource)
                 sb.Append("</table>\n");
             }
         }
-        while (openLists.Count > 0) sb.Append(openLists.Pop().kind == ListKind.Number ? "</ol>\n" : "</ul>\n");
+        while (openLists.Count > 0) sb.Append(openLists.Pop().kind == ListKind.Number ? "</li>\n</ol>\n" : "</li>\n</ul>\n");
         return sb.ToString();
     }
 
@@ -187,6 +187,6 @@ internal sealed class HtmlWriter(bool xhtml, Func<DImage, string> imageSource)
         }
     }
 
-    public static string Enc(string s) => WebUtility.HtmlEncode(s);
+    public static string Enc(string s) => WebUtility.HtmlEncode(SafeXml.Text(s));
     static string Num(double v) => v.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture);
 }

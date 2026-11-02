@@ -67,8 +67,12 @@ internal sealed class TrayIcon : IDisposable
 
     public void Dispose()
     {
+        _settings.Changed -= Refresh;
         _icon.Visible = false;
+        _icon.ContextMenuStrip?.Dispose();
         _icon.Dispose();
+        _normalIcon.Dispose();
+        _pausedIcon.Dispose();
     }
 
     sealed class DarkColors : ProfessionalColorTable

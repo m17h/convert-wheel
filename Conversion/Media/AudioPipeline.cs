@@ -50,31 +50,44 @@ internal sealed class MfAudioSource : IAudioSource
         MF.MFCreateSourceReaderFromURL(path, null, out _reader);
         try
         {
-            _reader.SetStreamSelection(MF.SourceReaderAllStreams, false);
-            _reader.SetStreamSelection(MF.SourceReaderFirstAudio, true);
-        }
-        catch (COMException)
-        {
-            throw new NotSupportedException("This file has no audio track.");
-        }
-        if (_reader.GetNativeMediaType(MF.SourceReaderFirstAudio, 0, out var native) < 0)
-            throw new NotSupportedException("This file has no audio track.");
-        NativeSubtype = native.GetGuid(MF.MT_SUBTYPE) ?? Guid.Empty;
-        SourceBits = native.GetInt(MF.MT_AUDIO_BITS_PER_SAMPLE) is int b and >= 16 and <= 32 && (NativeSubtype == MF.AudioPCM || NativeSubtype == MF.AudioFLAC) ? b : 16;
-        MF.Release(native);
+            try
+            {
+                _reader.SetStreamSelection(MF.SourceReaderAllStreams, false);
+                _reader.SetStreamSelection(MF.SourceReaderFirstAudio, true);
+            }
+            catch (COMException)
+            {
+                throw new NotSupportedException("This file has no audio track.");
+            }
+            if (_reader.GetNativeMediaType(MF.SourceReaderFirstAudio, 0, out var native) < 0)
+                throw new NotSupportedException("This file has no audio track.");
+            try
+            {
+                NativeSubtype = native.GetGuid(MF.MT_SUBTYPE) ?? Guid.Empty;
+                SourceBits = native.GetInt(MF.MT_AUDIO_BITS_PER_SAMPLE) is int b and >= 16 and <= 32 && (NativeSubtype == MF.AudioPCM || NativeSubtype == MF.AudioFLAC) ? b : 16;
+            }
+            finally { MF.Release(native); }
 
-        var want = MF.NewType(MF.MediaTypeAudio, MF.AudioFloat);
-        int hr = _reader.SetCurrentMediaType(MF.SourceReaderFirstAudio, IntPtr.Zero, want);
-        MF.Release(want);
-        if (hr < 0) throw new NotSupportedException("Windows can't decode this audio.");
-        _reader.GetCurrentMediaType(MF.SourceReaderFirstAudio, out var current);
-        Format = new AudioFormat(current.GetInt(MF.MT_AUDIO_SAMPLES_PER_SECOND) ?? 44100, current.GetInt(MF.MT_AUDIO_NUM_CHANNELS) ?? 2);
-        MF.Release(current);
-        if (MF.Duration(_reader) is long d) TotalFrames = d * Format.SampleRate / 10_000_000;
+            var want = MF.NewType(MF.MediaTypeAudio, MF.AudioFloat);
+            int hr;
+            try { hr = _reader.SetCurrentMediaType(MF.SourceReaderFirstAudio, IntPtr.Zero, want); }
+            finally { MF.Release(want); }
+            if (hr < 0) throw new NotSupportedException("Windows can't decode this audio.");
+            Marshal.ThrowExceptionForHR(_reader.GetCurrentMediaType(MF.SourceReaderFirstAudio, out var current));
+            try { Format = new AudioFormat(current.GetInt(MF.MT_AUDIO_SAMPLES_PER_SECOND) ?? 44100, current.GetInt(MF.MT_AUDIO_NUM_CHANNELS) ?? 2); }
+            finally { MF.Release(current); }
+            if (MF.Duration(_reader) is long d) TotalFrames = d * Format.SampleRate / 10_000_000;
+        }
+        catch
+        {
+            MF.Release(_reader);
+            throw;
+        }
     }
 
     public int Read(float[] buffer, int count)
     {
+        count -= count % Format.Channels;
         int written = 0;
         while (written < count)
         {
@@ -94,11 +107,16 @@ internal sealed class MfAudioSource : IAudioSource
     bool Refill()
     {
         _reader.ReadSample(MF.SourceReaderFirstAudio, 0, out _, out var flags, out _, out var sample);
-        if ((flags & MF.ReaderError) != 0) throw new InvalidOperationException("Windows couldn't decode this audio.");
+        if ((flags & MF.ReaderError) != 0)
+        {
+            MF.Release(sample);
+            throw new InvalidOperationException("Windows couldn't decode this audio.");
+        }
         if ((flags & MF.ReaderEndOfStream) != 0) _ended = true;
         if (sample == null) return !_ended;
-        var bytes = MF.Bytes(sample);
-        MF.Release(sample);
+        byte[] bytes;
+        try { bytes = MF.Bytes(sample); }
+        finally { MF.Release(sample); }
         _pending = MemoryMarshal.Cast<byte, float>(bytes).ToArray();
         _pendingOffset = 0;
         return true;
@@ -134,14 +152,24 @@ internal sealed class OpusSource : IAudioSource
 
     public OpusSource(string path, int channels)
     {
+        if (channels is not (1 or 2)) throw new NotSupportedException("This Opus channel layout needs FFmpeg.");
         _file = File.OpenRead(path);
-        Format = new AudioFormat(48000, Math.Clamp(channels, 1, 2));
-        _reader = new OpusOggReadStream(OpusCodecFactory.CreateDecoder(48000, Format.Channels, null), _file);
-        if (_reader.TotalTime > TimeSpan.Zero) TotalFrames = (long)(_reader.TotalTime.TotalSeconds * 48000);
+        try
+        {
+            Format = new AudioFormat(48000, Math.Clamp(channels, 1, 2));
+            _reader = new OpusOggReadStream(OpusCodecFactory.CreateDecoder(48000, Format.Channels, null), _file);
+            if (_reader.TotalTime > TimeSpan.Zero) TotalFrames = (long)(_reader.TotalTime.TotalSeconds * 48000);
+        }
+        catch
+        {
+            _file.Dispose();
+            throw;
+        }
     }
 
     public int Read(float[] buffer, int count)
     {
+        count -= count % Format.Channels;
         int written = 0;
         while (written < count)
         {
@@ -181,6 +209,7 @@ internal sealed class AiffSource : IAudioSource
         if (file.Length < 12 || file[0] != 'F' || file[1] != 'O' || file[2] != 'R' || file[3] != 'M')
             throw new NotSupportedException("Not an AIFF file.");
         bool aifc = file[8] == 'A' && file[9] == 'I' && file[10] == 'F' && file[11] == 'C';
+        if (!aifc && !file.AsSpan(8, 4).SequenceEqual("AIFF"u8)) throw new NotSupportedException("Not an AIFF file.");
         int channels = 0, bits = 16;
         double rate = 44100;
         string compression = "NONE";
@@ -190,8 +219,10 @@ internal sealed class AiffSource : IAudioSource
             var id = System.Text.Encoding.ASCII.GetString(file, pos, 4);
             int size = BinaryPrimitives.ReadInt32BigEndian(file.AsSpan(pos + 4));
             int body = pos + 8;
+            if (size < 0 || size > file.Length - body) throw new NotSupportedException("This AIFF file is damaged.");
             if (id == "COMM")
             {
+                if (size < (aifc ? 22 : 18)) throw new NotSupportedException("This AIFF file is damaged.");
                 channels = BinaryPrimitives.ReadInt16BigEndian(file.AsSpan(body));
                 bits = BinaryPrimitives.ReadInt16BigEndian(file.AsSpan(body + 6));
                 rate = ReadExtended(file.AsSpan(body + 8, 10));
@@ -199,13 +230,16 @@ internal sealed class AiffSource : IAudioSource
             }
             else if (id == "SSND")
             {
+                if (size < 8) throw new NotSupportedException("This AIFF file is damaged.");
                 int offset = BinaryPrimitives.ReadInt32BigEndian(file.AsSpan(body));
+                if (offset < 0 || offset > size - 8) throw new NotSupportedException("This AIFF file is damaged.");
                 dataOffset = body + 8 + offset;
                 dataLength = Math.Min(size - 8 - offset, file.Length - dataOffset);
             }
             pos = body + size + (size & 1);
         }
-        if (channels <= 0 || dataOffset < 0) throw new NotSupportedException("This AIFF file is damaged.");
+        if (channels <= 0 || dataOffset < 0 || bits is < 1 or > 32 || !double.IsFinite(rate) || rate < 1 || rate > int.MaxValue)
+            throw new NotSupportedException("This AIFF file is damaged.");
         _littleEndian = compression is "sowt";
         _float = compression is "fl32" or "FL32";
         if (compression is not ("NONE" or "sowt" or "fl32" or "FL32" or "twos")) throw new NotSupportedException("Compressed AIFF isn't supported.");
@@ -227,6 +261,7 @@ internal sealed class AiffSource : IAudioSource
     public int Read(float[] buffer, int count)
     {
         int samples = Math.Min(count - count % Format.Channels, (_data.Length - _position) / _bytesPerSample);
+        samples -= samples % Format.Channels;
         for (int i = 0; i < samples; i++, _position += _bytesPerSample)
         {
             var s = _data.AsSpan(_position, _bytesPerSample);
@@ -241,7 +276,7 @@ internal sealed class AiffSource : IAudioSource
         for (int i = 0; i < s.Length; i++) v = v << 8 | s[_littleEndian ? s.Length - 1 - i : i];
         int shift = 32 - 8 * s.Length;
         v = v << shift >> shift; // sign-extend
-        return s.Length == 1 ? v / 128f : v / (float)(1 << (8 * s.Length - 1));
+        return v / MathF.ScaleB(1, 8 * s.Length - 1);
     }
 
     public void Dispose() { }
@@ -425,17 +460,29 @@ internal sealed class MfAudioSink : IAudioSink
         MF.EnsureStarted();
         _format = format;
         _bits = bits;
-        MF.MFCreateAttributes(out var attrs, 3);
-        attrs.SetGUID(MF.TRANSCODE_CONTAINERTYPE, container);
-        attrs.SetInt(MF.READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1);
-        attrs.SetInt(MF.SINK_WRITER_DISABLE_THROTTLING, 1);
-        MF.MFCreateSinkWriterFromURL(path, IntPtr.Zero, attrs, out _writer);
-        MF.Release(attrs);
-        _writer.AddStream(outputType, out _stream);
-        var input = PcmType(format, bits);
-        _writer.SetInputMediaType(_stream, input, null);
-        MF.Release(input);
-        _writer.BeginWriting();
+        try
+        {
+            MF.MFCreateAttributes(out var attrs, 3);
+            try
+            {
+                attrs.SetGUID(MF.TRANSCODE_CONTAINERTYPE, container);
+                attrs.SetInt(MF.READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1);
+                attrs.SetInt(MF.SINK_WRITER_DISABLE_THROTTLING, 1);
+                MF.MFCreateSinkWriterFromURL(path, IntPtr.Zero, attrs, out _writer);
+            }
+            finally { MF.Release(attrs); }
+            _writer.AddStream(outputType, out _stream);
+            var input = PcmType(format, bits);
+            try { _writer.SetInputMediaType(_stream, input, null); }
+            finally { MF.Release(input); }
+            _writer.BeginWriting();
+        }
+        catch
+        {
+            MF.Release(_writer);
+            throw;
+        }
+        finally { MF.Release(outputType); }
     }
 
     public static IMFMediaType PcmType(AudioFormat format, int bits)
@@ -459,8 +506,8 @@ internal sealed class MfAudioSink : IAudioSink
         long time = _frames * 10_000_000 / _format.SampleRate;
         long duration = (_frames + frames) * 10_000_000 / _format.SampleRate - time;
         var sample = MF.SampleFrom(_bytes.AsSpan(0, size), time, duration);
-        _writer.WriteSample(_stream, sample);
-        MF.Release(sample);
+        try { _writer.WriteSample(_stream, sample); }
+        finally { MF.Release(sample); }
         _frames += frames;
     }
 
@@ -495,10 +542,12 @@ internal sealed class WavSink : IAudioSink
 
     public void Finish()
     {
+        if (_dataBytes > uint.MaxValue - 36L - (_dataBytes & 1)) throw new ConversionException("This audio is too large for a WAV file.");
+        if ((_dataBytes & 1) != 0) _file.WriteByte(0);
         int block = _format.Channels * _bits / 8;
         var h = new byte[44];
         "RIFF"u8.CopyTo(h);
-        BinaryPrimitives.WriteUInt32LittleEndian(h.AsSpan(4), (uint)Math.Min(uint.MaxValue, 36 + _dataBytes));
+        BinaryPrimitives.WriteUInt32LittleEndian(h.AsSpan(4), (uint)(36 + _dataBytes + (_dataBytes & 1)));
         "WAVEfmt "u8.CopyTo(h.AsSpan(8));
         BinaryPrimitives.WriteInt32LittleEndian(h.AsSpan(16), 16);
         BinaryPrimitives.WriteInt16LittleEndian(h.AsSpan(20), 1);
@@ -543,9 +592,11 @@ internal sealed class AiffSink : IAudioSink
 
     public void Finish()
     {
+        if (_dataBytes > uint.MaxValue - 46L - (_dataBytes & 1)) throw new ConversionException("This audio is too large for an AIFF file.");
+        if ((_dataBytes & 1) != 0) _file.WriteByte(0);
         var h = new byte[54];
         "FORM"u8.CopyTo(h);
-        BinaryPrimitives.WriteUInt32BigEndian(h.AsSpan(4), (uint)(46 + _dataBytes));
+        BinaryPrimitives.WriteUInt32BigEndian(h.AsSpan(4), (uint)(46 + _dataBytes + (_dataBytes & 1)));
         "AIFFCOMM"u8.CopyTo(h.AsSpan(8));
         BinaryPrimitives.WriteInt32BigEndian(h.AsSpan(16), 18);
         BinaryPrimitives.WriteInt16BigEndian(h.AsSpan(20), (short)_format.Channels);
@@ -647,6 +698,7 @@ internal sealed class VorbisSink : IAudioSink
 internal sealed class OpusSink : IAudioSink
 {
     readonly OpusOggWriteStream _writer;
+    readonly FileStream _file;
 
     public OpusSink(string path, AudioFormat format, MediaTags tags)
     {
@@ -655,10 +707,12 @@ internal sealed class OpusSink : IAudioSink
         encoder.Complexity = 10;
         var opusTags = new OpusTags();
         foreach (var (key, value) in tags.AsVorbisComments()) opusTags.Fields[key] = value;
-        _writer = new OpusOggWriteStream(encoder, File.Create(path), opusTags, format.SampleRate, 8, leaveOpen: false);
+        _file = File.Create(path);
+        try { _writer = new OpusOggWriteStream(encoder, _file, opusTags, format.SampleRate, 8, leaveOpen: false); }
+        catch { _file.Dispose(); throw; }
     }
 
     public void Write(float[] samples, int count) => _writer.WriteSamples(samples, 0, count);
     public void Finish() => _writer.Finish();
-    public void Dispose() { }
+    public void Dispose() => _file.Dispose();
 }

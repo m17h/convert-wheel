@@ -18,7 +18,8 @@ internal sealed class OdtReader
     internal static readonly XNamespace XLink = "http://www.w3.org/1999/xlink";
     internal static readonly XNamespace Svg = "urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0";
 
-    readonly ZipArchive _zip;
+    readonly ZipArchive? _zip;
+    readonly XElement? _flat;
     readonly Dictionary<string, XElement> _styles = [];
     readonly Dictionary<string, XElement> _listStyles = [];
     readonly Dictionary<string, string> _fontFaces = [];
@@ -45,11 +46,13 @@ internal sealed class OdtReader
 
     public static DDocument Read(string path)
     {
+        if (Path.GetExtension(path).Equals(".fodt", StringComparison.OrdinalIgnoreCase))
+            return new OdtReader(null, XDocument.Load(path, LoadOptions.PreserveWhitespace).Root).Build(Path.GetFileNameWithoutExtension(path));
         using var zip = ZipFile.OpenRead(path);
         return new OdtReader(zip).Build(Path.GetFileNameWithoutExtension(path));
     }
 
-    OdtReader(ZipArchive zip) => _zip = zip;
+    OdtReader(ZipArchive? zip, XElement? flat = null) => (_zip, _flat) = (zip, flat);
 
     DDocument Build(string title)
     {
@@ -354,7 +357,7 @@ internal sealed class OdtReader
                 ReadInlines(el.Nodes(), inner, link, builder);
             }
             else if (n == Text + "a") ReadInlines(el.Nodes(), run, (string?)el.Attribute(XLink + "href") ?? link, builder);
-            else if (n == Text + "s") builder.Literal(new string(' ', (int?)el.Attribute(Text + "c") ?? 1), run.ToStyle(), link);
+            else if (n == Text + "s") builder.Literal(new string(' ', Units.OdfSpaceCount((string?)el.Attribute(Text + "c"))), run.ToStyle(), link);
             else if (n == Text + "tab") builder.Literal("\t", run.ToStyle(), link);
             else if (n == Text + "line-break") builder.Add(new DLineBreak());
             else if (n == Draw + "frame") ReadFrame(el, builder);
@@ -428,16 +431,25 @@ internal sealed class OdtReader
     (byte[] data, string ext, double w, double h)? LoadFrameImage(XElement frame)
     {
         // Charts are drawn from their own data; their saved preview is usually a format nothing else reads.
-        if ((string?)frame.Element(Draw + "object")?.Attribute(XLink + "href") is { } objectHref && Charts.ReadOdf(_zip, objectHref) is { } chart)
+        if (_zip != null && (string?)frame.Element(Draw + "object")?.Attribute(XLink + "href") is { } objectHref && Charts.ReadOdf(_zip, objectHref) is { } chart)
         {
             double cw = Len(frame, Svg + "width") ?? 360, ch = Len(frame, Svg + "height") ?? 216;
             var picture = Charts.ToImage(chart, cw, ch);
             return (picture.Data, "png", cw, ch);
         }
+        if (frame.Elements(Draw + "image").Elements(Office + "binary-data").FirstOrDefault() is { } binary)
+        {
+            byte[] embedded;
+            try { embedded = Convert.FromBase64String(binary.Value); }
+            catch (FormatException) { return null; }
+            if (HtmlReader.ImageExt(embedded) is not { } embeddedExt) return null;
+            var (iw, ih) = DocxReader.ImageSize(embedded);
+            return (embedded, embeddedExt, iw, ih);
+        }
         var href = frame.Elements(Draw + "image").Select(i => (string?)i.Attribute(XLink + "href"))
             .OrderBy(h => h != null && h.EndsWith(".svg", StringComparison.OrdinalIgnoreCase) ? 1 : 0).FirstOrDefault();
         if (href == null || href.Contains("://")) return null;
-        var entry = _zip.GetEntry(href.TrimStart('.', '/'));
+        var entry = _zip?.GetEntry(href.TrimStart('.', '/'));
         if (entry == null) return null;
         var ext = Path.GetExtension(href).TrimStart('.').ToLowerInvariant();
         ext = ext switch { "jpg" or "jpeg" => "jpeg", "tif" => "tiff", _ => ext };
@@ -575,7 +587,8 @@ internal sealed class OdtReader
 
     XElement? Load(string path)
     {
-        var entry = _zip.GetEntry(path);
+        if (_flat != null) return _flat;
+        var entry = _zip?.GetEntry(path);
         if (entry == null) return null;
         using var stream = entry.Open();
         return XDocument.Load(stream, LoadOptions.PreserveWhitespace).Root;

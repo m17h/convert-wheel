@@ -64,6 +64,7 @@ internal sealed class Chart
 /// <summary>Reads charts saved by PowerPoint/Word/Excel (DrawingML) and LibreOffice (ODF), and draws them.</summary>
 internal static class Charts
 {
+    const int MaxPoints = 100000;
     static readonly XNamespace C = "http://schemas.openxmlformats.org/drawingml/2006/chart";
     static readonly XNamespace A = "http://schemas.openxmlformats.org/drawingml/2006/main";
 
@@ -204,7 +205,21 @@ internal static class Charts
     }
 
     static string? Val(XElement? el) => (string?)el?.Attribute("val");
-    static double? Num(string? s) => double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out var v) ? v : null;
+    static double? Num(string? s) => double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out var v) && double.IsFinite(v) ? v : null;
+
+    static int PointCount(string? value)
+    {
+        if (!long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var n) || n < 0) return 0;
+        if (n > MaxPoints) throw new ConversionException("This chart has too many data points.");
+        return (int)n;
+    }
+
+    static int PointIndex(XElement point)
+    {
+        if (!long.TryParse((string?)point.Attribute("idx"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var n) || n < 0) return -1;
+        if (n >= MaxPoints) throw new ConversionException("This chart has too many data points.");
+        return (int)n;
+    }
 
     static string? RichText(XElement title)
     {
@@ -226,8 +241,8 @@ internal static class Charts
     {
         var cache = holder?.Descendants(C + "numCache").FirstOrDefault() ?? holder?.Descendants(C + "numLit").FirstOrDefault();
         if (cache == null) return [];
-        int count = (int)(Num(Val(cache.Element(C + "ptCount"))) ?? 0);
-        var points = cache.Elements(C + "pt").Select(p => ((int)(Num((string?)p.Attribute("idx")) ?? 0), Num(p.Element(C + "v")?.Value))).ToList();
+        int count = PointCount(Val(cache.Element(C + "ptCount")));
+        var points = cache.Elements(C + "pt").Select(p => (PointIndex(p), Num(p.Element(C + "v")?.Value))).Where(p => p.Item1 >= 0).ToList();
         count = Math.Max(count, points.Count == 0 ? 0 : points.Max(p => p.Item1) + 1);
         var values = Enumerable.Repeat<double?>(null, count).ToList();
         foreach (var (idx, value) in points) if (idx < count) values[idx] = value;
@@ -240,19 +255,21 @@ internal static class Charts
         var multi = holder.Descendants(C + "multiLvlStrCache").FirstOrDefault();
         if (multi != null)
         {
-            var levels = multi.Elements(C + "lvl").Select(l => l.Elements(C + "pt").ToDictionary(p => (int)(Num((string?)p.Attribute("idx")) ?? 0), p => p.Element(C + "v")?.Value ?? "")).ToList();
-            int n = (int)(Num(Val(multi.Element(C + "ptCount"))) ?? levels.FirstOrDefault()?.Count ?? 0);
+            var levels = multi.Elements(C + "lvl").Select(l => l.Elements(C + "pt").Where(p => PointIndex(p) >= 0)
+                .GroupBy(PointIndex).ToDictionary(g => g.Key, g => g.Last().Element(C + "v")?.Value ?? "")).ToList();
+            int n = Math.Max(PointCount(Val(multi.Element(C + "ptCount"))), levels.SelectMany(l => l.Keys).DefaultIfEmpty(-1).Max() + 1);
             return Enumerable.Range(0, n).Select(i => levels.Count > 0 && levels[0].TryGetValue(i, out var v) ? v : "").ToList();
         }
         var cache = holder.Descendants(C + "strCache").FirstOrDefault() ?? holder.Descendants(C + "strLit").FirstOrDefault()
                     ?? holder.Descendants(C + "numCache").FirstOrDefault() ?? holder.Descendants(C + "numLit").FirstOrDefault();
         if (cache == null) return [];
-        int count = (int)(Num(Val(cache.Element(C + "ptCount"))) ?? 0);
+        int count = PointCount(Val(cache.Element(C + "ptCount")));
         var format = cache.Element(C + "formatCode")?.Value;
         var result = Enumerable.Repeat("", count).ToList();
         foreach (var p in cache.Elements(C + "pt"))
         {
-            int idx = (int)(Num((string?)p.Attribute("idx")) ?? 0);
+            int idx = PointIndex(p);
+            if (idx < 0) continue;
             var v = p.Element(C + "v")?.Value ?? "";
             if (cache.Name.LocalName.StartsWith("num") && Num(v) is double d) v = FormatValue(d, format, dates: true);
             while (result.Count <= idx) result.Add("");
@@ -341,15 +358,20 @@ internal static class Charts
             }
             grid.Add(cells);
         }
-        (string text, double? value) Cell(int row, int col) => row < grid.Count && col < grid[row].Count ? grid[row][col] : ("", null);
+        (string text, double? value) Cell(int row, int col) => row >= 0 && row < grid.Count && col >= 0 && col < grid[row].Count ? grid[row][col] : ("", null);
         List<(int row, int col)> Range(string? address)
         {
             var cells = new List<(int, int)>();
             if (string.IsNullOrEmpty(address)) return cells;
-            var refs = Regex.Matches(address, @"\$?([A-Z]+)\$?(\d+)").Select(m => (row: int.Parse(m.Groups[2].Value) - 1, col: ColumnIndex(m.Groups[1].Value))).ToList();
+            var refs = Regex.Matches(address, @"\$?([A-Z]+)\$?(\d+)").Select(m =>
+                (row: int.TryParse(m.Groups[2].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var r) && r > 0 ? r - 1 : -1,
+                 col: ColumnIndex(m.Groups[1].Value))).ToList();
             if (refs.Count == 0) return cells;
             var (r1, c1) = refs[0];
             var (r2, c2) = refs.Count > 1 ? refs[1] : refs[0];
+            if (r1 < 0 || r2 < 0 || c1 < 0 || c2 < 0) return cells;
+            if ((Math.Abs((long)r2 - r1) + 1) * (Math.Abs((long)c2 - c1) + 1) > MaxPoints)
+                throw new ConversionException("This chart has too many data points.");
             for (int r = Math.Min(r1, r2); r <= Math.Max(r1, r2); r++)
                 for (int c = Math.Min(c1, c2); c <= Math.Max(c1, c2); c++) cells.Add((r, c));
             return cells;
@@ -437,7 +459,7 @@ internal static class Charts
             int point = 0;
             foreach (var dp in ser.Elements(Ch + "data-point"))
             {
-                int repeat = int.TryParse((string?)dp.Attribute(Ch + "repeated"), out var r) ? r : 1;
+                int repeat = int.TryParse((string?)dp.Attribute(Ch + "repeated"), out var r) ? Math.Clamp(r, 0, Math.Max(0, s.Values.Count - point)) : 1;
                 if (Units.ParseHex((string?)Props(dp, "graphic-properties")?.Attribute(Drw + "fill-color")) is { } pc)
                     for (int i = 0; i < repeat; i++) s.PointColors[point + i] = pc;
                 point += repeat;
@@ -459,7 +481,11 @@ internal static class Charts
     static int ColumnIndex(string letters)
     {
         int n = 0;
-        foreach (var ch in letters) n = n * 26 + (ch - 'A' + 1);
+        foreach (var ch in letters)
+        {
+            if (n > (int.MaxValue - 26) / 26) return -1;
+            n = n * 26 + (ch - 'A' + 1);
+        }
         return n - 1;
     }
 

@@ -56,7 +56,9 @@ internal static partial class MarkdownWriter
                 var lines = new StringBuilder();
                 foreach (var inline in code.Inlines)
                     lines.Append(inline switch { DText t => t.Text, DLineBreak => "\n", _ => "" });
-                sb.Append("```\n").Append(lines.ToString().TrimEnd('\n')).Append("\n```\n\n");
+                var codeText = lines.ToString().TrimEnd('\n');
+                var fence = new string('`', Math.Max(3, Regex.Matches(codeText, "`+").Select(m => m.Length).DefaultIfEmpty(0).Max() + 1));
+                sb.Append(fence).Append('\n').Append(codeText).Append('\n').Append(fence).Append("\n\n");
             }
             else if (block is DParagraph p)
             {
@@ -122,13 +124,25 @@ internal static partial class MarkdownWriter
                     var lead = text[..^text.TrimStart().Length];
                     var trail = text[text.TrimEnd().Length..];
                     text = text.Trim();
-                    if (IsMono(s.Font)) text = "`" + t.Text.Trim() + "`";
+                    if (IsMono(s.Font))
+                    {
+                        var codeText = t.Text.Trim();
+                        var fence = new string('`', Regex.Matches(codeText, "`+").Select(m => m.Length).DefaultIfEmpty(0).Max() + 1);
+                        var pad = codeText.StartsWith('`') || codeText.EndsWith('`') ? " " : "";
+                        text = fence + pad + codeText + pad + fence;
+                    }
                     if (s.Strike) text = $"~~{text}~~";
                     if (s.Italic) text = $"*{text}*";
                     if (s.Bold) text = $"**{text}**";
                     if (s.Superscript) text = $"<sup>{text}</sup>";
                     if (s.Subscript) text = $"<sub>{text}</sub>";
-                    if (t.Link != null) text = $"[{text}]({t.Link.Replace(" ", "%20").Replace(")", "%29")})";
+                    if (t.Link != null) text = $"[{text}]({t.Link.Replace(" ", "%20").Replace("(", "%28").Replace(")", "%29")})";
+                    if (lead.Length == 0 && sb.Length >= 2 &&
+                        (text.StartsWith("**") && sb[^2] == '*' && sb[^1] == '*' || text.StartsWith("~~") && sb[^2] == '~' && sb[^1] == '~'))
+                    {
+                        sb.Length -= 2;
+                        text = text[2..];
+                    }
                     sb.Append(lead).Append(text).Append(trail);
                     break;
                 case DLineBreak: sb.Append("  \n"); break;
@@ -138,20 +152,24 @@ internal static partial class MarkdownWriter
                 case DNote n: sb.Append($"[^{NoteKey(n)}]"); break;
             }
         }
-        return Regex.Replace(sb.ToString().Replace("\t", "    "), @"\*\*\*\*|~~~~", "");
+        return sb.ToString().Replace("\t", "    ");
     }
 
     static string Escape(string text)
     {
-        text = MarkdownSpecial().Replace(text, @"\$1");
+        // Only "&name;" / "&#123;" would read as an entity; a plain "&" stays readable.
+        text = MarkdownSpecial().Replace(EntityLike().Replace(text, "&amp;"), @"\$1");
         // Text that would read as a heading, quote or list at the start of a line.
-        return LineStart().Replace(text, @"\$1");
+        return LineStart().Replace(text, m => m.Groups[1].Success ? m.Groups[1].Value + "\\" + m.Groups[2].Value : "\\" + m.Value);
     }
 
-    [GeneratedRegex(@"([\\`*_\[\]<>|])")]
+    [GeneratedRegex(@"&(?=#?[A-Za-z0-9]+;)")]
+    private static partial Regex EntityLike();
+
+    [GeneratedRegex(@"([\\`*_~\[\]<>|])")]
     private static partial Regex MarkdownSpecial();
 
-    [GeneratedRegex(@"^(#|>|[-+] |\d+\. )", RegexOptions.Multiline)]
+    [GeneratedRegex(@"^(?:#|>|[-+] |(\d+)([.)] ))", RegexOptions.Multiline)]
     private static partial Regex LineStart();
 }
 
@@ -178,7 +196,6 @@ internal static class EpubWriter
         {
             bool start = block is DParagraph { Heading: 1 } or DParagraph { PageBreakBefore: true };
             if (start && chapters[^1].Count > 0) chapters.Add([]);
-            if (block is DParagraph { PageBreakBefore: true } p) p.PageBreakBefore = false;
             chapters[^1].Add(block);
         }
         string ChapterTitle(List<DBlock> blocks, int i) =>
@@ -195,7 +212,9 @@ internal static class EpubWriter
         for (int i = 0; i < chapters.Count; i++)
         {
             var body = writer.Blocks(chapters[i]);
-            if (i == chapters.Count - 1) body += writer.Notes(doc.Notes()).Replace("<section", "<section epub:type=\"footnotes\"");
+            var chapterDoc = new DDocument();
+            chapterDoc.Blocks.AddRange(chapters[i]);
+            body += writer.Notes(chapterDoc.Notes()).Replace("<section", "<section epub:type=\"footnotes\"");
             files.Add(($"chapter{i + 1}.xhtml", Page(ChapterTitle(chapters[i], i), body)));
         }
 
@@ -209,9 +228,9 @@ internal static class EpubWriter
         var package = new XElement(Opf + "package", new XAttribute("version", "3.0"), new XAttribute("unique-identifier", "bookid"),
             new XElement(Opf + "metadata", new XAttribute(XNamespace.Xmlns + "dc", Dc),
                 new XElement(Dc + "identifier", new XAttribute("id", "bookid"), "urn:uuid:" + Guid.NewGuid()),
-                new XElement(Dc + "title", title),
+                new XElement(Dc + "title", SafeXml.Text(title)),
                 new XElement(Dc + "language", lang),
-                new XElement(Opf + "meta", new XAttribute("property", "dcterms:modified"), DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"))),
+                new XElement(Opf + "meta", new XAttribute("property", "dcterms:modified"), DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ", System.Globalization.CultureInfo.InvariantCulture))),
             new XElement(Opf + "manifest",
                 new XElement(Opf + "item", new XAttribute("id", "nav"), new XAttribute("href", "nav.xhtml"), new XAttribute("media-type", "application/xhtml+xml"), new XAttribute("properties", "nav")),
                 new XElement(Opf + "item", new XAttribute("id", "css"), new XAttribute("href", "style.css"), new XAttribute("media-type", "text/css")),

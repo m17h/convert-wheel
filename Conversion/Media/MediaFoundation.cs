@@ -328,16 +328,25 @@ internal static class MF
     public static IMFSample SampleFrom(ReadOnlySpan<byte> data, long time, long duration)
     {
         MFCreateMemoryBuffer(Math.Max(1, data.Length), out var buffer);
-        buffer.Lock(out var ptr, out _, out _);
-        unsafe { data.CopyTo(new Span<byte>((void*)ptr, data.Length)); }
-        buffer.Unlock();
-        buffer.SetCurrentLength(data.Length);
-        MFCreateSample(out var sample);
-        sample.AddBuffer(buffer);
-        sample.SetSampleTime(time);
-        sample.SetSampleDuration(duration);
-        Marshal.ReleaseComObject(buffer);
-        return sample;
+        IMFSample? sample = null;
+        try
+        {
+            buffer.Lock(out var ptr, out _, out _);
+            try { unsafe { data.CopyTo(new Span<byte>((void*)ptr, data.Length)); } }
+            finally { buffer.Unlock(); }
+            buffer.SetCurrentLength(data.Length);
+            MFCreateSample(out sample);
+            sample.AddBuffer(buffer);
+            sample.SetSampleTime(time);
+            sample.SetSampleDuration(duration);
+            return sample;
+        }
+        catch
+        {
+            Release(sample);
+            throw;
+        }
+        finally { Release(buffer); }
     }
 
     public static byte[] Bytes(IMFSample sample)

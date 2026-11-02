@@ -23,6 +23,7 @@ internal sealed partial class HtmlReader
     readonly NoteState _notes;
     DParagraph? _current;
     bool _breakBeforeNext;
+    bool _preParagraph;
 
     sealed record Context(TextStyle Style, string? Link, bool Pre, TextAlignment Align, double Indent, int ListLevel);
 
@@ -329,7 +330,8 @@ internal sealed partial class HtmlReader
         if (value.StartsWith('#') && value.Length == 4) value = "#" + string.Concat(value[1..].Select(c => $"{c}{c}"));
         if (Units.ParseHex(value) is { } hex) return hex;
         var rgb = RgbRegex().Match(value);
-        if (rgb.Success) return Color.FromRgb(byte.Parse(rgb.Groups[1].Value), byte.Parse(rgb.Groups[2].Value), byte.Parse(rgb.Groups[3].Value));
+        if (rgb.Success) return Color.FromRgb((byte)Math.Min(255, int.Parse(rgb.Groups[1].Value, CultureInfo.InvariantCulture)),
+            (byte)Math.Min(255, int.Parse(rgb.Groups[2].Value, CultureInfo.InvariantCulture)), (byte)Math.Min(255, int.Parse(rgb.Groups[3].Value, CultureInfo.InvariantCulture)));
         try { return (Color)ColorConverter.ConvertFromString(value); } catch { return null; }
     }
 
@@ -348,6 +350,7 @@ internal sealed partial class HtmlReader
             SpaceAfter = 8,
             PageBreakBefore = _breakBeforeNext,
         };
+        _preParagraph = ctx.Pre;
         _breakBeforeNext = false;
         _output.Add(_current);
         return _current;
@@ -357,8 +360,8 @@ internal sealed partial class HtmlReader
     {
         if (_current == null) return;
         // Trim whitespace left at the ends by collapsing.
-        if (_current.Inlines.FirstOrDefault() is DText first) first.Text = first.Text.TrimStart();
-        if (_current.Inlines.LastOrDefault() is DText last) last.Text = last.Text.TrimEnd();
+        if (!_preParagraph && _current.Inlines.FirstOrDefault() is DText first) first.Text = first.Text.TrimStart();
+        if (!_preParagraph && _current.Inlines.LastOrDefault() is DText last) last.Text = last.Text.TrimEnd();
         _current.Inlines.RemoveAll(i => i is DText { Text.Length: 0 });
         if (_current.Inlines.Count == 0 && _current.ListLabel == null && _current.Heading == 0)
         {
@@ -396,7 +399,7 @@ internal sealed partial class HtmlReader
         else p.Inlines.Add(new DText(text, ctx.Style, ctx.Link));
     }
 
-    [GeneratedRegex(@"\s+")]
+    [GeneratedRegex(@"[ \t\r\n\f]+")]
     private static partial Regex WhitespaceRegex();
 
     void Image(IElement e, Context ctx)
@@ -450,6 +453,11 @@ internal sealed partial class HtmlReader
                     EndParagraph();
                     List(nested, inner, nested.LocalName == "ol");
                 }
+                else if (child is IElement { LocalName: "p" } itemParagraph && _current == p && p.Inlines.Count == 0)
+                {
+                    Children(itemParagraph, ApplyStyle(itemParagraph, inner));
+                    EndParagraph();
+                }
                 else Node(child, inner);
             }
             EndParagraph();
@@ -474,7 +482,7 @@ internal sealed partial class HtmlReader
             var row = new DRow { Header = tr.Children.All(c => c.LocalName == "th") || tr.ParentElement?.LocalName == "thead" };
             foreach (var td in tr.Children.Where(c => c.LocalName is "td" or "th"))
             {
-                var cell = new DCell { ColSpan = int.TryParse(td.GetAttribute("colspan"), out var span) ? Math.Max(1, span) : 1 };
+                var cell = new DCell { ColSpan = int.TryParse(td.GetAttribute("colspan"), out var span) ? Math.Clamp(span, 1, 1000) : 1 };
                 if (td.GetAttribute("bgcolor") is { } bg && CssColor(bg) is { } shade) cell.Shading = shade;
                 var inner = new HtmlReader(cell.Blocks, _resolve, _maxImageWidth / Math.Max(1, tr.Children.Length), _notes);
                 inner.Children(td, ApplyStyle(td, ctx with { Indent = 0, Align = TextAlignment.Left }));

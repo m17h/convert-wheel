@@ -14,6 +14,8 @@ internal static class TextDecoding
     /// <summary>Honours a BOM, otherwise UTF-8 if the bytes are valid UTF-8, otherwise the Windows ANSI code page.</summary>
     public static string Decode(byte[] bytes)
     {
+        if (bytes.Length >= 4 && bytes[0] == 0xFF && bytes[1] == 0xFE && bytes[2] == 0 && bytes[3] == 0) return Encoding.UTF32.GetString(bytes, 4, bytes.Length - 4);
+        if (bytes.Length >= 4 && bytes[0] == 0 && bytes[1] == 0 && bytes[2] == 0xFE && bytes[3] == 0xFF) return new UTF32Encoding(true, false).GetString(bytes, 4, bytes.Length - 4);
         if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF) return Encoding.UTF8.GetString(bytes, 3, bytes.Length - 3);
         if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE) return Encoding.Unicode.GetString(bytes, 2, bytes.Length - 2);
         if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF) return Encoding.BigEndianUnicode.GetString(bytes, 2, bytes.Length - 2);

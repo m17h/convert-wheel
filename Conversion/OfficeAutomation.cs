@@ -65,7 +65,7 @@ internal static class OfficeAutomation
             // Hung on an invisible dialog or cancelled: end only the instance we started.
             lock (started)
                 foreach (var id in started)
-                    try { Process.GetProcessById(id).Kill(); } catch { }
+                    try { using var process = Process.GetProcessById(id); process.Kill(); } catch { }
             ct.ThrowIfCancellationRequested();
             throw new ConversionException($"Microsoft {app.Name} stopped responding.");
         }
@@ -75,15 +75,23 @@ internal static class OfficeAutomation
     static void Run(OfficeApp office, string input, string output, int format, HashSet<int> started)
     {
         object m = Type.Missing;
-        var before = Process.GetProcessesByName(office.Process).Select(p => p.Id).ToHashSet();
+        var before = new HashSet<int>();
+        foreach (var process in Process.GetProcessesByName(office.Process))
+            using (process) before.Add(process.Id);
         dynamic app = Activator.CreateInstance(Type.GetTypeFromProgID(office.ProgId)!)!;
-        var ours = Process.GetProcessesByName(office.Process).Where(p => !before.Contains(p.Id)).Select(p => p.Id).ToList();
+        var ours = new List<int>();
+        foreach (var process in Process.GetProcessesByName(office.Process))
+            using (process) if (!before.Contains(process.Id)) ours.Add(process.Id);
         lock (started) started.UnionWith(ours);
         bool weStarted = ours.Count > 0;
         dynamic? file = null, files = null;
 
         try
         {
+            // Word and Excel get hidden and silenced below, which must never happen to the user's own window.
+            // PowerPoint is single-instance and opens our file windowless without changing the app, so sharing is fine.
+            if (!weStarted && office.Name != "PowerPoint")
+                throw new ConversionException($"Microsoft {office.Name} is already in use; using another converter.");
             try { app.AutomationSecurity = 3; } catch { } // never run macros in the file
             switch (office.Name)
             {

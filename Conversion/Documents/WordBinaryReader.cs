@@ -195,27 +195,42 @@ internal sealed partial class WordBinaryReader
     void ReadPieces()
     {
         var (fc, lcb) = FcLcb(33);
+        if (fc < 0 || lcb < 0 || fc > _table.Length - lcb) throw new ConversionException("This Word document has a damaged piece table.");
         int i = fc, end = fc + lcb;
         while (i < end)
         {
             byte type = _table[i];
-            if (type == 1) { i += 3 + BinaryPrimitives.ReadInt16LittleEndian(_table.AsSpan(i + 1)); continue; }
+            if (type == 1)
+            {
+                if (end - i < 3) throw new ConversionException("This Word document has a damaged piece table.");
+                int length = BinaryPrimitives.ReadUInt16LittleEndian(_table.AsSpan(i + 1));
+                if (length > end - i - 3) throw new ConversionException("This Word document has a damaged piece table.");
+                i += 3 + length;
+                continue;
+            }
             if (type != 2) break;
+            if (end - i < 5) throw new ConversionException("This Word document has a damaged piece table.");
             int size = BinaryPrimitives.ReadInt32LittleEndian(_table.AsSpan(i + 1));
+            if (size < 4 || size > end - i - 5 || (size - 4) % 12 != 0) throw new ConversionException("This Word document has a damaged piece table.");
             int plc = i + 5, n = (size - 4) / 12;
             for (int k = 0; k < n; k++)
             {
                 int cpStart = BinaryPrimitives.ReadInt32LittleEndian(_table.AsSpan(plc + k * 4));
                 int cpEnd = BinaryPrimitives.ReadInt32LittleEndian(_table.AsSpan(plc + (k + 1) * 4));
                 uint fcValue = BinaryPrimitives.ReadUInt32LittleEndian(_table.AsSpan(plc + (n + 1) * 4 + k * 8 + 2));
+                if (cpStart < 0 || cpEnd < cpStart || k == 0 && cpStart != 0)
+                    throw new ConversionException("This Word document has a damaged piece table.");
                 if (_word6)
                 {
                     // Word 6 text is always 8-bit, and its file offsets carry no flags.
+                    if ((long)fcValue + cpEnd - cpStart > _word.Length) throw new ConversionException("This Word document has a damaged piece table.");
                     _pieces.Add((cpStart, cpEnd, (int)fcValue, true));
                     continue;
                 }
                 bool compressed = (fcValue & 0x40000000) != 0;
                 int pieceFc = (int)(fcValue & 0x3FFFFFFF);
+                if ((compressed ? pieceFc / 2L : pieceFc) + (long)(cpEnd - cpStart) * (compressed ? 1 : 2) > _word.Length)
+                    throw new ConversionException("This Word document has a damaged piece table.");
                 _pieces.Add((cpStart, cpEnd, compressed ? pieceFc / 2 : pieceFc, compressed));
             }
             break;
@@ -743,6 +758,8 @@ internal sealed partial class WordBinaryReader
 
     void ReadStory(int cpStart, int cpEnd, List<DBlock> into, Dictionary<int, (List<DBlock> blocks, bool endnote)> notes)
     {
+        if (cpStart < 0 || cpEnd < cpStart || cpEnd > _pieces.Select(p => p.cpEnd).DefaultIfEmpty(0).Max())
+            throw new ConversionException("This Word document has an invalid text range.");
         var paragraph = new DParagraph();
         var row = new List<DCell>();
         var cell = new DCell();
@@ -1091,7 +1108,10 @@ internal sealed partial class WordBinaryReader
             _file = file;
             if (file.Length < 512 || BinaryPrimitives.ReadUInt64LittleEndian(file) != 0xE11AB1A1E011CFD0)
                 throw new ConversionException("This isn't an Office 97–2003 file, or it is damaged.");
-            _sectorSize = 1 << BinaryPrimitives.ReadUInt16LittleEndian(file.AsSpan(0x1E));
+            int sectorShift = BinaryPrimitives.ReadUInt16LittleEndian(file.AsSpan(0x1E));
+            if (sectorShift is not (9 or 12) || BinaryPrimitives.ReadUInt16LittleEndian(file.AsSpan(0x20)) != 6)
+                throw new ConversionException("This Office file has an invalid sector size.");
+            _sectorSize = 1 << sectorShift;
             _miniCutoff = BinaryPrimitives.ReadInt32LittleEndian(file.AsSpan(0x38));
             int firstDir = BinaryPrimitives.ReadInt32LittleEndian(file.AsSpan(0x30));
             int firstMiniFat = BinaryPrimitives.ReadInt32LittleEndian(file.AsSpan(0x3C));
@@ -1103,10 +1123,11 @@ internal sealed partial class WordBinaryReader
                 int s = BinaryPrimitives.ReadInt32LittleEndian(file.AsSpan(0x4C + i * 4));
                 if (s >= 0) fatSectors.Add(s);
             }
-            for (int d = firstDifat, guard = 0; d >= 0 && guard < 10000; guard++)
+            var seenDifat = new HashSet<int>();
+            for (int d = firstDifat; d >= 0 && seenDifat.Add(d);)
             {
                 int at = Offset(d);
-                if (at + _sectorSize > file.Length) break;
+                if (at < 0) break;
                 for (int i = 0; i < _sectorSize / 4 - 1; i++)
                 {
                     int s = BinaryPrimitives.ReadInt32LittleEndian(file.AsSpan(at + i * 4));
@@ -1114,9 +1135,10 @@ internal sealed partial class WordBinaryReader
                 }
                 d = BinaryPrimitives.ReadInt32LittleEndian(file.AsSpan(at + _sectorSize - 4));
             }
-            foreach (var s in fatSectors)
+            foreach (var s in fatSectors.Distinct())
             {
                 int at = Offset(s);
+                if (at < 0) continue;
                 for (int i = 0; i < _sectorSize / 4 && at + i * 4 + 4 <= file.Length; i++)
                     _fat.Add(BinaryPrimitives.ReadInt32LittleEndian(file.AsSpan(at + i * 4)));
             }
@@ -1138,7 +1160,11 @@ internal sealed partial class WordBinaryReader
             _miniStream = root.size > 0 ? Chain(root.start, root.size) : [];
         }
 
-        int Offset(int sector) => (sector + 1) * _sectorSize;
+        int Offset(int sector)
+        {
+            long at = ((long)sector + 1) * _sectorSize;
+            return at >= 0 && at <= _file.Length - _sectorSize ? (int)at : -1;
+        }
 
         byte[] Chain(int start, long size)
         {
@@ -1147,7 +1173,7 @@ internal sealed partial class WordBinaryReader
             for (int s = start; s >= 0 && s < _fat.Count + 1 && seen.Add(s) && ms.Length < size; s = s < _fat.Count ? _fat[s] : -2)
             {
                 int at = Offset(s);
-                if (at >= _file.Length) break;
+                if (at < 0) break;
                 ms.Write(_file, at, (int)Math.Min(_sectorSize, Math.Min(_file.Length - at, size - ms.Length)));
             }
             return ms.ToArray();
@@ -1159,8 +1185,9 @@ internal sealed partial class WordBinaryReader
             var seen = new HashSet<int>();
             for (int s = start; s >= 0 && s < _miniFat.Count && seen.Add(s) && ms.Length < size; s = _miniFat[s])
             {
-                int at = s * 64;
-                if (at >= _miniStream.Length) break;
+                long offset = (long)s * 64;
+                if (offset >= _miniStream.Length) break;
+                int at = (int)offset;
                 ms.Write(_miniStream, at, (int)Math.Min(64, Math.Min(_miniStream.Length - at, size - ms.Length)));
             }
             return ms.ToArray();

@@ -122,7 +122,7 @@ internal sealed class PptxReader
             number++;
             if (Attr(id, R + "id") is not { } rid || !pres.Rels.TryGetValue(rid, out var rel)) continue;
             var slidePart = LoadPart(rel.Target);
-            if (slidePart == null || Attr(slidePart.Root, "show") == "0") continue; // hidden slides aren't exported
+            if (slidePart == null || Attr(slidePart.Root, "show") is "0" or "false") continue; // hidden slides aren't exported
             deck.Slides.Add(ReadSlide(slidePart, number, deck));
         }
         if (deck.Slides.Count == 0) throw new ConversionException("This presentation has no slides.");
@@ -150,8 +150,8 @@ internal sealed class PptxReader
         var slide = new Slide { Background = Background(ctx) };
 
         // Decorations from the master and layout (logos, bars) sit behind the slide's own shapes.
-        bool showMaster = Attr(slidePart.Root, "showMasterSp") != "0";
-        if (showMaster && master != null && Attr(layout?.Root, "showMasterSp") != "0")
+        bool showMaster = Attr(slidePart.Root, "showMasterSp") is not ("0" or "false");
+        if (showMaster && master != null && Attr(layout?.Root, "showMasterSp") is not ("0" or "false"))
             ReadTree(Tree(master), Inherit(ctx, master), null, slide.Shapes, placeholders: false);
         if (showMaster && layout != null)
             ReadTree(Tree(layout), Inherit(ctx, layout), null, slide.Shapes, placeholders: false);

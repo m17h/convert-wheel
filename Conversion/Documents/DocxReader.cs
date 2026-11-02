@@ -325,6 +325,7 @@ internal sealed class DocxReader
             numId = Val(numPr.Element(W + "numId")) ?? numId;
             ilvl = Int(Val(numPr.Element(W + "ilvl"))) ?? ilvl;
         }
+        ilvl = Math.Clamp(ilvl, 0, 8);
         Level? level = null;
         if (numId != null && numId != "0" && _numbering.TryGetValue(numId, out var instance))
         {
@@ -506,7 +507,7 @@ internal sealed class DocxReader
             {
                 bool endnote = n == W + "endnoteReference";
                 var notes = endnote ? _endnotes : _footnotes;
-                if (Attr(el, "id") is { } id && notes.TryGetValue(id, out var body))
+                if (_currentNote == null && Attr(el, "id") is { } id && notes.TryGetValue(id, out var body))
                 {
                     var note = new DNote(endnote ? ++_endnoteNumber : ++_footnoteNumber, endnote, style);
                     var saved = _currentNote;

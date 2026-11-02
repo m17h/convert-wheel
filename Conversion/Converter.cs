@@ -25,10 +25,11 @@ public sealed partial class Converter(AppSettings settings)
     public async Task<string> ConvertAsync(
         ConversionPlan plan, FormatInfo target, Func<Task<string>> ensureFfmpeg, IProgress<double?> progress, CancellationToken ct)
     {
+        ct.ThrowIfCancellationRequested();
         var output = ReserveOutputPath(plan, target.Ext);
+        var result = output;
         try
         {
-            var result = output;
             switch (plan.SourceKind)
             {
                 case FormatKind.Archive:
@@ -74,12 +75,15 @@ public sealed partial class Converter(AppSettings settings)
                     await FfmpegAsync(await ensureFfmpeg(), plan, target, output, progress, ct);
                     break;
             }
+            ct.ThrowIfCancellationRequested();
             progress.Report(1);
             return result;
         }
         catch
         {
             TryDelete(output);
+            if (result != output)
+                try { Directory.Delete(result, recursive: true); } catch { }
             throw;
         }
     }
@@ -123,7 +127,7 @@ public sealed partial class Converter(AppSettings settings)
         if (Environment.GetEnvironmentVariable("CONVERTWHEEL_MEDIA_ENGINE") == "ffmpeg") return false;
         try
         {
-            if (plan.SourceKind == FormatKind.Image && ImageConverter.TryConvert(plan.SourcePath, output, target.Ext)) return true;
+            if (plan.SourceKind == FormatKind.Image && ImageConverter.TryConvert(plan.SourcePath, output, target.Ext, ct)) return true;
             if (plan.SourceKind is FormatKind.Audio or FormatKind.Video && target.Kind == FormatKind.Audio && Media.AudioEngine.CanEncode(target.Ext))
             {
                 Media.AudioEngine.Convert(plan.SourcePath, output, target.Ext, progress, ct);
@@ -403,7 +407,7 @@ public sealed partial class Converter(AppSettings settings)
         try
         {
             // A private profile avoids clashing with a LibreOffice window the user already has open.
-            var profile = new Uri(Path.Combine(Log.DataDir, "libreoffice-profile")).AbsoluteUri;
+            var profile = new Uri(Path.Combine(temp, "profile")).AbsoluteUri;
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
             timeout.CancelAfter(TimeSpan.FromMinutes(5));
             var (exit, stderr) = await RunAsync(soffice,
@@ -455,6 +459,7 @@ public sealed partial class Converter(AppSettings settings)
         catch (OperationCanceledException)
         {
             try { process.Kill(entireProcessTree: true); } catch { }
+            try { await process.WaitForExitAsync(CancellationToken.None); } catch { }
             throw;
         }
         process.WaitForExit(); // flush redirected output

@@ -59,7 +59,7 @@ internal static class DataFiles
         switch (ext)
         {
             case "json":
-                File.WriteAllText(output, ToJson(tree)!.ToJsonString(new JsonSerializerOptions { WriteIndented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping }), new UTF8Encoding(false));
+                File.WriteAllText(output, ToJson(tree)?.ToJsonString(new JsonSerializerOptions { WriteIndented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping }) ?? "null", new UTF8Encoding(false));
                 break;
             case "yaml":
                 var yaml = new SerializerBuilder().WithQuotingNecessaryStrings().Build().Serialize(ToPlain(tree));
@@ -119,14 +119,26 @@ internal static class DataFiles
         return docs.Count switch { 0 => null, 1 => docs[0], _ => docs };
     }
 
-    static object? FromYaml(YamlNode node) => node switch
+    static object? FromYaml(YamlNode node) => FromYaml(node, new HashSet<YamlNode>(ReferenceEqualityComparer.Instance));
+
+    static object? FromYaml(YamlNode node, HashSet<YamlNode> ancestors)
     {
-        YamlMappingNode m => Collect(m.Children.Select(kv => new KeyValuePair<string, object?>(((YamlScalarNode)kv.Key).Value ?? "", FromYaml(kv.Value)))),
-        YamlSequenceNode s => s.Children.Select(FromYaml).ToList(),
-        YamlScalarNode s when s.Style is YamlDotNet.Core.ScalarStyle.Plain => Infer(s.Value),
-        YamlScalarNode s => s.Value,
-        _ => null,
-    };
+        if (ancestors.Count >= 128 || !ancestors.Add(node))
+            throw new ConversionException("This YAML contains a cycle or is nested too deeply.");
+        try
+        {
+            return node switch
+            {
+                YamlMappingNode m => Collect(m.Children.Select(kv => new KeyValuePair<string, object?>(
+                    kv.Key is YamlScalarNode key ? key.Value ?? "" : throw new ConversionException("YAML table keys must be scalar values."), FromYaml(kv.Value, ancestors)))),
+                YamlSequenceNode s => s.Children.Select(n => FromYaml(n, ancestors)).ToList(),
+                YamlScalarNode s when s.Style is YamlDotNet.Core.ScalarStyle.Plain => Infer(s.Value),
+                YamlScalarNode s => s.Value,
+                _ => null,
+            };
+        }
+        finally { ancestors.Remove(node); }
+    }
 
     /// <summary>Unquoted scalars: numbers, booleans and null become typed values.</summary>
     static object? Infer(string? value)

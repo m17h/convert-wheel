@@ -421,7 +421,7 @@ internal sealed class OdpWriter
     static XElement TextProperties(TextStyle s, bool bold)
     {
         var props = new XElement(St + "text-properties", new XAttribute(Fo + "font-size", Len(s.Size ?? 18)));
-        if (s.Font is { Length: > 0 } font) props.Add(new XAttribute(Fo + "font-family", font));
+        if (s.Font is { Length: > 0 } font) props.Add(new XAttribute(Fo + "font-family", SafeXml.Text(font)));
         if (s.Color is { } c) props.Add(new XAttribute(Fo + "color", Hex(c)));
         if (s.Bold || bold) props.Add(new XAttribute(Fo + "font-weight", "bold"));
         if (s.Italic) props.Add(new XAttribute(Fo + "font-style", "italic"));
@@ -437,6 +437,7 @@ internal sealed class OdpWriter
     /// <summary>ODF collapses runs of spaces and ignores tabs and newlines, so those become elements.</summary>
     static void AddText(XElement span, string text)
     {
+        text = SafeXml.Text(text);
         var sb = new StringBuilder();
         void Flush()
         {
@@ -521,6 +522,7 @@ internal sealed class OdpWriter
 
     void Save(string path, XElement root)
     {
+        SafeXml.Clean(root);
         var entry = _zip.CreateEntry(path, CompressionLevel.Optimal);
         using var stream = entry.Open();
         // No indentation: ODF treats whitespace inside paragraphs as text.

@@ -325,7 +325,7 @@ internal sealed class PptxWriter
     }
 
     /// <summary>Characters XML can't hold (control codes) are dropped.</summary>
-    static string Clean(string text) => new(text.Where(ch => ch == '\t' || ch >= ' ').ToArray());
+    static string Clean(string text) => SafeXml.Text(text);
 
     // ------------------------------------------------------------------ shapes, fills and lines
 
@@ -649,6 +649,7 @@ internal sealed class PptxWriter
 
     void Save(string path, XElement root)
     {
+        SafeXml.Clean(root);
         var entry = _zip.CreateEntry(path, CompressionLevel.Optimal);
         using var stream = entry.Open();
         using var writer = System.Xml.XmlWriter.Create(stream, new System.Xml.XmlWriterSettings { Encoding = new System.Text.UTF8Encoding(false) });

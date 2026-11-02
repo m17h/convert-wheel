@@ -34,14 +34,15 @@ internal static class Spreadsheets
     static Sheet ReadCsv(string path)
     {
         var text = TextDecoding.Decode(File.ReadAllBytes(path));
-        char delimiter = DetectDelimiter(text);
+        char delimiter = Path.GetExtension(path).Equals(".tsv", StringComparison.OrdinalIgnoreCase) ? '\t' : DetectDelimiter(text);
         var rows = new List<object?[]>();
         var row = new List<object?>();
         var field = new StringBuilder();
-        bool quoted = false;
+        bool quoted = false, rowStarted = false;
 
         for (int i = 0; i < text.Length; i++)
         {
+            rowStarted = true;
             char c = text[i];
             if (quoted)
             {
@@ -57,10 +58,11 @@ internal static class Spreadsheets
                 EndField();
                 rows.Add([.. row]);
                 row.Clear();
+                rowStarted = false;
             }
             else field.Append(c);
         }
-        if (field.Length > 0 || row.Count > 0)
+        if (rowStarted)
         {
             EndField();
             rows.Add([.. row]);
@@ -206,8 +208,9 @@ internal static class Spreadsheets
         foreach (var node in p.DescendantNodes())
         {
             if (node is XText t) sb.Append(t.Value);
-            else if (node is XElement { Name.LocalName: "s" } s) sb.Append(' ', (int?)s.Attribute(Text + "c") ?? 1);
+            else if (node is XElement { Name.LocalName: "s" } s) sb.Append(' ', Units.OdfSpaceCount((string?)s.Attribute(Text + "c")));
             else if (node is XElement { Name.LocalName: "tab" }) sb.Append('\t');
+            else if (node is XElement { Name.LocalName: "line-break" }) sb.Append('\n');
         }
         return sb.ToString();
     }
@@ -391,6 +394,7 @@ internal static class Spreadsheets
 
         static void Put(ZipArchive zip, string name, XElement root)
         {
+            SafeXml.Clean(root);
             using var stream = zip.CreateEntry(name, CompressionLevel.Optimal).Open();
             new XDocument(new XDeclaration("1.0", "UTF-8", "yes"), root).Save(stream, SaveOptions.DisableFormatting);
         }
@@ -446,7 +450,7 @@ internal static class Spreadsheets
                             break;
                         default:
                             tc.Add(new XAttribute(Office + "value-type", "string"),
-                                Display(v).Split('\n').Select(line => new XElement(Text + "p", XmlSafe(line))));
+                                Display(v).Replace("\r\n", "\n").Replace('\r', '\n').Split('\n').Select(line => new XElement(Text + "p", OdtWriter.TextNodes(line))));
                             break;
                     }
                     tr.Add(tc);
@@ -587,7 +591,7 @@ internal static class Spreadsheets
         var names = new List<string>();
         foreach (var sheet in sheets)
         {
-            var name = new string(sheet.Name.Where(c => !invalid.Contains(c)).ToArray()).Trim();
+            var name = new string(SafeXml.Text(sheet.Name).Where(c => !invalid.Contains(c)).ToArray()).Trim().Trim('\'');
             if (name.Length == 0) name = $"Sheet{names.Count + 1}";
             if (name.Length > maxLength) name = name[..maxLength];
             var candidate = name;
@@ -608,5 +612,5 @@ internal static class Spreadsheets
         return name;
     }
 
-    static string XmlSafe(string s) => new(s.Where(c => c >= 0x20 || c is '\t' or '\n' or '\r').ToArray());
+    static string XmlSafe(string s) => SafeXml.Text(s);
 }

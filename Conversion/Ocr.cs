@@ -49,21 +49,21 @@ internal static unsafe class Ocr
             var engine = Engine();
             if (engine == IntPtr.Zero) throw new ConversionException(_unavailable ?? "Windows text recognition isn't available on this PC.");
 
-            // The engine has a size limit, and reads small print better when it is enlarged a little.
-            double scale = 1;
-            int longest = Math.Max(image.PixelWidth, image.PixelHeight);
-            if (longest > _maxDimension) scale = (double)_maxDimension / longest;
-            else if (longest < 1400) scale = Math.Min(3, 1400.0 / longest);
-            var source = scale == 1 ? image : new TransformedBitmap(image, new ScaleTransform(scale, scale));
-            var bgra = new FormatConvertedBitmap(source, PixelFormats.Bgra32, null, 0);
-            int w = bgra.PixelWidth, h = bgra.PixelHeight;
-            var pixels = new byte[w * h * 4];
-            bgra.CopyPixels(pixels, w * 4, 0);
-
             // A fresh engine per call: conversions run on short-lived threads, and COM objects belong to their apartment.
             IntPtr buffer = 0, bitmap = 0, operation = 0, result = 0, lines = 0;
             try
             {
+                // The engine has a size limit, and reads small print better when it is enlarged a little.
+                double scale = 1;
+                int longest = Math.Max(image.PixelWidth, image.PixelHeight);
+                if (longest > _maxDimension) scale = (double)_maxDimension / longest;
+                else if (longest < 1400) scale = Math.Min(3, 1400.0 / longest);
+                var source = scale == 1 ? image : new TransformedBitmap(image, new ScaleTransform(scale, scale));
+                var bgra = new FormatConvertedBitmap(source, PixelFormats.Bgra32, null, 0);
+                int w = bgra.PixelWidth, h = bgra.PixelHeight;
+                var pixels = new byte[w * h * 4];
+                bgra.CopyPixels(pixels, w * 4, 0);
+
                 var bufferStatics = Factory("Windows.Security.Cryptography.CryptographicBuffer", IidBufferStatics);
                 try
                 {
@@ -148,8 +148,11 @@ internal static unsafe class Ocr
                     try
                     {
                         var all = Vector(languages);
-                        if (all.Count > 0) Check(((delegate* unmanaged[Stdcall]<IntPtr, IntPtr, IntPtr*, int>)Slot(statics, 9))(statics, all[0], &engine));
-                        foreach (var language in all) Marshal.Release(language);
+                        try
+                        {
+                            if (all.Count > 0) Check(((delegate* unmanaged[Stdcall]<IntPtr, IntPtr, IntPtr*, int>)Slot(statics, 9))(statics, all[0], &engine));
+                        }
+                        finally { foreach (var language in all) Marshal.Release(language); }
                     }
                     finally { Marshal.Release(languages); }
                 }
@@ -196,13 +199,21 @@ internal static unsafe class Ocr
         uint size;
         Check(((delegate* unmanaged[Stdcall]<IntPtr, uint*, int>)Slot(view, 7))(view, &size));
         var items = new List<IntPtr>((int)size);
-        for (uint i = 0; i < size; i++)
+        try
         {
-            IntPtr item;
-            Check(((delegate* unmanaged[Stdcall]<IntPtr, uint, IntPtr*, int>)Slot(view, 6))(view, i, &item));
-            items.Add(item);
+            for (uint i = 0; i < size; i++)
+            {
+                IntPtr item;
+                Check(((delegate* unmanaged[Stdcall]<IntPtr, uint, IntPtr*, int>)Slot(view, 6))(view, i, &item));
+                items.Add(item);
+            }
+            return items;
         }
-        return items;
+        catch
+        {
+            foreach (var item in items) Marshal.Release(item);
+            throw;
+        }
     }
 
     static string GetString(IntPtr obj, int slot)

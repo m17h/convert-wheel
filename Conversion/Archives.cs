@@ -37,12 +37,14 @@ internal static class Archives
             if (isDirectory)
             {
                 writer.WriteDirectory(name, modified);
+                files++;
                 continue;
             }
             // Tar needs each entry's size up front, so buffer through a temporary file.
             using var source = open();
             using var buffer = new FileStream(Path.GetTempFileName(), FileMode.Open, FileAccess.ReadWrite, FileShare.None, 1 << 16, FileOptions.DeleteOnClose);
-            source.CopyTo(buffer);
+            source.CopyToAsync(buffer, ct).GetAwaiter().GetResult();
+            ct.ThrowIfCancellationRequested();
             done += buffer.Length;
             buffer.Position = 0;
             writer.Write(name, buffer, modified);
@@ -118,10 +120,14 @@ internal static class Archives
     static Stream Decompress(string input)
     {
         var file = File.OpenRead(input);
-        var lower = input.ToLowerInvariant();
-        if (lower.EndsWith(".gz")) return new GZipStream(file, CompressionMode.Decompress);
-        if (lower.EndsWith(".bz2")) return BZip2Stream.Create(file, SharpCompress.Compressors.CompressionMode.Decompress, false);
-        return new XZStream(file);
+        try
+        {
+            var lower = input.ToLowerInvariant();
+            if (lower.EndsWith(".gz")) return new GZipStream(file, CompressionMode.Decompress);
+            if (lower.EndsWith(".bz2")) return BZip2Stream.Create(file, SharpCompress.Compressors.CompressionMode.Decompress, false);
+            return new XZStream(file);
+        }
+        catch { file.Dispose(); throw; }
     }
 
     /// <summary>Whether a .gz/.bz2/.xz holds a tar (names like backup.tgz renamed to .gz).</summary>

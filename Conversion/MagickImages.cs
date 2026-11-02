@@ -36,7 +36,7 @@ internal static class MagickImages
             if (f.Read(head, 0, head.Length) < head.Length) return false;
             return head.AsSpan(0, 4).SequenceEqual("RIFF"u8) && head.AsSpan(8, 8).SequenceEqual("WEBPVP8X"u8) && (head[20] & 0x02) != 0;
         }
-        catch (IOException) { return false; }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return false; }
     }
 
     /// <summary>Every frame of an animated WebP, composited onto the full canvas.</summary>
@@ -122,9 +122,9 @@ internal static class MagickImages
 /// <summary>Pictures to PDF: one page each, fitted onto A4/Letter with a margin.</summary>
 internal static class ImagePdf
 {
-    public static void Write(List<BitmapSource> pages, string output, string title)
+    public static void Write(List<BitmapSource> pages, string output, string title, CancellationToken ct)
     {
-        var pdf = new PdfDocument();
+        using var pdf = new PdfDocument();
         pdf.Info.Title = title;
         pdf.Info.Creator = "Convert Wheel";
         var paper = Documents.DDocument.DefaultPage;
@@ -132,6 +132,7 @@ internal static class ImagePdf
 
         foreach (var bitmap in pages)
         {
+            ct.ThrowIfCancellationRequested();
             bool landscape = bitmap.PixelWidth > bitmap.PixelHeight;
             var page = pdf.AddPage();
             page.Width = XUnit.FromPoint(landscape ? paper.Height : paper.Width);
@@ -144,10 +145,11 @@ internal static class ImagePdf
             h *= scale;
             using var gfx = XGraphics.FromPdfPage(page);
             using var stream = Encode(bitmap);
-            var image = XImage.FromStream(stream);
+            using var image = XImage.FromStream(stream);
             gfx.DrawImage(image, (page.Width.Point - w) / 2, (page.Height.Point - h) / 2, w, h);
             AddTextLayer(gfx, bitmap, (page.Width.Point - w) / 2, (page.Height.Point - h) / 2, w / bitmap.PixelWidth);
         }
+        ct.ThrowIfCancellationRequested();
         pdf.Save(output);
     }
 

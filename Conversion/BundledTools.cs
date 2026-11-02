@@ -73,22 +73,38 @@ internal static class Outputs
     /// </summary>
     public static string Pages(string reserved, int count, Action<int, string> write)
     {
-        if (count <= 1)
+        if (count <= 0) throw new ConversionException("This file has no pages to convert.");
+        if (count == 1)
         {
             write(0, reserved);
             return reserved;
         }
-        File.Delete(reserved);
         var ext = Path.GetExtension(reserved);
         var stem = Path.GetFileNameWithoutExtension(reserved);
         var parent = Path.GetDirectoryName(reserved)!;
-        var folder = Path.Combine(parent, $"{stem} ({ext.TrimStart('.').ToUpperInvariant()})");
-        for (int i = 2; Directory.Exists(folder) || File.Exists(folder); i++)
-            folder = Path.Combine(parent, $"{stem} ({ext.TrimStart('.').ToUpperInvariant()}) ({i})");
-        Directory.CreateDirectory(folder);
-        int digits = Math.Max(2, count.ToString().Length);
-        for (int i = 0; i < count; i++)
-            write(i, Path.Combine(folder, $"{stem}-{(i + 1).ToString().PadLeft(digits, '0')}{ext}"));
-        return folder;
+        var staging = Path.Combine(parent, $".cw-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(staging);
+        try
+        {
+            int digits = Math.Max(2, count.ToString().Length);
+            for (int i = 0; i < count; i++)
+                write(i, Path.Combine(staging, $"{stem}-{(i + 1).ToString().PadLeft(digits, '0')}{ext}"));
+            File.Delete(reserved);
+            for (int i = 1; ; i++)
+            {
+                var name = $"{stem} ({ext.TrimStart('.').ToUpperInvariant()})";
+                var folder = Path.Combine(parent, i == 1 ? name : $"{name} ({i})");
+                try
+                {
+                    Directory.Move(staging, folder);
+                    return folder;
+                }
+                catch (IOException) when (Directory.Exists(staging) && (Directory.Exists(folder) || File.Exists(folder))) { }
+            }
+        }
+        finally
+        {
+            try { if (Directory.Exists(staging)) Directory.Delete(staging, recursive: true); } catch { }
+        }
     }
 }

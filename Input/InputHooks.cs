@@ -26,6 +26,7 @@ internal sealed class InputHooks : IDisposable
     readonly bool[] _swallowedKeyUps = new bool[256];
     readonly bool[] _swallowedMouseUps = new bool[4];
     uint _threadId;
+    volatile bool _stopping;
     nint _keyboardHook, _mouseHook;
 
     public InputHooks(Func<HookEvent, bool> filter)
@@ -41,6 +42,7 @@ internal sealed class InputHooks : IDisposable
     void Run()
     {
         _threadId = Win32.GetCurrentThreadId();
+        Win32.PeekMessage(out _, 0, 0, 0, 0); // create the queue before Dispose can post WM_QUIT
         var module = Win32.GetModuleHandle(null);
         _keyboardHook = Win32.SetWindowsHookEx(Win32.WH_KEYBOARD_LL, _keyboardProc, module, 0);
         _mouseHook = Win32.SetWindowsHookEx(Win32.WH_MOUSE_LL, _mouseProc, module, 0);
@@ -48,7 +50,7 @@ internal sealed class InputHooks : IDisposable
             Log.Write($"Failed to install input hooks (error {Marshal.GetLastWin32Error()}).");
         _ready.Set();
 
-        while (Win32.GetMessage(out var msg, 0, 0, 0) > 0)
+        while (!_stopping && Win32.GetMessage(out var msg, 0, 0, 0) > 0)
         {
             Win32.TranslateMessage(ref msg);
             Win32.DispatchMessage(ref msg);
@@ -75,7 +77,9 @@ internal sealed class InputHooks : IDisposable
         {
             if (msg is Win32.WM_KEYDOWN or Win32.WM_SYSKEYDOWN)
             {
-                if (!_filter(new HookEvent(HookEventKind.KeyDown, vk, default))) return false;
+                bool swallow = _filter(new HookEvent(HookEventKind.KeyDown, vk, default));
+                if (_swallowedKeyUps[vk]) return true;
+                if (!swallow) return false;
                 _swallowedKeyUps[vk] = true;
                 return true;
             }
@@ -176,6 +180,8 @@ internal sealed class InputHooks : IDisposable
 
     public void Dispose()
     {
+        _stopping = true;
         if (_threadId != 0) Win32.PostThreadMessage(_threadId, Win32.WM_QUIT, 0, 0);
+        if (_thread.Join(TimeSpan.FromSeconds(1))) _ready.Dispose();
     }
 }
