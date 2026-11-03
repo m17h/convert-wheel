@@ -94,6 +94,7 @@ internal static class Win32
     [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT pt);
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] public static extern nint WindowFromPoint(POINT pt);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(nint hwnd, out uint processId);
     [DllImport("user32.dll")] public static extern nint GetAncestor(nint hwnd, uint flags);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(nint hwnd, StringBuilder sb, int max);
     [DllImport("user32.dll")] public static extern nint MonitorFromPoint(POINT pt, uint flags);

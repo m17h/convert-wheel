@@ -18,6 +18,7 @@ internal sealed class OdpWriter
 
     readonly ZipArchive _zip;
     readonly Deck _deck;
+    readonly CancellationToken _ct;
     readonly List<XElement> _autoStyles = [];
     readonly List<XElement> _commonStyles = [];
     readonly Dictionary<string, string> _styleCache = [];
@@ -29,13 +30,13 @@ internal sealed class OdpWriter
     readonly List<XElement> _masters = [];
     readonly List<XElement> _masterStyles = [];
 
-    OdpWriter(ZipArchive zip, Deck deck) => (_zip, _deck) = (zip, deck);
+    OdpWriter(ZipArchive zip, Deck deck, CancellationToken ct) => (_zip, _deck, _ct) = (zip, deck, ct);
 
-    public static void Write(Deck deck, string path)
+    public static void Write(Deck deck, string path, CancellationToken ct = default)
     {
         using var file = File.Create(path);
         using var zip = new ZipArchive(file, ZipArchiveMode.Create);
-        new OdpWriter(zip, deck).WriteAll();
+        new OdpWriter(zip, deck, ct).WriteAll();
     }
 
     void WriteAll()
@@ -48,7 +49,11 @@ internal sealed class OdpWriter
             new XAttribute(Svg + "viewBox", "0 0 20 30"), new XAttribute(Svg + "d", "M10 0l-10 30h20z")));
 
         var presentation = new XElement(Office + "presentation");
-        for (int i = 0; i < _deck.Slides.Count; i++) presentation.Add(Page(_deck.Slides[i], i));
+        for (int i = 0; i < _deck.Slides.Count; i++)
+        {
+            _ct.ThrowIfCancellationRequested();
+            presentation.Add(Page(_deck.Slides[i], i));
+        }
 
         Save("content.xml", new XElement(Office + "document-content", Namespaces(), new XAttribute(Office + "version", "1.3"),
             new XElement(Office + "automatic-styles", _autoStyles),

@@ -283,7 +283,7 @@ internal sealed class TriggerController : IDisposable
         string? path = null;
         try
         {
-            path = await _resolver.ResolveFileAsync(point).WaitAsync(TimeSpan.FromSeconds(3));
+            path = await _resolver.ResolveFileAsync(point);
         }
         catch (Exception ex)
         {

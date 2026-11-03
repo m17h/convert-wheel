@@ -30,7 +30,7 @@ internal static class BundledTools
     {
         if (!HasFfmpeg) return null;
         var exe = Path.Combine(FfmpegDir, "ffmpeg.exe");
-        return File.Exists(Path.Combine(FfmpegDir, ".complete")) ? exe : null;
+        return File.Exists(exe) && File.Exists(Path.Combine(FfmpegDir, ".complete")) ? exe : null;
     }
 
     /// <summary>Unpacks the bundled FFmpeg if needed (a few seconds, once) and returns ffmpeg.exe.</summary>
@@ -39,27 +39,41 @@ internal static class BundledTools
         lock (Gate)
         {
             if (ReadyFfmpeg() is { } ready) return ready;
-            var target = FfmpegDir;
-            var staging = target + ".unpacking";
-            if (Directory.Exists(staging)) Directory.Delete(staging, recursive: true);
-            Directory.CreateDirectory(staging);
-
-            using (var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream(FfmpegResource)
-                         ?? throw new ConversionException("This build doesn't include the video tools."))
-            using (var reader = ReaderFactory.OpenReader(stream, new ReaderOptions()))
+            using var mutex = new Mutex(false, @"Local\ConvertWheel-ffmpeg-unpack");
+            try { mutex.WaitOne(); }
+            catch (AbandonedMutexException) { } // Ownership passes to us after a crashed unpacker.
+            try
             {
-                var options = new ExtractionOptions { ExtractFullPath = false, Overwrite = true };
-                while (reader.MoveToNextEntry())
-                    if (!reader.Entry.IsDirectory) reader.WriteEntryToDirectory(staging, options);
-            }
-            File.WriteAllText(Path.Combine(staging, ".complete"), DateTime.UtcNow.ToString("O"));
-            if (Directory.Exists(target)) Directory.Delete(target, recursive: true);
-            Directory.Move(staging, target);
+                if (ReadyFfmpeg() is { } unpacked) return unpacked;
+                var target = FfmpegDir;
+                var staging = target + $".{Environment.ProcessId}-{Guid.NewGuid():N}.unpacking";
+                Directory.CreateDirectory(staging);
+                try
+                {
+                    using (var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream(FfmpegResource)
+                                 ?? throw new ConversionException("This build doesn't include the video tools."))
+                    using (var reader = ReaderFactory.OpenReader(stream, new ReaderOptions()))
+                    {
+                        var options = new ExtractionOptions { ExtractFullPath = false, Overwrite = true };
+                        while (reader.MoveToNextEntry())
+                            if (!reader.Entry.IsDirectory) reader.WriteEntryToDirectory(staging, options);
+                    }
+                    File.WriteAllText(Path.Combine(staging, ".complete"), DateTime.UtcNow.ToString("O"));
+                    if (ReadyFfmpeg() is { } completed) return completed;
+                    if (Directory.Exists(target)) Directory.Delete(target, recursive: true);
+                    Directory.Move(staging, target);
 
-            // Remove copies left by older versions.
-            foreach (var old in Directory.EnumerateDirectories(ToolLocator.ToolsDir, "ffmpeg-*").Where(d => d != target))
-                try { Directory.Delete(old, recursive: true); } catch { }
-            return Path.Combine(target, "ffmpeg.exe");
+                    // Remove copies left by older versions.
+                    foreach (var old in Directory.EnumerateDirectories(ToolLocator.ToolsDir, "ffmpeg-*").Where(d => d != target))
+                        try { Directory.Delete(old, recursive: true); } catch { }
+                    return Path.Combine(target, "ffmpeg.exe");
+                }
+                finally
+                {
+                    try { if (Directory.Exists(staging)) Directory.Delete(staging, recursive: true); } catch { }
+                }
+            }
+            finally { mutex.ReleaseMutex(); }
         }
     }
 }

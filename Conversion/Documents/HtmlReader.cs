@@ -73,22 +73,22 @@ internal sealed partial class HtmlReader
         {
             var entry = zip.GetEntry(name) ?? zip.Entries.FirstOrDefault(e => e.FullName.Equals(name, StringComparison.OrdinalIgnoreCase));
             if (entry == null) return null;
-            using var r = new StreamReader(entry.Open());
+            using var r = new StreamReader(PackageResources.Open(entry));
             return r.ReadToEnd();
         }
         byte[]? Bytes(string name)
         {
             var entry = zip.GetEntry(name) ?? zip.Entries.FirstOrDefault(e => e.FullName.Equals(name, StringComparison.OrdinalIgnoreCase));
             if (entry == null) return null;
-            using var s = entry.Open();
+            using var s = PackageResources.Open(entry, media: true);
             using var ms = new MemoryStream();
             s.CopyTo(ms);
             return ms.ToArray();
         }
 
-        var container = XDocument.Parse(Text("META-INF/container.xml") ?? throw new ConversionException("This EPUB has no table of contents."));
+        var container = PackageResources.ParseXml(Text("META-INF/container.xml") ?? throw new ConversionException("This EPUB has no table of contents."));
         var opfPath = container.Descendants().First(e => e.Name.LocalName == "rootfile").Attribute("full-path")!.Value;
-        var opf = XDocument.Parse(Text(opfPath) ?? throw new ConversionException("This EPUB is damaged."));
+        var opf = PackageResources.ParseXml(Text(opfPath) ?? throw new ConversionException("This EPUB is damaged."));
         var opfDir = opfPath.Contains('/') ? opfPath[..opfPath.LastIndexOf('/')] : "";
         var manifest = opf.Descendants().Where(e => e.Name.LocalName == "item")
             .ToDictionary(e => (string)e.Attribute("id")!, e => (string)e.Attribute("href")!);

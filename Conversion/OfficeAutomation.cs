@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using ConvertWheel.Native;
 
 namespace ConvertWheel.Conversion;
 
@@ -10,7 +11,10 @@ namespace ConvertWheel.Conversion;
 /// </summary>
 internal static class OfficeAutomation
 {
-    sealed record OfficeApp(string ProgId, string Process, string Name, HashSet<string> Inputs, Dictionary<string, int> Outputs);
+    sealed record OfficeApp(string ProgId, string Process, string Name, HashSet<string> Inputs, Dictionary<string, int> Outputs)
+    {
+        public readonly SemaphoreSlim CreationGate = new(1, 1);
+    }
 
     static readonly OfficeApp Word = new("Word.Application", "WINWORD", "Word",
         ["doc", "docx", "odt", "rtf", "txt"],
@@ -40,13 +44,19 @@ internal static class OfficeAutomation
     public static async Task ConvertAsync(ConversionPlan plan, FormatInfo target, string output, CancellationToken ct)
     {
         var app = AppFor(plan, target) ?? throw new ConversionException("Microsoft Office can't do this conversion.");
-        var started = new HashSet<int>();
+        ct.ThrowIfCancellationRequested();
+        using var stop = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var token = stop.Token;
+        var started = new List<Process>();
         var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        // A timed-out caller no longer awaits the STA's eventual COM failure.
+        _ = tcs.Task.ContinueWith(t => { _ = t.Exception; }, CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
         var thread = new Thread(() =>
         {
             try
             {
-                Run(app, plan.SourcePath, output, app.Outputs[target.Ext], started);
+                Run(app, plan.SourcePath, output, app.Outputs[target.Ext], started, token);
                 tcs.TrySetResult();
             }
             catch (Exception ex)
@@ -59,35 +69,99 @@ internal static class OfficeAutomation
         thread.Start();
 
         // PDF export goes through Office's print pipeline, which can stall for minutes on some PCs.
-        var timeout = Task.Delay(target.Ext == "pdf" ? TimeSpan.FromSeconds(90) : TimeSpan.FromMinutes(3), ct);
-        if (await Task.WhenAny(tcs.Task, timeout) != tcs.Task)
+        try
+        {
+            await tcs.Task.WaitAsync(target.Ext == "pdf" ? TimeSpan.FromSeconds(90) : TimeSpan.FromMinutes(3), ct);
+        }
+        catch (Exception ex) when (ex is TimeoutException or OperationCanceledException)
         {
             // Hung on an invisible dialog or cancelled: end only the instance we started.
+            stop.Cancel();
             lock (started)
-                foreach (var id in started)
-                    try { using var process = Process.GetProcessById(id); process.Kill(); } catch { }
+                foreach (var process in started) Kill(process);
             ct.ThrowIfCancellationRequested();
             throw new ConversionException($"Microsoft {app.Name} stopped responding.");
         }
-        await tcs.Task;
     }
 
-    static void Run(OfficeApp office, string input, string output, int format, HashSet<int> started)
+    static void Kill(Process process)
+    {
+        try { process.Kill(); } catch { }
+    }
+
+    static void Release(object? value)
+    {
+        if (value != null)
+            try { Marshal.FinalReleaseComObject(value); } catch { }
+    }
+
+    static HashSet<int> ProcessIds(OfficeApp office)
+    {
+        var ids = new HashSet<int>();
+        foreach (var process in Process.GetProcessesByName(office.Process))
+            using (process) ids.Add(process.Id);
+        return ids;
+    }
+
+    static int? InstanceProcessId(OfficeApp office, dynamic app)
+    {
+        dynamic? documents = null, window = null;
+        try
+        {
+            nint hwnd;
+            if (office.Name == "Word")
+            {
+                documents = app.Documents;
+                if (documents.Count == 0) return null;
+                window = app.ActiveWindow;
+                hwnd = (nint)(int)window.Hwnd;
+            }
+            else hwnd = office.Name == "Excel" ? (nint)(int)app.Hwnd : (nint)(int)app.HWND;
+            return Win32.GetWindowThreadProcessId(hwnd, out uint id) != 0 ? (int)id : null;
+        }
+        catch { return null; }
+        finally
+        {
+            Release(window);
+            Release(documents);
+        }
+    }
+
+    static void Run(OfficeApp office, string input, string output, int format, List<Process> started, CancellationToken ct)
     {
         object m = Type.Missing;
-        var before = new HashSet<int>();
-        foreach (var process in Process.GetProcessesByName(office.Process))
-            using (process) before.Add(process.Id);
-        dynamic app = Activator.CreateInstance(Type.GetTypeFromProgID(office.ProgId)!)!;
-        var ours = new List<int>();
-        foreach (var process in Process.GetProcessesByName(office.Process))
-            using (process) if (!before.Contains(process.Id)) ours.Add(process.Id);
-        lock (started) started.UnionWith(ours);
-        bool weStarted = ours.Count > 0;
-        dynamic? file = null, files = null;
+        bool weStarted = false;
+        dynamic? app = null, file = null, files = null;
 
         try
         {
+            office.CreationGate.Wait(ct);
+            try
+            {
+                ct.ThrowIfCancellationRequested();
+                var before = ProcessIds(office);
+                app = Activator.CreateInstance(Type.GetTypeFromProgID(office.ProgId)!)!;
+                var after = ProcessIds(office);
+                int? actual = InstanceProcessId(office, app);
+                var added = after.Except(before).ToArray();
+                int? owned = actual.HasValue
+                    ? (!before.Contains(actual.Value) && after.Contains(actual.Value) ? actual : null)
+                    : added.Length == 1 ? added[0] : null;
+                if (owned is { } id)
+                {
+                    weStarted = true;
+                    var process = Process.GetProcessById(id);
+                    try { _ = process.Handle; } // Pin the process identity so PID reuse cannot target another app.
+                    catch { process.Dispose(); throw; }
+                    lock (started)
+                    {
+                        started.Add(process);
+                        if (ct.IsCancellationRequested) Kill(process); // Creation may finish after the caller gave up.
+                    }
+                }
+            }
+            finally { office.CreationGate.Release(); }
+            ct.ThrowIfCancellationRequested();
             // Word and Excel get hidden and silenced below, which must never happen to the user's own window.
             // PowerPoint is single-instance and opens our file windowless without changing the app, so sharing is fine.
             if (!weStarted && office.Name != "PowerPoint")
@@ -101,9 +175,9 @@ internal static class OfficeAutomation
                     // FileName, ConfirmConversions, ReadOnly, AddToRecentFiles, …, Visible (12th), …, NoEncodingDialog (15th)
                     files = app.Documents;
                     file = files.Open(input, false, true, false, m, m, m, m, m, m, m, false, m, m, true);
+                    ct.ThrowIfCancellationRequested();
                     if (format == 7) file.SaveAs2(output, format, m, m, false, m, m, m, m, m, m, 65001); // UTF-8 text
                     else file.SaveAs2(output, format);
-                    file.Close(0);
                     break;
 
                 case "Excel":
@@ -112,33 +186,57 @@ internal static class OfficeAutomation
                     try { app.AskToUpdateLinks = false; app.EnableEvents = false; } catch { }
                     files = app.Workbooks;
                     file = files.Open(input, 0, true);
+                    ct.ThrowIfCancellationRequested();
                     if (format == -1) file.ExportAsFixedFormat(0, output);
                     else
                     {
                         try { file.SaveAs(output, format); }
                         catch (COMException) when (format == 62) { file.SaveAs(output, 6); } // older Excel: no UTF-8 CSV
                     }
-                    file.Close(false);
                     break;
 
                 case "PowerPoint":
                     files = app.Presentations;
                     file = files.Open(input, -1, 0, 0); // ReadOnly, not Untitled, no window
+                    ct.ThrowIfCancellationRequested();
                     file.SaveAs(output, format);
-                    file.Close();
                     break;
             }
         }
         finally
         {
             // Every COM object we touched must be released, or the hidden Office app never exits.
-            if (file != null) Marshal.FinalReleaseComObject(file);
-            if (files != null) Marshal.FinalReleaseComObject(files);
-            if (weStarted)
+            try
             {
-                try { app.Quit(); } catch { }
+                if (file != null)
+                {
+                    try
+                    {
+                        if (office.Name == "Word") file.Close(0);
+                        else if (office.Name == "Excel") file.Close(false);
+                        else file.Close();
+                    }
+                    catch { }
+                    Release(file);
+                }
+                Release(files);
+                if (app != null)
+                {
+                    if (weStarted)
+                    {
+                        try { app.Quit(); } catch { }
+                    }
+                    Release(app);
+                }
             }
-            Marshal.FinalReleaseComObject(app);
+            finally
+            {
+                lock (started)
+                {
+                    foreach (var process in started) process.Dispose();
+                    started.Clear();
+                }
+            }
             GC.Collect();
             GC.WaitForPendingFinalizers();
         }

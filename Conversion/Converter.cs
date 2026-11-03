@@ -355,7 +355,7 @@ public sealed partial class Converter(AppSettings settings)
         var engines = new List<(string name, Func<Task> run)>();
         bool builtIn = BuiltInDocuments.CanConvert(plan, target);
         bool builtInFirst = plan.SourceExt is "txt" or "csv" || target.Ext == "pdf";
-        var builtInEngine = ("built-in", (Func<Task>)(() => RunSta(() => { BuiltInDocuments.Convert(plan, target, output); return true; })));
+        var builtInEngine = ("built-in", (Func<Task>)(() => RunSta(() => { BuiltInDocuments.Convert(plan, target, output, ct); return true; })));
 
         if (builtIn && builtInFirst) engines.Add(builtInEngine);
         if (OfficeAutomation.CanConvert(plan, target)) engines.Add(("Microsoft Office", () => OfficeAutomation.ConvertAsync(plan, target, output, ct)));

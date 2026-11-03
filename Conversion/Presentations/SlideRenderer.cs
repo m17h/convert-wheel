@@ -18,7 +18,7 @@ internal sealed class SlideRenderer(Deck deck)
     /// <summary>Draws loose shapes (a Word drawing, a group) as one transparent picture of the given size in points.</summary>
     public static DImage ToPicture(IEnumerable<SlideShape> shapes, double widthPt, double heightPt)
     {
-        var deck = new Deck { Width = Math.Max(1, widthPt), Height = Math.Max(1, heightPt) };
+        var deck = new Deck { Width = RasterLimits.Dimension(widthPt, 720), Height = RasterLimits.Dimension(heightPt, 405) };
         var slide = new Slide();
         slide.Shapes.AddRange(shapes);
         var renderer = new SlideRenderer(deck) { _transparent = true };
@@ -27,7 +27,8 @@ internal sealed class SlideRenderer(Deck deck)
         {
             double w = Units.ToDip(deck.Width), h = Units.ToDip(deck.Height);
             double scale = Math.Clamp(1600 / Math.Max(w, h), 1, 4);
-            var bitmap = new RenderTargetBitmap((int)Math.Ceiling(w * scale), (int)Math.Ceiling(h * scale), 96 * scale, 96 * scale, PixelFormats.Pbgra32);
+            if (!RasterLimits.TrySize(w, h, ref scale, out int pw, out int ph)) throw new ConversionException("This drawing has an invalid size.");
+            var bitmap = new RenderTargetBitmap(pw, ph, 96 * scale, 96 * scale, PixelFormats.Pbgra32);
             bitmap.Render(visual);
             var png = new PngBitmapEncoder();
             png.Frames.Add(BitmapFrame.Create(bitmap));
@@ -40,18 +41,20 @@ internal sealed class SlideRenderer(Deck deck)
 
     public void ToPdf(string output, IProgress<double?> progress, CancellationToken ct)
     {
+        NormalizeSize();
         int count = deck.Slides.Count;
         PdfRenderer.RenderVisuals(output, deck.Width, deck.Height, count, i =>
         {
             ct.ThrowIfCancellationRequested();
             progress.Report((double)i / count);
             return Build(deck.Slides[i]);
-        }, deck.Title);
+        }, deck.Title, ct);
     }
 
     /// <returns>The picture, or a folder of them when there are several slides.</returns>
     public string ToImages(string output, string ext, IProgress<double?> progress, CancellationToken ct)
     {
+        NormalizeSize();
         int count = deck.Slides.Count;
         return Outputs.Pages(output, count, (i, path) =>
         {
@@ -63,11 +66,18 @@ internal sealed class SlideRenderer(Deck deck)
         });
     }
 
+    void NormalizeSize()
+    {
+        deck.Width = RasterLimits.Dimension(deck.Width, 720);
+        deck.Height = RasterLimits.Dimension(deck.Height, 405);
+    }
+
     BitmapSource Rasterize(Visual visual, int pixelWidth)
     {
         double width = Units.ToDip(deck.Width), height = Units.ToDip(deck.Height);
-        double dpi = 96.0 * pixelWidth / width;
-        var bitmap = new RenderTargetBitmap(pixelWidth, (int)Math.Round(height * dpi / 96), dpi, dpi, PixelFormats.Pbgra32);
+        double scale = pixelWidth / width;
+        if (!RasterLimits.TrySize(width, height, ref scale, out int pw, out int ph)) throw new ConversionException("This slide has an invalid size.");
+        var bitmap = new RenderTargetBitmap(pw, ph, 96 * scale, 96 * scale, PixelFormats.Pbgra32);
         bitmap.Render(visual);
         bitmap.Freeze();
         return bitmap;
@@ -96,6 +106,7 @@ internal sealed class SlideRenderer(Deck deck)
     /// <returns>The slide's visual, and an action that frees its text layouts once it has been drawn.</returns>
     public (Visual visual, Action release) Build(Slide slide)
     {
+        NormalizeSize();
         var pages = new List<DocumentPage>();
         var root = new ContainerVisual();
         var area = new Rect(0, 0, Units.ToDip(deck.Width), Units.ToDip(deck.Height));
@@ -254,6 +265,7 @@ internal sealed class SlideRenderer(Deck deck)
     static BitmapSource ShapedPicture(BitmapSource bitmap, SlideFill fill, Geometry geometry, Rect bounds)
     {
         double scale = Math.Min(2, 2400 / Math.Max(bounds.Width, bounds.Height));
+        if (!RasterLimits.TrySize(bounds.Width, bounds.Height, ref scale, out int pw, out int ph)) return bitmap;
         var brush = new ImageBrush(bitmap) { Stretch = Stretch.Fill, Opacity = fill.Opacity };
         if (fill.Tile is { } tile)
         {
@@ -269,7 +281,7 @@ internal sealed class SlideRenderer(Deck deck)
             dc.PushTransform(new TranslateTransform(-bounds.X, -bounds.Y));
             dc.DrawGeometry(brush, null, geometry);
         }
-        var target = new RenderTargetBitmap((int)Math.Ceiling(bounds.Width * scale), (int)Math.Ceiling(bounds.Height * scale), 96, 96, PixelFormats.Pbgra32);
+        var target = new RenderTargetBitmap(pw, ph, 96, 96, PixelFormats.Pbgra32);
         target.Render(visual);
         target.Freeze();
         return target;

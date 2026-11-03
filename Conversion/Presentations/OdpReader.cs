@@ -19,6 +19,8 @@ internal sealed partial class OdpReader
     static readonly XNamespace Pres = "urn:oasis:names:tc:opendocument:xmlns:presentation:1.0";
 
     readonly ZipArchive _zip;
+    readonly CancellationToken _ct;
+    readonly OdfRepetitions _repeats = new();
     readonly Dictionary<string, XElement> _styles = [];
     readonly Dictionary<string, XElement> _listStyles = [];
     readonly Dictionary<string, XElement> _gradients = [];
@@ -38,14 +40,14 @@ internal sealed partial class OdpReader
         public Run Clone() => (Run)MemberwiseClone();
     }
 
-    OdpReader(ZipArchive zip) => _zip = zip;
+    OdpReader(ZipArchive zip, CancellationToken ct) => (_zip, _ct) = (zip, ct);
 
-    public static Deck Read(string path)
+    public static Deck Read(string path, CancellationToken ct = default)
     {
         try
         {
             using var zip = ZipFile.OpenRead(path);
-            return new OdpReader(zip).Build(Path.GetFileNameWithoutExtension(path));
+            return new OdpReader(zip, ct).Build(Path.GetFileNameWithoutExtension(path));
         }
         catch (InvalidDataException)
         {
@@ -91,6 +93,7 @@ internal sealed partial class OdpReader
         var pages = content.Element(Office + "body")?.Element(Office + "presentation")?.Elements(Draw + "page") ?? [];
         foreach (var page in pages)
         {
+            _ct.ThrowIfCancellationRequested();
             _pageNumber++;
             masters.TryGetValue((string?)page.Attribute(Draw + "master-page-name") ?? "", out var master);
             master ??= masters.Values.FirstOrDefault();
@@ -743,20 +746,13 @@ internal sealed partial class OdpReader
     DTable ReadTable(XElement table, List<XElement> chain)
     {
         var result = new DTable { Borders = true, BorderColor = Color.FromRgb(0x80, 0x80, 0x80), CellPadding = new Thickness(5.4, 3.6, 5.4, 3.6) };
-        var widths = new List<double>();
-        foreach (var col in table.Descendants(Table + "table-column"))
-        {
-            var width = Len(Style((string?)col.Attribute(Table + "style-name"))?.Element(St + "table-column-properties"), St + "column-width") ?? 72;
-            int repeat = int.TryParse((string?)col.Attribute(Table + "number-columns-repeated"), out var r) ? r : 1;
-            for (int i = 0; i < Math.Min(repeat, 64); i++) widths.Add(width);
-        }
-        if (widths.Count > 0) result.ColumnWidths = widths;
-
-        foreach (var tr in table.Descendants(Table + "table-row"))
+        foreach (var (tr, cells) in _repeats.Rows(table, _ct))
         {
             var row = new DRow();
-            foreach (var tc in tr.Elements(Table + "table-cell"))
+            foreach (var item in cells)
             {
+                var tc = item ?? new XElement(Table + "table-cell");
+                if (tc.Name == Table + "covered-table-cell") continue;
                 var cell = new DCell { ColSpan = int.TryParse((string?)tc.Attribute(Table + "number-columns-spanned"), out var span) ? span : 1 };
                 var cellStyle = Style((string?)tc.Attribute(Table + "style-name"));
                 var fill = (string?)cellStyle?.Element(St + "graphic-properties")?.Attribute(Draw + "fill-color")
@@ -773,6 +769,9 @@ internal sealed partial class OdpReader
             }
             result.Rows.Add(row);
         }
+        var widths = OdfRepetitions.Widths(table, result.Rows.Select(r => r.Cells.Sum(c => c.ColSpan)).DefaultIfEmpty(0).Max(),
+            col => Len(Style((string?)col.Attribute(Table + "style-name"))?.Element(St + "table-column-properties"), St + "column-width") ?? 72);
+        if (widths.Count > 0 && widths.All(w => w > 0)) result.ColumnWidths = widths;
         return result;
     }
 
@@ -799,7 +798,7 @@ internal sealed partial class OdpReader
         DImage? image = null;
         if (_zip.GetEntry(href) is { } entry)
         {
-            using var stream = entry.Open();
+            using var stream = PackageResources.Open(entry, media: true);
             using var ms = new MemoryStream();
             stream.CopyTo(ms);
             var data = ms.ToArray();
@@ -813,8 +812,8 @@ internal sealed partial class OdpReader
     XElement? Load(string name)
     {
         if (_zip.GetEntry(name) is not { } entry) return null;
-        using var stream = entry.Open();
-        return XDocument.Load(stream).Root;
+        using var stream = PackageResources.Open(entry);
+        return PackageResources.LoadXml(stream).Root;
     }
 
     static double? Len(XElement? el, XName name) => Units.ParseLength((string?)el?.Attribute(name));

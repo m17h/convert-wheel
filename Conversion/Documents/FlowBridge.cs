@@ -24,6 +24,7 @@ internal static class FlowBridge
     internal sealed class FlowContext(DDocument doc)
     {
         public DDocument Doc { get; } = doc;
+        public CancellationToken Cancellation { get; init; }
         /// <summary>RTF can't hold WPF controls or figures, so list markers become text and notes go to the end.</summary>
         public bool ForRtf { get; init; }
         /// <summary>Page number and count, for page fields in headers and footers.</summary>
@@ -42,7 +43,7 @@ internal static class FlowBridge
         public List<DNote> EarlierEndnotes { get; init; } = [];
     }
 
-    public static FlowDocument ToFlow(DDocument doc, bool forRtf = false) => ToFlow(new FlowContext(doc) { ForRtf = forRtf });
+    public static FlowDocument ToFlow(DDocument doc, bool forRtf = false, CancellationToken ct = default) => ToFlow(new FlowContext(doc) { ForRtf = forRtf, Cancellation = ct });
 
     public static FlowDocument ToFlow(FlowContext ctx)
     {
@@ -84,12 +85,16 @@ internal static class FlowBridge
         Background = null, // the PDF page is already white; a fill would hide what lies beneath and skew measurements
     };
 
-    static Block ToBlock(DBlock block, FlowContext ctx, double available) => block switch
+    static Block ToBlock(DBlock block, FlowContext ctx, double available)
     {
-        DTable t => ToTable(t, ctx, available),
-        DParagraph p => ToParagraph(p, ctx, available),
-        _ => new Paragraph(),
-    };
+        ctx.Cancellation.ThrowIfCancellationRequested();
+        return block switch
+        {
+            DTable t => ToTable(t, ctx, available),
+            DParagraph p => ToParagraph(p, ctx, available),
+            _ => new Paragraph(),
+        };
+    }
 
     static Paragraph ToParagraph(DParagraph p, FlowContext ctx, double available)
     {
@@ -409,6 +414,7 @@ internal static class FlowBridge
             : new Thickness(Units.ToDip(5.4), Units.ToDip(1), Units.ToDip(5.4), Units.ToDip(1));
         foreach (var r in t.Rows)
         {
+            ctx.Cancellation.ThrowIfCancellationRequested();
             var row = new TableRow();
             int col = 0;
             foreach (var c in r.Cells)

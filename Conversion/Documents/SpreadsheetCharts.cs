@@ -24,8 +24,8 @@ internal static class SpreadsheetCharts
             {
                 var entry = zip.GetEntry(part);
                 if (entry == null) return null;
-                using var s = entry.Open();
-                return XDocument.Load(s).Root;
+                using var s = PackageResources.Open(entry);
+                return PackageResources.LoadXml(s).Root;
             }
             Dictionary<string, string> Rels(string part)
             {
@@ -110,7 +110,7 @@ internal static class SpreadsheetCharts
     /// <summary>A picture from the package, as PNG/JPEG (metafiles and SVG converted).</summary>
     static DImage? Picture(ZipArchiveEntry entry, double w, double h)
     {
-        using var stream = entry.Open();
+        using var stream = PackageResources.Open(entry, media: true);
         using var ms = new MemoryStream();
         stream.CopyTo(ms);
         var data = ms.ToArray();

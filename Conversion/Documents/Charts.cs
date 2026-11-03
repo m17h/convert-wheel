@@ -336,7 +336,7 @@ internal static class Charts
         var entry = zip.GetEntry(dir + "/content.xml");
         if (entry == null) return null;
         XElement root;
-        using (var s = entry.Open()) root = XDocument.Load(s).Root!;
+        using (var s = PackageResources.Open(entry)) root = PackageResources.LoadXml(s).Root!;
         var chartEl = root.Descendants(Ch + "chart").FirstOrDefault();
         if (chartEl == null) return null;
         var styles = root.Descendants(Sty + "style").Where(s => s.Attribute(Sty + "name") != null).ToDictionary(s => (string)s.Attribute(Sty + "name")!, s => s);
@@ -346,18 +346,10 @@ internal static class Charts
         // The chart's data lives in a small table inside the chart.
         var grid = new List<List<(string text, double? value)>>();
         var table = chartEl.Descendants(Tb + "table").FirstOrDefault();
-        foreach (var row in table?.Descendants(Tb + "table-row") ?? [])
-        {
-            var cells = new List<(string, double?)>();
-            foreach (var cell in row.Elements().Where(e => e.Name == Tb + "table-cell" || e.Name == Tb + "covered-table-cell"))
-            {
-                int repeat = int.TryParse((string?)cell.Attribute(Tb + "number-columns-repeated"), out var r) ? Math.Min(r, 256) : 1;
-                var text = string.Join(" ", cell.Elements(Tx + "p").Select(p => p.Value));
-                var value = Num((string?)cell.Attribute(Off + "value"));
-                for (int i = 0; i < repeat; i++) cells.Add((text, value));
-            }
-            grid.Add(cells);
-        }
+        if (table != null)
+            foreach (var (_, cells) in new OdfRepetitions().Rows(table))
+                grid.Add(cells.Select(cell => cell == null ? ("", (double?)null) :
+                    (string.Join(" ", cell.Elements(Tx + "p").Select(p => p.Value)), Num((string?)cell.Attribute(Off + "value")))).ToList());
         (string text, double? value) Cell(int row, int col) => row >= 0 && row < grid.Count && col >= 0 && col < grid[row].Count ? grid[row][col] : ("", null);
         List<(int row, int col)> Range(string? address)
         {
@@ -494,13 +486,14 @@ internal static class Charts
     /// <summary>The chart as a sharp picture of the given size (points).</summary>
     public static DImage ToImage(Chart chart, double widthPt, double heightPt)
     {
-        widthPt = Math.Max(widthPt, 40);
-        heightPt = Math.Max(heightPt, 30);
+        widthPt = Math.Max(RasterLimits.Dimension(widthPt, 480), 40);
+        heightPt = Math.Max(RasterLimits.Dimension(heightPt, 300), 30);
         double w = Units.ToDip(widthPt), h = Units.ToDip(heightPt);
         double scale = Math.Clamp(2400 / Math.Max(w, h), 1, 4);
+        if (!RasterLimits.TrySize(w, h, ref scale, out int pw, out int ph)) throw new ConversionException("This chart has an invalid size.");
         var visual = new DrawingVisual();
         using (var dc = visual.RenderOpen()) new Painter(chart, dc, w, h).Draw();
-        var bitmap = new RenderTargetBitmap((int)Math.Ceiling(w * scale), (int)Math.Ceiling(h * scale), 96 * scale, 96 * scale, PixelFormats.Pbgra32);
+        var bitmap = new RenderTargetBitmap(pw, ph, 96 * scale, 96 * scale, PixelFormats.Pbgra32);
         bitmap.Render(visual);
         var encoder = new PngBitmapEncoder();
         encoder.Frames.Add(BitmapFrame.Create(bitmap));

@@ -8,7 +8,7 @@ namespace ConvertWheel.Conversion.Documents;
 /// <summary>Markdown (GitHub flavour). Pictures go in a "name_images" folder next to the file.</summary>
 internal static partial class MarkdownWriter
 {
-    public static void Write(DDocument doc, string path)
+    public static void Write(DDocument doc, string path, CancellationToken ct = default)
     {
         var imagesDir = Path.Combine(Path.GetDirectoryName(path)!, Path.GetFileNameWithoutExtension(path) + "_images");
         int imageCount = 0;
@@ -21,11 +21,12 @@ internal static partial class MarkdownWriter
         }
 
         var sb = new StringBuilder();
-        Blocks(doc.Blocks, sb, Image);
+        Blocks(doc.Blocks, sb, Image, ct);
         var notes = doc.Notes().OrderBy(n => n.Endnote).ThenBy(n => n.Number).ToList();
         if (notes.Count > 0) sb.Append('\n');
         foreach (var note in notes)
         {
+            ct.ThrowIfCancellationRequested();
             var text = string.Join(" ", FlowBridge.WithoutMark(note).OfType<DParagraph>().Select(p => Inlines(p, Image)).Where(s => s.Length > 0));
             sb.Append($"[^{NoteKey(note)}]: {text}\n");
         }
@@ -34,12 +35,13 @@ internal static partial class MarkdownWriter
 
     static string NoteKey(DNote n) => n.Endnote ? "e" + n.Number : n.Number.ToString();
 
-    static void Blocks(List<DBlock> blocks, StringBuilder sb, Func<DImage, string> image)
+    static void Blocks(List<DBlock> blocks, StringBuilder sb, Func<DImage, string> image, CancellationToken ct)
     {
         var numbers = new Dictionary<int, int>();
         var lastTopList = ListKind.None;
         foreach (var block in blocks)
         {
+            ct.ThrowIfCancellationRequested();
             // A top-level list changing between bullets and numbers starts a new Markdown list.
             if (block is DParagraph { List: not ListKind.None, ListLevel: 0 } lp && lastTopList != ListKind.None && lp.List != lastTopList)
             {
@@ -96,7 +98,11 @@ internal static partial class MarkdownWriter
                 }
                 sb.Append('\n').Append(Row(t.Rows[0]));
                 sb.Append("|").Append(string.Concat(Enumerable.Repeat(" --- |", cols))).Append('\n');
-                foreach (var r in t.Rows.Skip(1)) sb.Append(Row(r));
+                foreach (var r in t.Rows.Skip(1))
+                {
+                    ct.ThrowIfCancellationRequested();
+                    sb.Append(Row(r));
+                }
                 sb.Append('\n');
             }
         }
@@ -179,7 +185,7 @@ internal static class EpubWriter
     static readonly XNamespace Opf = "http://www.idpf.org/2007/opf";
     static readonly XNamespace Dc = "http://purl.org/dc/elements/1.1/";
 
-    public static void Write(DDocument doc, string path)
+    public static void Write(DDocument doc, string path, CancellationToken ct = default)
     {
         var images = new List<(string name, byte[] data, string mime)>();
         string Image(DImage img)
@@ -188,12 +194,13 @@ internal static class EpubWriter
             images.Add((name, img.Data, HtmlWriter.Mime(img)));
             return name;
         }
-        var writer = new HtmlWriter(true, Image);
+        var writer = new HtmlWriter(true, Image, ct);
 
         // Chapters start at each level-1 heading or page break.
         var chapters = new List<List<DBlock>> { new() };
         foreach (var block in doc.Blocks)
         {
+            ct.ThrowIfCancellationRequested();
             bool start = block is DParagraph { Heading: 1 } or DParagraph { PageBreakBefore: true };
             if (start && chapters[^1].Count > 0) chapters.Add([]);
             chapters[^1].Add(block);
@@ -211,6 +218,7 @@ internal static class EpubWriter
         var files = new List<(string name, string content)>();
         for (int i = 0; i < chapters.Count; i++)
         {
+            ct.ThrowIfCancellationRequested();
             var body = writer.Blocks(chapters[i]);
             var chapterDoc = new DDocument();
             chapterDoc.Blocks.AddRange(chapters[i]);

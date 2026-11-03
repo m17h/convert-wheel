@@ -27,9 +27,9 @@ internal static class PdfRenderer
     /// gets its header/footer (with live page numbers) and any behind/in-front pictures painted around it.
     /// Sections with their own page size or columns are laid out separately and numbered on.
     /// </summary>
-    public static void Render(DDocument doc, string output)
+    public static void Render(DDocument doc, string output, CancellationToken ct = default)
     {
-        var pdf = new PdfDocument();
+        using var pdf = new PdfDocument();
         if (!string.IsNullOrEmpty(doc.Title)) pdf.Info.Title = doc.Title;
         pdf.Info.Creator = "Convert Wheel";
 
@@ -38,8 +38,9 @@ internal static class PdfRenderer
         var laidOut = new List<(DDocument part, FlowBridge.FlowContext ctx, DynamicDocumentPaginator paginator)>();
         for (int k = 0; k < parts.Count; k++)
         {
+            ct.ThrowIfCancellationRequested();
             bool last = k == parts.Count - 1;
-            var (ctx, paginator) = LayOut(parts[k], hold: !last, earlierEndnotes);
+            var (ctx, paginator) = LayOut(parts[k], hold: !last, earlierEndnotes, ct);
             if (!last) earlierEndnotes.AddRange(ctx.Endnotes);
             laidOut.Add((parts[k], ctx, paginator));
         }
@@ -53,6 +54,7 @@ internal static class PdfRenderer
             var overlays = ctx.Overlays.Select(o => (o.Float, page: PageOf(paginator, o.Anchor))).ToList();
             for (int i = 0; i < paginator.PageCount; i++)
             {
+                ct.ThrowIfCancellationRequested();
                 number++;
                 using var page = paginator.GetPage(i);
                 var pdfPage = pdf.AddPage();
@@ -73,22 +75,23 @@ internal static class PdfRenderer
             }
         }
         if (pdf.PageCount == 0) pdf.AddPage();
+        ct.ThrowIfCancellationRequested();
         pdf.Save(output);
     }
 
     /// <summary>Lays out one section; a first pass finds which page each footnote lands on.</summary>
-    static (FlowBridge.FlowContext ctx, DynamicDocumentPaginator paginator) LayOut(DDocument part, bool hold, List<DNote> earlierEndnotes)
+    static (FlowBridge.FlowContext ctx, DynamicDocumentPaginator paginator) LayOut(DDocument part, bool hold, List<DNote> earlierEndnotes, CancellationToken ct)
     {
-        var ctx = new FlowBridge.FlowContext(part) { HoldEndnotes = hold, EarlierEndnotes = [.. earlierEndnotes] };
-        var paginator = Paginate(FlowBridge.ToFlow(ctx));
+        var ctx = new FlowBridge.FlowContext(part) { Cancellation = ct, HoldEndnotes = hold, EarlierEndnotes = [.. earlierEndnotes] };
+        var paginator = Paginate(FlowBridge.ToFlow(ctx), ct);
         // Footnotes: a first layout shows which page each reference lands on; the final layout then gives
         // each page one block holding its notes in order.
         var footnotes = ctx.NoteAnchors.Where(kv => !kv.Key.Endnote).ToList();
         if (footnotes.Count > 1)
         {
             var pagesOfNotes = footnotes.ToDictionary(kv => kv.Key, kv => PageOf(paginator, kv.Value));
-            ctx = new FlowBridge.FlowContext(part) { NotePages = pagesOfNotes, HoldEndnotes = hold, EarlierEndnotes = [.. earlierEndnotes] };
-            paginator = Paginate(FlowBridge.ToFlow(ctx));
+            ctx = new FlowBridge.FlowContext(part) { Cancellation = ct, NotePages = pagesOfNotes, HoldEndnotes = hold, EarlierEndnotes = [.. earlierEndnotes] };
+            paginator = Paginate(FlowBridge.ToFlow(ctx), ct);
         }
         return (ctx, paginator);
     }
@@ -129,14 +132,15 @@ internal static class PdfRenderer
 
     /// <summary>Writes ready-made WPF visuals (e.g. slides), one per page, as vector PDF pages.</summary>
     /// <param name="page">Builds page <c>i</c>; the returned action releases it once drawn.</param>
-    public static void RenderVisuals(string output, double widthPt, double heightPt, int count, Func<int, (Visual visual, Action release)> page, string? title)
+    public static void RenderVisuals(string output, double widthPt, double heightPt, int count, Func<int, (Visual visual, Action release)> page, string? title, CancellationToken ct = default)
     {
-        var pdf = new PdfDocument();
+        using var pdf = new PdfDocument();
         if (!string.IsNullOrEmpty(title)) pdf.Info.Title = title;
         pdf.Info.Creator = "Convert Wheel";
         var images = new Dictionary<ImageSource, XImage>();
         for (int i = 0; i < count; i++)
         {
+            ct.ThrowIfCancellationRequested();
             var pdfPage = pdf.AddPage();
             pdfPage.Width = XUnit.FromPoint(widthPt);
             pdfPage.Height = XUnit.FromPoint(heightPt);
@@ -150,6 +154,7 @@ internal static class PdfRenderer
             finally { release(); }
         }
         if (pdf.PageCount == 0) pdf.AddPage();
+        ct.ThrowIfCancellationRequested();
         pdf.Save(output);
     }
 
@@ -193,11 +198,17 @@ internal static class PdfRenderer
         return bounds;
     }
 
-    static DynamicDocumentPaginator Paginate(FlowDocument flow)
+    static DynamicDocumentPaginator Paginate(FlowDocument flow, CancellationToken ct = default)
     {
         var paginator = (DynamicDocumentPaginator)((IDocumentPaginatorSource)flow).DocumentPaginator;
         paginator.PageSize = new Size(flow.PageWidth, flow.PageHeight);
-        paginator.ComputePageCount();
+        paginator.IsBackgroundPaginationEnabled = false;
+        for (int i = 0; !paginator.IsPageCountValid; i++)
+        {
+            ct.ThrowIfCancellationRequested();
+            using var page = paginator.GetPage(i);
+            if (page == DocumentPage.Missing) break;
+        }
         return paginator;
     }
 

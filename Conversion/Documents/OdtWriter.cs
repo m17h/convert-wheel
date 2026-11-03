@@ -58,6 +58,7 @@ internal static class OdfPackage
 internal sealed class OdtWriter
 {
     readonly DDocument _doc;
+    readonly CancellationToken _ct;
     /// <summary>Automatic styles live in the file that uses them: content.xml for the body, styles.xml for headers/footers.</summary>
     sealed class StyleSet(string prefix)
     {
@@ -73,13 +74,14 @@ internal sealed class OdtWriter
     /// <summary>Page settings of the sections after the first, in order (each gets its own page style).</summary>
     readonly List<PageSetup> _sections = [];
 
-    OdtWriter(DDocument doc)
+    OdtWriter(DDocument doc, CancellationToken ct)
     {
         _doc = doc;
+        _ct = ct;
         _set = _contentStyles;
     }
 
-    public static void Write(DDocument doc, string path) => new OdtWriter(doc).Save(path);
+    public static void Write(DDocument doc, string path, CancellationToken ct = default) => new OdtWriter(doc, ct).Save(path);
 
     void Save(string path)
     {
@@ -98,6 +100,7 @@ internal sealed class OdtWriter
     {
         foreach (var block in blocks)
         {
+            _ct.ThrowIfCancellationRequested();
             // A section on its own page settings opens with a paragraph that switches to its page style.
             if (block.Section is { } setup && block is not DParagraph && parent.Name == Office + "text")
                 parent.Add(new XElement(Text + "p", new XAttribute(Text + "style-name", ParagraphStyle(new DParagraph { Section = setup }))));
@@ -373,6 +376,7 @@ internal sealed class OdtWriter
         var shaded = new Dictionary<string, string>();
         foreach (var row in t.Rows)
         {
+            _ct.ThrowIfCancellationRequested();
             var tr = new XElement(Table + "table-row");
             int col = 0;
             foreach (var cell in row.Cells)

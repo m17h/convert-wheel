@@ -8,7 +8,7 @@ namespace ConvertWheel.Conversion.Documents;
 /// Writes the document model as HTML. The same code produces the XHTML chapters of an EPUB, where
 /// void tags must self-close and pictures are separate files rather than embedded data.
 /// </summary>
-internal sealed class HtmlWriter(bool xhtml, Func<DImage, string> imageSource)
+internal sealed class HtmlWriter(bool xhtml, Func<DImage, string> imageSource, CancellationToken ct = default)
 {
     readonly string _end = xhtml ? " />" : ">";
 
@@ -22,9 +22,9 @@ internal sealed class HtmlWriter(bool xhtml, Func<DImage, string> imageSource)
         "header, footer { color: #555; font-size: 0.9em; }\nheader { border-bottom: 1px solid #ddd; margin-bottom: 1.5em; }\nfooter { border-top: 1px solid #ddd; margin-top: 2em; }\n" +
         ".notes { font-size: 0.9em; border-top: 1px solid #ccc; margin-top: 2em; padding-top: 0.5em; }\n.box { padding: 4px 8px; margin: 0 0 0.5em; }\n";
 
-    public static void Write(DDocument doc, string path)
+    public static void Write(DDocument doc, string path, CancellationToken ct = default)
     {
-        var writer = new HtmlWriter(false, DataUri);
+        var writer = new HtmlWriter(false, DataUri, ct);
         var sb = new StringBuilder();
         sb.Append("<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n");
         sb.Append($"<title>{Enc(doc.Title ?? "Document")}</title>\n<style>\n");
@@ -62,6 +62,7 @@ internal sealed class HtmlWriter(bool xhtml, Func<DImage, string> imageSource)
         var openLists = new Stack<(ListKind kind, int level)>();
         foreach (var block in blocks)
         {
+            ct.ThrowIfCancellationRequested();
             if (block is DParagraph { List: not ListKind.None } item)
             {
                 while (openLists.Count > 0 && (openLists.Peek().level > item.ListLevel ||
@@ -99,6 +100,7 @@ internal sealed class HtmlWriter(bool xhtml, Func<DImage, string> imageSource)
                 sb.Append(t.Borders ? "<table class=\"grid\">\n" : "<table>\n");
                 foreach (var row in t.Rows)
                 {
+                    ct.ThrowIfCancellationRequested();
                     sb.Append("<tr>");
                     foreach (var cell in row.Cells)
                     {

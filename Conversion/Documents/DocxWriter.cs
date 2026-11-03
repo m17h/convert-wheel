@@ -21,6 +21,7 @@ internal sealed class DocxWriter
     static readonly XNamespace MC = "http://schemas.openxmlformats.org/markup-compatibility/2006";
 
     readonly DDocument _doc;
+    readonly CancellationToken _ct;
     readonly List<XElement> _mainRels = [];
     // Relationships of the part currently being written (body, a header/footer, or the notes).
     List<XElement> _rels;
@@ -33,13 +34,14 @@ internal sealed class DocxWriter
     int? _currentNumId;
     ListKind _currentKind;
 
-    DocxWriter(DDocument doc)
+    DocxWriter(DDocument doc, CancellationToken ct)
     {
         _doc = doc;
+        _ct = ct;
         _rels = _mainRels;
     }
 
-    public static void Write(DDocument doc, string path) => new DocxWriter(doc).Save(path);
+    public static void Write(DDocument doc, string path, CancellationToken ct = default) => new DocxWriter(doc, ct).Save(path);
 
     PageSetup _section = null!;
     List<XElement>? _headerReferences;
@@ -132,6 +134,7 @@ internal sealed class DocxWriter
     {
         for (int i = 0; i < blocks.Count; i++)
         {
+            _ct.ThrowIfCancellationRequested();
             if (topLevel && i > 0 && blocks[i].Section is { } next)
             {
                 // A section ends: Word keeps its settings in the last paragraph of the section.
@@ -482,6 +485,7 @@ internal sealed class DocxWriter
 
         foreach (var row in t.Rows)
         {
+            _ct.ThrowIfCancellationRequested();
             var tr = new XElement(W + "tr");
             if (row.Header) tr.Add(new XElement(W + "trPr", new XElement(W + "tblHeader")));
             int col = 0;

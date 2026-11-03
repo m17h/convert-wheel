@@ -14,7 +14,8 @@ internal static class PresentationEngine
     /// <summary>Runs on an STA thread (slides are laid out with WPF).</summary>
     public static string Convert(string input, string output, string ext, IProgress<double?> progress, CancellationToken ct)
     {
-        var deck = Read(input);
+        ct.ThrowIfCancellationRequested();
+        var deck = Read(input, ct);
         ct.ThrowIfCancellationRequested();
         switch (ext)
         {
@@ -24,20 +25,20 @@ internal static class PresentationEngine
             case "png" or "jpg" or "webp":
                 return new SlideRenderer(deck).ToImages(output, ext, progress, ct);
             case "pptx":
-                PptxWriter.Write(deck, output);
+                PptxWriter.Write(deck, output, ct);
                 return output;
             case "odp":
-                OdpWriter.Write(deck, output);
+                OdpWriter.Write(deck, output, ct);
                 return output;
             default:
                 throw new ConversionException($"Can't convert presentations to {ext.ToUpperInvariant()}.");
         }
     }
 
-    public static Deck Read(string input) => Path.GetExtension(input).ToLowerInvariant() switch
+    public static Deck Read(string input, CancellationToken ct = default) => Path.GetExtension(input).ToLowerInvariant() switch
     {
-        ".odp" => OdpReader.Read(input),
-        ".ppt" or ".pps" or ".pot" => PptReader.Read(input),
-        _ => PptxReader.Read(input),
+        ".odp" => OdpReader.Read(input, ct),
+        ".ppt" or ".pps" or ".pot" => PptReader.Read(input, ct),
+        _ => PptxReader.Read(input, ct),
     };
 }

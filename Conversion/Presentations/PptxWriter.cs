@@ -24,24 +24,29 @@ internal sealed class PptxWriter
 
     readonly ZipArchive _zip;
     readonly Deck _deck;
+    readonly CancellationToken _ct;
     readonly Dictionary<DImage, string> _media = [];
     readonly HashSet<string> _mediaTypes = [];
     List<XElement> _rels = [];
     int _shapeId;
 
-    PptxWriter(ZipArchive zip, Deck deck) => (_zip, _deck) = (zip, deck);
+    PptxWriter(ZipArchive zip, Deck deck, CancellationToken ct) => (_zip, _deck, _ct) = (zip, deck, ct);
 
-    public static void Write(Deck deck, string path)
+    public static void Write(Deck deck, string path, CancellationToken ct = default)
     {
         using var file = File.Create(path);
         using var zip = new ZipArchive(file, ZipArchiveMode.Create);
-        new PptxWriter(zip, deck).WriteAll();
+        new PptxWriter(zip, deck, ct).WriteAll();
     }
 
     void WriteAll()
     {
         int count = _deck.Slides.Count;
-        for (int i = 0; i < count; i++) WriteSlide(i);
+        for (int i = 0; i < count; i++)
+        {
+            _ct.ThrowIfCancellationRequested();
+            WriteSlide(i);
+        }
 
         var presRels = new List<XElement> { Rel("rId1", "slideMaster", "slideMasters/slideMaster1.xml") };
         for (int i = 0; i < count; i++) presRels.Add(Rel($"rId{i + 2}", "slide", $"slides/slide{i + 1}.xml"));

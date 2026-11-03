@@ -15,6 +15,7 @@ internal sealed class PptReader
     const double MasterUnit = 72.0 / 576; // positions are in 576ths of an inch
 
     readonly byte[] _doc;
+    readonly CancellationToken _ct;
     readonly byte[]? _pictures;
     readonly Dictionary<int, int> _persist = [];
     readonly Dictionary<int, int> _notesPersist = [];
@@ -43,9 +44,9 @@ internal sealed class PptReader
         public TextDefaults Clone() => (TextDefaults)MemberwiseClone();
     }
 
-    PptReader(byte[] doc, byte[]? pictures) => (_doc, _pictures) = (doc, pictures);
+    PptReader(byte[] doc, byte[]? pictures, CancellationToken ct) => (_doc, _pictures, _ct) = (doc, pictures, ct);
 
-    public static Deck Read(string path)
+    public static Deck Read(string path, CancellationToken ct = default)
     {
         var bytes = File.ReadAllBytes(path);
         var cfb = new WordBinaryReader.CompoundFile(bytes);
@@ -55,7 +56,7 @@ internal sealed class PptReader
         if (BinaryPrimitives.ReadUInt32LittleEndian(user.AsSpan(12)) == 0xF3D1C4DF) throw new ConversionException("This presentation is password-protected.");
         try
         {
-            return new PptReader(doc, cfb.Stream("Pictures")).Build(BinaryPrimitives.ReadInt32LittleEndian(user.AsSpan(16)), Path.GetFileNameWithoutExtension(path));
+            return new PptReader(doc, cfb.Stream("Pictures"), ct).Build(BinaryPrimitives.ReadInt32LittleEndian(user.AsSpan(16)), Path.GetFileNameWithoutExtension(path));
         }
         catch (Exception ex) when (ex is IndexOutOfRangeException or ArgumentOutOfRangeException or ArgumentException)
         {
@@ -154,6 +155,7 @@ internal sealed class PptReader
         var entries = new List<(int persist, List<Rec> texts)>();
         foreach (var r in Children(slideList))
         {
+            _ct.ThrowIfCancellationRequested();
             if (r.Type == 0x03F3) entries.Add((I32(r.Start), []));
             else if (entries.Count > 0) entries[^1].texts.Add(r);
         }

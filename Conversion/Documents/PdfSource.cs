@@ -16,7 +16,7 @@ internal static partial class PdfSource
         if (ext is "png" or "jpg" or "webp" or "tiff")
             return Pages(pdf, output, ext, progress, ct);
         var doc = Reflow(pdf, Path.GetFileNameWithoutExtension(input), progress, ct);
-        BuiltInDocuments.Write(doc, ext, output);
+        BuiltInDocuments.Write(doc, ext, output, ct);
         return output;
     }
 
@@ -86,7 +86,8 @@ internal static partial class PdfSource
             double covered = images.Sum(im => im.image.Width * im.image.Height) / Math.Max(1, width * height);
             if (lines.Count == 0 && (images.Count == 0 || covered > 0.4) && Ocr.Available)
             {
-                var ocrLines = OcrLines(pdf.Render(i, 300), 300, height, i);
+                var scan = pdf.Render(i, 300);
+                var ocrLines = OcrLines(scan, scan.PixelWidth * 72.0 / width, height, i);
                 if (ocrLines.Count > 0)
                 {
                     lines = ocrLines;
@@ -102,7 +103,7 @@ internal static partial class PdfSource
                 ? "No text was found in this PDF. Try converting it to PNG instead."
                 : "This PDF has no text (it may be scanned) and Windows text recognition isn't available. Try converting it to PNG instead.");
         if (usedOcr) Log.Write($"{title}: scanned pages read with Windows OCR.");
-        return Reflow(pages, title);
+        return Reflow(pages, title, ct);
     }
 
     /// <summary>Recognises text in pictures (photos of pages, screenshots, scans) and lays it out as a document.</summary>
@@ -118,7 +119,7 @@ internal static partial class PdfSource
             pages.Add(new PageText(OcrLines(picture, dpi, height, i), [], width, height));
         }
         if (pages.All(p => p.Lines.Count == 0)) throw new ConversionException("No text was found in this picture.");
-        var doc = Reflow(pages, title);
+        var doc = Reflow(pages, title, ct);
         doc.PageWidth = DDocument.DefaultPage.Width;
         doc.PageHeight = DDocument.DefaultPage.Height;
         return doc;
@@ -158,7 +159,7 @@ internal static partial class PdfSource
         return lines;
     }
 
-    static DDocument Reflow(List<PageText> pages, string title)
+    static DDocument Reflow(List<PageText> pages, string title, CancellationToken ct = default)
     {
         var doc = new DDocument { Title = title };
         if (pages.Count > 0) (doc.PageWidth, doc.PageHeight) = (pages[0].Width, pages[0].Height);
@@ -178,6 +179,7 @@ internal static partial class PdfSource
         Line? previous = null;
         foreach (var (lines, images, width, _) in pages)
         {
+            ct.ThrowIfCancellationRequested();
             var pending = images.OrderByDescending(i => i.top).ToList();
             foreach (var line in lines)
             {
@@ -298,8 +300,10 @@ internal static partial class PdfSource
             try
             {
                 double scale = dpi / 72;
-                int w = Math.Max(1, (int)Math.Round(FPDF_GetPageWidthF(page) * scale)), h = Math.Max(1, (int)Math.Round(FPDF_GetPageHeightF(page) * scale));
+                if (!RasterLimits.TrySize(FPDF_GetPageWidthF(page), FPDF_GetPageHeightF(page), ref scale, out int w, out int h))
+                    throw new ConversionException("This PDF page has an invalid size.");
                 var bitmap = FPDFBitmap_Create(w, h, 1);
+                if (bitmap == IntPtr.Zero) throw new ConversionException("This PDF page could not be rendered.");
                 try
                 {
                     FPDFBitmap_FillRect(bitmap, 0, 0, w, h, 0xFFFFFFFF);

@@ -20,18 +20,16 @@ internal sealed record Sheet(string Name, List<object?[]> Rows)
 
 internal static class Spreadsheets
 {
-    const int MaxRepeat = 1000; // ODS stores "the rest of the sheet" as huge repeated empty cells
-
     // ------------------------------------------------------------------ reading
 
-    public static List<Sheet> Read(string path) => Path.GetExtension(path).ToLowerInvariant() switch
+    public static List<Sheet> Read(string path, CancellationToken ct = default) => Path.GetExtension(path).ToLowerInvariant() switch
     {
-        ".csv" or ".tsv" => [ReadCsv(path)],
-        ".ods" => ReadOds(path),
-        _ => ReadExcel(path),
+        ".csv" or ".tsv" => [ReadCsv(path, ct)],
+        ".ods" => ReadOds(path, ct),
+        _ => ReadExcel(path, ct),
     };
 
-    static Sheet ReadCsv(string path)
+    static Sheet ReadCsv(string path, CancellationToken ct)
     {
         var text = TextDecoding.Decode(File.ReadAllBytes(path));
         char delimiter = Path.GetExtension(path).Equals(".tsv", StringComparison.OrdinalIgnoreCase) ? '\t' : DetectDelimiter(text);
@@ -42,6 +40,7 @@ internal static class Spreadsheets
 
         for (int i = 0; i < text.Length; i++)
         {
+            if ((i & 4095) == 0) ct.ThrowIfCancellationRequested();
             rowStarted = true;
             char c = text[i];
             if (quoted)
@@ -118,10 +117,21 @@ internal static class Spreadsheets
         return value;
     }
 
-    static List<Sheet> ReadExcel(string path)
+    static List<Sheet> ReadExcel(string path, CancellationToken ct)
     {
         TextDecoding.EnsureRegistered();
         using var stream = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        if (Path.GetExtension(path).ToLowerInvariant() is ".xlsx" or ".xlsm")
+        {
+            using (var zip = new ZipArchive(stream, ZipArchiveMode.Read, leaveOpen: true))
+                foreach (var entry in zip.Entries)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    using var part = PackageResources.Open(entry, media: !entry.FullName.EndsWith(".xml", StringComparison.OrdinalIgnoreCase) && !entry.FullName.EndsWith(".rels", StringComparison.OrdinalIgnoreCase));
+                    part.CopyTo(Stream.Null);
+                }
+            stream.Position = 0;
+        }
         using var reader = ExcelReaderFactory.CreateReader(stream);
         var sheets = new List<Sheet>();
         do
@@ -130,6 +140,7 @@ internal static class Spreadsheets
             var rows = new List<object?[]>();
             while (reader.Read())
             {
+                ct.ThrowIfCancellationRequested();
                 var row = new object?[reader.FieldCount];
                 for (int i = 0; i < row.Length; i++)
                 {
@@ -154,30 +165,22 @@ internal static class Spreadsheets
         return sheets.Count > 0 ? sheets : [new Sheet("Sheet1", [])];
     }
 
-    static List<Sheet> ReadOds(string path)
+    static List<Sheet> ReadOds(string path, CancellationToken ct)
     {
         using var zip = ZipFile.OpenRead(path);
         var entry = zip.GetEntry("content.xml") ?? throw new ConversionException("This OpenDocument spreadsheet has no content.");
         XElement root;
-        using (var stream = entry.Open()) root = XDocument.Load(stream).Root!;
+        using (var stream = PackageResources.Open(entry)) root = PackageResources.LoadXml(stream).Root!;
 
         var sheets = new List<Sheet>();
+        var repeats = new OdfRepetitions();
         foreach (var table in root.Descendants(Table + "table"))
         {
+            ct.ThrowIfCancellationRequested();
             var rows = new List<object?[]>();
-            foreach (var tr in table.Descendants(Table + "table-row"))
-            {
-                var cells = new List<object?>();
-                foreach (var tc in tr.Elements().Where(e => e.Name == Table + "table-cell" || e.Name == Table + "covered-table-cell"))
-                {
-                    int repeat = Math.Min((int?)tc.Attribute(Table + "number-columns-repeated") ?? 1, MaxRepeat);
-                    var value = OdsValue(tc);
-                    for (int i = 0; i < repeat; i++) cells.Add(value);
-                }
-                int rowRepeat = Math.Min((int?)tr.Attribute(Table + "number-rows-repeated") ?? 1, MaxRepeat);
-                for (int i = 0; i < rowRepeat; i++) rows.Add([.. cells]);
-            }
-            sheets.Add(new Sheet((string?)table.Attribute(Table + "name") ?? $"Sheet{sheets.Count + 1}", Trim(rows)));
+            foreach (var (_, cells) in repeats.Rows(table, ct))
+                rows.Add(cells.Select(tc => tc == null ? null : OdsValue(tc)).ToArray());
+            sheets.Add(new Sheet((string?)table.Attribute(Table + "name") ?? $"Sheet{sheets.Count + 1}", rows));
         }
         var odsCharts = SpreadsheetCharts.Ods(zip, root);
         sheets = sheets.Select(s => odsCharts.TryGetValue(s.Name, out var c) ? s with { Charts = c } : s).ToList();
@@ -198,6 +201,7 @@ internal static class Spreadsheets
             case "boolean":
                 return (string?)tc.Attribute(Office + "boolean-value") == "true";
         }
+        if ((string?)tc.Attribute(Office + "string-value") is { } text) return text;
         var paragraphs = tc.Elements(Text + "p").Select(p => OdsText(p)).ToList();
         return paragraphs.Count == 0 ? null : string.Join("\n", paragraphs);
     }
@@ -228,19 +232,21 @@ internal static class Spreadsheets
 
     // ------------------------------------------------------------------ writing
 
-    public static void Write(List<Sheet> sheets, string path, string ext, string title)
+    public static void Write(List<Sheet> sheets, string path, string ext, string title, CancellationToken ct = default)
     {
+        ct.ThrowIfCancellationRequested();
         switch (ext)
         {
-            case "csv": WriteCsv(sheets[0], path, ','); break;
-            case "tsv": WriteCsv(sheets[0], path, '\t'); break;
+            case "csv": WriteCsv(sheets[0], path, ',', ct); break;
+            case "tsv": WriteCsv(sheets[0], path, '\t', ct); break;
             case "json": DataFiles.FromSheets(sheets, path); break;
-            case "xlsx": WriteXlsx(sheets, path); break;
-            case "ods": WriteOds(sheets, path); break;
-            case "html": WriteHtml(sheets, path, title); break;
-            case "pdf": PdfRenderer.Render(ToDocument(sheets, title), path); break;
+            case "xlsx": WriteXlsx(sheets, path, ct); break;
+            case "ods": WriteOds(sheets, path, ct); break;
+            case "html": WriteHtml(sheets, path, title, ct); break;
+            case "pdf": PdfRenderer.Render(ToDocument(sheets, title, ct), path, ct); break;
             default: throw new ConversionException($"Spreadsheets can't be saved as {ext.ToUpperInvariant()} without Office or LibreOffice.");
         }
+        ct.ThrowIfCancellationRequested();
     }
 
     static string Display(object? v) => v switch
@@ -252,12 +258,13 @@ internal static class Spreadsheets
         _ => Convert.ToString(v, CultureInfo.InvariantCulture) ?? "",
     };
 
-    static void WriteCsv(Sheet sheet, string path, char delimiter)
+    static void WriteCsv(Sheet sheet, string path, char delimiter, CancellationToken ct)
     {
         var sb = new StringBuilder();
         int width = sheet.ColumnCount;
         foreach (var row in sheet.Rows)
         {
+            ct.ThrowIfCancellationRequested();
             for (int i = 0; i < width; i++)
             {
                 if (i > 0) sb.Append(delimiter);
@@ -272,7 +279,7 @@ internal static class Spreadsheets
         File.WriteAllText(path, sb.ToString(), new UTF8Encoding(true));
     }
 
-    static void WriteXlsx(List<Sheet> sheets, string path)
+    static void WriteXlsx(List<Sheet> sheets, string path, CancellationToken ct)
     {
         XNamespace S = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
         XNamespace R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
@@ -294,6 +301,7 @@ internal static class Spreadsheets
 
         for (int i = 0; i < sheets.Count; i++)
         {
+            ct.ThrowIfCancellationRequested();
             int n = i + 1;
             types.Add(new XElement(CT + "Override", new XAttribute("PartName", $"/xl/worksheets/sheet{n}.xml"),
                 new XAttribute("ContentType", "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml")));
@@ -304,6 +312,7 @@ internal static class Spreadsheets
             var data = new XElement(S + "sheetData");
             for (int r = 0; r < sheet.Rows.Count; r++)
             {
+                ct.ThrowIfCancellationRequested();
                 var row = new XElement(S + "row", new XAttribute("r", r + 1));
                 for (int c = 0; c < sheet.Rows[r].Length; c++)
                 {
@@ -331,7 +340,7 @@ internal static class Spreadsheets
             }
 
             var worksheet = new XElement(S + "worksheet", new XAttribute(XNamespace.Xmlns + "r", R));
-            var widths = ColumnWidths(sheet);
+            var widths = ColumnWidths(sheet, ct);
             if (widths.Count > 0)
                 worksheet.Add(new XElement(S + "cols", widths.Select((w, c) => new XElement(S + "col",
                     new XAttribute("min", c + 1), new XAttribute("max", c + 1), new XAttribute("width", w.ToString("0.##", CultureInfo.InvariantCulture)), new XAttribute("customWidth", 1)))));
@@ -400,7 +409,7 @@ internal static class Spreadsheets
         }
     }
 
-    static void WriteOds(List<Sheet> sheets, string path)
+    static void WriteOds(List<Sheet> sheets, string path, CancellationToken ct)
     {
         var names = UniqueSheetNames(sheets, 100, "[]*?:/\\'");
         var spreadsheet = new XElement(Office + "spreadsheet");
@@ -416,9 +425,10 @@ internal static class Spreadsheets
 
         for (int i = 0; i < sheets.Count; i++)
         {
+            ct.ThrowIfCancellationRequested();
             var sheet = sheets[i];
             var table = new XElement(Table + "table", new XAttribute(Table + "name", names[i]));
-            var widths = ColumnWidths(sheet);
+            var widths = ColumnWidths(sheet, ct);
             for (int c = 0; c < widths.Count; c++)
             {
                 var styleName = $"co{i}_{c}";
@@ -430,6 +440,7 @@ internal static class Spreadsheets
 
             foreach (var row in sheet.Rows)
             {
+                ct.ThrowIfCancellationRequested();
                 var tr = new XElement(Table + "table-row");
                 foreach (var v in row)
                 {
@@ -487,7 +498,7 @@ internal static class Spreadsheets
         OdfPackage.Save(path, "application/vnd.oasis.opendocument.spreadsheet", content, styles, pictures);
     }
 
-    static void WriteHtml(List<Sheet> sheets, string path, string title)
+    static void WriteHtml(List<Sheet> sheets, string path, string title, CancellationToken ct)
     {
         var sb = new StringBuilder();
         sb.Append("<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<title>").Append(WebUtility.HtmlEncode(title)).Append("</title>\n<style>\n");
@@ -496,11 +507,13 @@ internal static class Spreadsheets
         sb.Append("td.n { text-align: right; }\n</style>\n</head>\n<body>\n");
         foreach (var sheet in sheets)
         {
+            ct.ThrowIfCancellationRequested();
             if (sheets.Count > 1) sb.Append("<h2>").Append(WebUtility.HtmlEncode(sheet.Name)).Append("</h2>\n");
             sb.Append("<table>\n");
             int width = sheet.ColumnCount;
             foreach (var row in sheet.Rows)
             {
+                ct.ThrowIfCancellationRequested();
                 sb.Append("<tr>");
                 for (int c = 0; c < width; c++)
                 {
@@ -519,7 +532,7 @@ internal static class Spreadsheets
     }
 
     /// <summary>Lays sheets out as tables for PDF output, landscape when they're wide.</summary>
-    static DDocument ToDocument(List<Sheet> sheets, string title)
+    static DDocument ToDocument(List<Sheet> sheets, string title, CancellationToken ct)
     {
         var doc = new DDocument { Title = title, Font = "Calibri", FontSize = 9, Margins = new Thickness(36) };
         int widest = sheets.Max(s => s.ColumnCount);
@@ -527,6 +540,7 @@ internal static class Spreadsheets
 
         for (int i = 0; i < sheets.Count; i++)
         {
+            ct.ThrowIfCancellationRequested();
             var sheet = sheets[i];
             if (sheets.Count > 1)
             {
@@ -536,11 +550,12 @@ internal static class Spreadsheets
             }
             int width = sheet.ColumnCount;
             if (width == 0) { AddCharts(doc, sheet); continue; }
-            var widths = ColumnWidths(sheet);
+            var widths = ColumnWidths(sheet, ct);
             double total = widths.Sum();
             var table = new DTable { Borders = true, ColumnWidths = widths.Select(w => w / total * doc.ContentWidth).ToList() };
             foreach (var row in sheet.Rows)
             {
+                ct.ThrowIfCancellationRequested();
                 var r = new DRow();
                 for (int c = 0; c < width; c++)
                 {
@@ -573,12 +588,13 @@ internal static class Spreadsheets
     }
 
     /// <summary>Approximate column widths in characters, from the longest value in each column.</summary>
-    static List<double> ColumnWidths(Sheet sheet)
+    static List<double> ColumnWidths(Sheet sheet, CancellationToken ct)
     {
         int width = sheet.ColumnCount;
         var widths = new List<double>();
         for (int c = 0; c < width; c++)
         {
+            ct.ThrowIfCancellationRequested();
             int longest = sheet.Rows.Take(2000).Select(r => c < r.Length ? Display(r[c]).Split('\n').Max(l => l.Length) : 0).DefaultIfEmpty(0).Max();
             widths.Add(Math.Clamp(longest + 2, 6, 60));
         }

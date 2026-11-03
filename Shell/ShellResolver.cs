@@ -10,42 +10,99 @@ namespace ConvertWheel.Shell;
 /// <summary>
 /// Finds the file under the mouse in Explorer windows (including tabs) and on the desktop.
 /// UI Automation gives the hovered item's display name; the Explorer view hosting it gives the
-/// folder, and together they produce a real path. All COM work runs on one STA worker thread.
+/// folder, and together they produce a real path. COM work runs on an STA worker, replaced if it hangs.
 /// </summary>
 internal sealed class ShellResolver : IDisposable
 {
-    readonly BlockingCollection<Action> _queue = new();
-    readonly Thread _thread;
+    sealed record Work(Action Run, Action Cancel);
 
-    public ShellResolver()
+    sealed class Worker
     {
-        _thread = new Thread(() =>
+        public readonly BlockingCollection<Work> Queue = new(32);
+        public bool Retired;
+    }
+
+    readonly object _gate = new();
+    Worker? _worker;
+    Work? _pendingResolve;
+    bool _disposed;
+
+    Worker StartWorker()
+    {
+        var worker = new Worker();
+        var thread = new Thread(() =>
         {
-            foreach (var work in _queue.GetConsumingEnumerable())
+            try
             {
-                try { work(); }
-                catch (Exception ex) { Log.Write(ex); }
+                foreach (var work in worker.Queue.GetConsumingEnumerable())
+                {
+                    lock (_gate)
+                    {
+                        if (ReferenceEquals(_pendingResolve, work)) _pendingResolve = null;
+                        if (worker.Retired) { work.Cancel(); continue; }
+                    }
+                    work.Run();
+                }
             }
+            finally { lock (_gate) worker.Queue.Dispose(); }
         })
         { IsBackground = true, Name = "Shell resolver" };
-        _thread.SetApartmentState(ApartmentState.STA);
-        _thread.Start();
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        return worker;
     }
 
-    Task<T> Invoke<T>(Func<T> func)
+    async Task<T?> Invoke<T>(Func<T?> func, TimeSpan timeout, bool resolve = false) where T : class
     {
-        var tcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
-        _queue.Add(() =>
+        var tcs = new TaskCompletionSource<T?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var work = new Work(() =>
         {
-            try { tcs.SetResult(func()); }
-            catch (Exception ex) { tcs.SetException(ex); }
-        });
-        return tcs.Task;
+            if (tcs.Task.IsCompleted) return;
+            try { tcs.TrySetResult(func()); }
+            catch (Exception ex) { Log.Write(ex); tcs.TrySetResult(null); }
+        }, () => tcs.TrySetResult(null));
+        Worker worker;
+        lock (_gate)
+        {
+            if (_disposed) return null;
+            worker = _worker ??= StartWorker();
+            if (resolve)
+            {
+                _pendingResolve?.Cancel(); // Superseded requests need not enter Explorer at all.
+                _pendingResolve = work;
+            }
+            if (!worker.Queue.TryAdd(work))
+            {
+                if (ReferenceEquals(_pendingResolve, work)) _pendingResolve = null;
+                work.Cancel();
+            }
+        }
+        try { return await tcs.Task.WaitAsync(timeout).ConfigureAwait(false); }
+        catch (TimeoutException)
+        {
+            lock (_gate)
+            {
+                if (!tcs.Task.IsCompleted && ReferenceEquals(_worker, worker))
+                {
+                    Retire(worker);
+                    _worker = null; // The next request gets a fresh STA, not the hung provider.
+                }
+            }
+            return null;
+        }
     }
 
-    public Task<string?> ResolveFileAsync(POINT pt) => Invoke(() => ResolveFile(pt));
+    void Retire(Worker worker)
+    {
+        worker.Retired = true;
+        worker.Queue.CompleteAdding();
+        while (worker.Queue.TryTake(out var work)) work.Cancel();
+        _pendingResolve = null;
+    }
 
-    public Task<BitmapSource?> GetThumbnailAsync(string path, int size) => Invoke(() => Thumbnail(path, size));
+    public Task<string?> ResolveFileAsync(POINT pt) => Invoke(() => ResolveFile(pt), TimeSpan.FromSeconds(3), resolve: true);
+
+    public Task<BitmapSource?> GetThumbnailAsync(string path, int size) => Invoke(() => Thumbnail(path, size), TimeSpan.FromSeconds(5));
 
     /// <summary>Cheap pre-check: is the point over a shell item view (Explorer or desktop)?</summary>
     public static bool IsOverShellView(POINT pt) => FindDefView(Win32.WindowFromPoint(pt)) != 0;
@@ -287,5 +344,14 @@ internal sealed class ShellResolver : IDisposable
         return source;
     }
 
-    public void Dispose() => _queue.CompleteAdding();
+    public void Dispose()
+    {
+        lock (_gate)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            if (_worker != null) Retire(_worker);
+            _worker = null;
+        }
+    }
 }

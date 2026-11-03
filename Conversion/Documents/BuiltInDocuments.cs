@@ -23,15 +23,16 @@ internal static class BuiltInDocuments
     };
 
     /// <summary>Must run on an STA thread (WPF does the RTF handling and page layout).</summary>
-    public static void Convert(ConversionPlan plan, FormatInfo target, string output)
+    public static void Convert(ConversionPlan plan, FormatInfo target, string output, CancellationToken ct = default)
     {
+        ct.ThrowIfCancellationRequested();
         var title = Path.GetFileNameWithoutExtension(plan.SourcePath);
         if (plan.SourceKind == FormatKind.Spreadsheet)
         {
-            Spreadsheets.Write(Spreadsheets.Read(plan.SourcePath), output, target.Ext, title);
+            Spreadsheets.Write(Spreadsheets.Read(plan.SourcePath, ct), output, target.Ext, title, ct);
             return;
         }
-        Write(Read(plan.SourcePath, plan.SourceExt), target.Ext, output);
+        Write(Read(plan.SourcePath, plan.SourceExt), target.Ext, output, ct);
     }
 
     public static DDocument Read(string path, string ext) => ext switch
@@ -46,19 +47,21 @@ internal static class BuiltInDocuments
         _ => PlainText.Read(path),
     };
 
-    public static void Write(DDocument doc, string ext, string output)
+    public static void Write(DDocument doc, string ext, string output, CancellationToken ct = default)
     {
+        ct.ThrowIfCancellationRequested();
         switch (ext)
         {
-            case "pdf": PdfRenderer.Render(doc, output); break;
-            case "docx": DocxWriter.Write(doc, output); break;
-            case "odt": OdtWriter.Write(doc, output); break;
-            case "rtf": RichText.Write(doc, output); break;
-            case "txt": PlainText.Write(doc, output); break;
-            case "html": HtmlWriter.Write(doc, output); break;
-            case "md": MarkdownWriter.Write(doc, output); break;
-            case "epub": EpubWriter.Write(doc, output); break;
+            case "pdf": PdfRenderer.Render(doc, output, ct); break;
+            case "docx": DocxWriter.Write(doc, output, ct); break;
+            case "odt": OdtWriter.Write(doc, output, ct); break;
+            case "rtf": RichText.Write(doc, output, ct); break;
+            case "txt": PlainText.Write(doc, output, ct); break;
+            case "html": HtmlWriter.Write(doc, output, ct); break;
+            case "md": MarkdownWriter.Write(doc, output, ct); break;
+            case "epub": EpubWriter.Write(doc, output, ct); break;
             default: throw new ConversionException($"Can't create {ext.ToUpperInvariant()} files from documents.");
         }
+        ct.ThrowIfCancellationRequested();
     }
 }

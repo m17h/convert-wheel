@@ -19,6 +19,7 @@ internal sealed class OdtReader
     internal static readonly XNamespace Svg = "urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0";
 
     readonly ZipArchive? _zip;
+    readonly OdfRepetitions _repeats = new();
     readonly XElement? _flat;
     readonly Dictionary<string, XElement> _styles = [];
     readonly Dictionary<string, XElement> _listStyles = [];
@@ -47,7 +48,10 @@ internal sealed class OdtReader
     public static DDocument Read(string path)
     {
         if (Path.GetExtension(path).Equals(".fodt", StringComparison.OrdinalIgnoreCase))
-            return new OdtReader(null, XDocument.Load(path, LoadOptions.PreserveWhitespace).Root).Build(Path.GetFileNameWithoutExtension(path));
+        {
+            using var stream = File.OpenRead(path);
+            return new OdtReader(null, PackageResources.LoadXml(stream, LoadOptions.PreserveWhitespace).Root).Build(Path.GetFileNameWithoutExtension(path));
+        }
         using var zip = ZipFile.OpenRead(path);
         return new OdtReader(zip).Build(Path.GetFileNameWithoutExtension(path));
     }
@@ -453,7 +457,7 @@ internal sealed class OdtReader
         if (entry == null) return null;
         var ext = Path.GetExtension(href).TrimStart('.').ToLowerInvariant();
         ext = ext switch { "jpg" or "jpeg" => "jpeg", "tif" => "tiff", _ => ext };
-        using var stream = entry.Open();
+        using var stream = PackageResources.Open(entry, media: true);
         using var ms = new MemoryStream();
         stream.CopyTo(ms);
         var data = ms.ToArray();
@@ -476,21 +480,12 @@ internal sealed class OdtReader
     DTable ReadTable(XElement el)
     {
         var table = new DTable();
-        var widths = new List<double>();
-        foreach (var col in el.Descendants(Table + "table-column"))
-        {
-            int repeat = Math.Min((int?)col.Attribute(Table + "number-columns-repeated") ?? 1, 256);
-            var style = Style((string?)col.Attribute(Table + "style-name"));
-            var width = Len(style?.Element(St + "table-column-properties"), St + "column-width") ?? 0;
-            for (int i = 0; i < repeat; i++) widths.Add(width);
-        }
-        if (widths.Count > 0 && widths.All(w => w > 0)) table.ColumnWidths = widths;
-
-        foreach (var tr in el.Descendants(Table + "table-row").Where(r => r.Ancestors(Table + "table").First() == el))
+        foreach (var (tr, cells) in _repeats.Rows(el))
         {
             var row = new DRow { Header = tr.Parent?.Name == Table + "table-header-rows" };
-            foreach (var tc in tr.Elements())
+            foreach (var item in cells)
             {
+                var tc = item ?? new XElement(Table + "table-cell");
                 if (tc.Name == Table + "covered-table-cell") continue;
                 if (tc.Name != Table + "table-cell") continue;
                 var cellStyle = Style((string?)tc.Attribute(Table + "style-name"))?.Element(St + "table-cell-properties");
@@ -504,8 +499,11 @@ internal sealed class OdtReader
                 ReadBlocks(tc.Elements(), cell.Blocks, 0, null);
                 row.Cells.Add(cell);
             }
-            if (row.Cells.Count > 0) table.Rows.Add(row);
+            table.Rows.Add(row);
         }
+        var widths = OdfRepetitions.Widths(el, table.Rows.Select(r => r.Cells.Sum(c => c.ColSpan)).DefaultIfEmpty(0).Max(),
+            col => Len(Style((string?)col.Attribute(Table + "style-name"))?.Element(St + "table-column-properties"), St + "column-width") ?? 0);
+        if (widths.Count > 0 && widths.All(w => w > 0)) table.ColumnWidths = widths;
         return table;
     }
 
@@ -590,7 +588,7 @@ internal sealed class OdtReader
         if (_flat != null) return _flat;
         var entry = _zip?.GetEntry(path);
         if (entry == null) return null;
-        using var stream = entry.Open();
-        return XDocument.Load(stream, LoadOptions.PreserveWhitespace).Root;
+        using var stream = PackageResources.Open(entry);
+        return PackageResources.LoadXml(stream, LoadOptions.PreserveWhitespace).Root;
     }
 }

@@ -94,7 +94,7 @@ internal static partial class RichText
                     var inner = rtf[(i + 1)..end];
                     if (word == "footnote")
                     {
-                        bool isEndnote = inner.Contains("\\ftnalt");
+                        bool isEndnote = FindControlWord(inner, "ftnalt") >= 0;
                         // Fields and page breaks inside notes and headers need the same treatment as the body.
                         notes.Add((isEndnote, Extract(StripControlWord(inner, "footnote")).Body));
                         body.Append(' ').Append(NoteToken(notes.Count - 1)).Append(' ');
@@ -116,6 +116,13 @@ internal static partial class RichText
             }
             else if (c == '\\')
             {
+                int binaryEnd = BinaryEnd(rtf, i);
+                if (binaryEnd > i)
+                {
+                    body.Append(rtf, i, binaryEnd - i);
+                    i = binaryEnd;
+                    continue;
+                }
                 var word = ControlWordAfter(rtf, i);
                 if (word is "page" or "sect")
                 {
@@ -165,13 +172,39 @@ internal static partial class RichText
         return i > start ? rtf[start..i] : null;
     }
 
+    static int BinaryEnd(string rtf, int at)
+    {
+        if (!rtf.AsSpan(at).StartsWith(@"\bin", StringComparison.Ordinal)) return at;
+        int i = at + 4;
+        if (i >= rtf.Length || !char.IsAsciiDigit(rtf[i])) return at;
+        long count = 0;
+        while (i < rtf.Length && char.IsAsciiDigit(rtf[i]))
+            count = Math.Min(rtf.Length, count * 10 + rtf[i++] - '0');
+        if (i < rtf.Length && rtf[i] == ' ') i++;
+        return i + (int)Math.Min(count, rtf.Length - i);
+    }
+
+    static int FindControlWord(string rtf, string word)
+    {
+        for (int i = 0; i < rtf.Length; i++)
+        {
+            if (rtf[i] != '\\') continue;
+            int end = BinaryEnd(rtf, i);
+            if (end > i) { i = end - 1; continue; }
+            if (rtf.AsSpan(i + 1).StartsWith(word, StringComparison.Ordinal)
+                && (i + word.Length + 1 == rtf.Length || !char.IsAsciiLetterLower(rtf[i + word.Length + 1]))) return i;
+            if (i + 1 < rtf.Length && !char.IsAsciiLetterLower(rtf[i + 1])) i++;
+        }
+        return -1;
+    }
+
     static int MatchingBrace(string rtf, int open)
     {
         int depth = 0;
         for (int i = open; i < rtf.Length; i++)
         {
             char c = rtf[i];
-            if (c == '\\') { i++; continue; }
+            if (c == '\\') { int end = BinaryEnd(rtf, i); i = end > i ? end - 1 : i + 1; continue; }
             if (c == '{') depth++;
             else if (c == '}' && --depth == 0) return i;
         }
@@ -180,14 +213,14 @@ internal static partial class RichText
 
     static string StripControlWord(string inner, string word)
     {
-        int at = inner.IndexOf("\\" + word, StringComparison.Ordinal);
+        int at = FindControlWord(inner, word);
         return at < 0 ? inner : inner[(at + word.Length + 1)..];
     }
 
     /// <summary>PAGE / NUMPAGES fields become tokens; anything else keeps its displayed result.</summary>
     static string? FieldToken(string field)
     {
-        int at = field.IndexOf("\\fldinst", StringComparison.Ordinal);
+        int at = FindControlWord(field, "fldinst");
         if (at < 0) return null;
         var instruction = InstructionRegex().Match(field[(at + 8)..]).Groups[1].Value.ToUpperInvariant();
         return instruction switch { "PAGE" => FieldPage, "NUMPAGES" or "SECTIONPAGES" => FieldPages, _ => null };
@@ -280,7 +313,7 @@ internal static partial class RichText
 
     // ------------------------------------------------------------------ writing
 
-    public static void Write(DDocument doc, string path)
+    public static void Write(DDocument doc, string path, CancellationToken ct = default)
     {
         // Lay out a copy with tokens for what WPF can't write, and every header, footer and note
         // appended as a marked segment so it shares the document's font and colour tables.
@@ -289,7 +322,7 @@ internal static partial class RichText
             Font = doc.Font, FontSize = doc.FontSize, PageWidth = doc.PageWidth, PageHeight = doc.PageHeight, Margins = doc.Margins, Title = doc.Title,
         };
         var notes = new List<DNote>();
-        copy.Blocks.AddRange(Tokenize(doc.Blocks, notes));
+        copy.Blocks.AddRange(Tokenize(doc.Blocks, notes, ct));
 
         var segments = new List<(string kind, int index)>();
         void Segment(string kind, IEnumerable<DBlock> blocks)
@@ -302,7 +335,7 @@ internal static partial class RichText
         }
         void HeaderFooter(string kind, DHeaderFooter? part)
         {
-            if (part != null) Segment(kind, Tokenize(part.Blocks, notes));
+            if (part != null) Segment(kind, Tokenize(part.Blocks, notes, ct));
         }
         bool facing = doc.EvenHeader != null || doc.EvenFooter != null;
         HeaderFooter(facing ? "headerr" : "header", doc.Header);
@@ -314,9 +347,9 @@ internal static partial class RichText
             HeaderFooter("headerf", doc.FirstHeader ?? new DHeaderFooter());
             HeaderFooter("footerf", doc.FirstFooter ?? new DHeaderFooter());
         }
-        for (int i = 0; i < notes.Count; i++) Segment("note" + i, Tokenize(FlowBridge.WithoutMark(notes[i]), notes));
+        for (int i = 0; i < notes.Count; i++) Segment("note" + i, Tokenize(FlowBridge.WithoutMark(notes[i]), notes, ct));
 
-        var flow = FlowBridge.ToFlow(copy, forRtf: true);
+        var flow = FlowBridge.ToFlow(copy, forRtf: true, ct: ct);
         string rtf;
         using (var ms = new MemoryStream())
         {
@@ -357,6 +390,7 @@ internal static partial class RichText
         rtf = rtf.Replace(FieldPage, "{\\field{\\*\\fldinst PAGE }{\\fldrslt 1}}")
                  .Replace(FieldPages, "{\\field{\\*\\fldinst NUMPAGES }{\\fldrslt 1}}")
                  .Replace(PageBreak, "\\page ");
+        ct.ThrowIfCancellationRequested();
         File.WriteAllBytes(path, Encoding.Latin1.GetBytes(rtf));
     }
 
@@ -368,21 +402,23 @@ internal static partial class RichText
     }
 
     /// <summary>Copies blocks, replacing notes, fields and page breaks with tokens.</summary>
-    static List<DBlock> Tokenize(List<DBlock> blocks, List<DNote> notes)
+    static List<DBlock> Tokenize(List<DBlock> blocks, List<DNote> notes, CancellationToken ct)
     {
         var result = new List<DBlock>();
         foreach (var block in blocks)
         {
+            ct.ThrowIfCancellationRequested();
             if (block is DTable t)
             {
                 var table = new DTable { Borders = t.Borders, ColumnWidths = t.ColumnWidths };
                 foreach (var row in t.Rows)
                 {
+                    ct.ThrowIfCancellationRequested();
                     var r = new DRow { Header = row.Header };
                     foreach (var cell in row.Cells)
                     {
                         var c = new DCell { ColSpan = cell.ColSpan, Shading = cell.Shading };
-                        c.Blocks.AddRange(Tokenize(cell.Blocks, notes));
+                        c.Blocks.AddRange(Tokenize(cell.Blocks, notes, ct));
                         r.Cells.Add(c);
                     }
                     table.Rows.Add(r);
@@ -414,17 +450,18 @@ internal static partial class RichText
     /// <summary>The "{ … \par}" group WPF writes for the paragraph containing <paramref name="position"/>.</summary>
     static (int start, int end) ParagraphGroup(string rtf, int position)
     {
-        int depth = 0;
-        for (int i = position; i >= 0; i--)
+        var opens = new Stack<int>();
+        for (int i = 0; i < position; i++)
         {
-            if (rtf[i] == '}' && (i == 0 || rtf[i - 1] != '\\')) depth++;
-            else if (rtf[i] == '{' && (i == 0 || rtf[i - 1] != '\\'))
-            {
-                if (depth > 0) { depth--; continue; }
-                int end = MatchingBrace(rtf, i);
-                var group = rtf[i..(end + 1)];
-                if (group.TrimEnd('}', ' ', '\r', '\n').EndsWith("\\par", StringComparison.Ordinal)) return (i, end);
-            }
+            if (rtf[i] == '\\') { int end = BinaryEnd(rtf, i); i = end > i ? end - 1 : i + 1; continue; }
+            if (rtf[i] == '{') opens.Push(i);
+            else if (rtf[i] == '}' && opens.Count > 0) opens.Pop();
+        }
+        foreach (int open in opens)
+        {
+            int end = MatchingBrace(rtf, open);
+            var group = rtf[open..(end + 1)];
+            if (group.TrimEnd('}', ' ', '\r', '\n').EndsWith("\\par", StringComparison.Ordinal)) return (open, end);
         }
         return (position, position);
     }

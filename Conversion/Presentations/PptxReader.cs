@@ -88,18 +88,19 @@ internal sealed class PptxReader
     }
 
     readonly ZipArchive _zip;
+    readonly CancellationToken _ct;
     readonly Dictionary<string, Part?> _parts = [];
     readonly Dictionary<string, Theme> _themes = [];
     XElement? _defaultTextStyle;
 
-    PptxReader(ZipArchive zip) => _zip = zip;
+    PptxReader(ZipArchive zip, CancellationToken ct) => (_zip, _ct) = (zip, ct);
 
-    public static Deck Read(string path)
+    public static Deck Read(string path, CancellationToken ct = default)
     {
         try
         {
             using var zip = ZipFile.OpenRead(path);
-            return new PptxReader(zip).Build(Path.GetFileNameWithoutExtension(path));
+            return new PptxReader(zip, ct).Build(Path.GetFileNameWithoutExtension(path));
         }
         catch (InvalidDataException)
         {
@@ -119,6 +120,7 @@ internal sealed class PptxReader
         int number = 0;
         foreach (var id in pres.Root.Element(P + "sldIdLst")?.Elements(P + "sldId") ?? [])
         {
+            _ct.ThrowIfCancellationRequested();
             number++;
             if (Attr(id, R + "id") is not { } rid || !pres.Rels.TryGetValue(rid, out var rel)) continue;
             var slidePart = LoadPart(rel.Target);
@@ -984,7 +986,7 @@ internal sealed class PptxReader
         if (Attr(blip, R + "embed") is not { } rid || !ctx.Part.Rels.TryGetValue(rid, out var rel) || rel.External) return null;
         var entry = _zip.GetEntry(rel.Target);
         if (entry == null) return null;
-        using var stream = entry.Open();
+        using var stream = PackageResources.Open(entry, media: true);
         using var ms = new MemoryStream();
         stream.CopyTo(ms);
         var data = ms.ToArray();
@@ -1167,8 +1169,8 @@ internal sealed class PptxReader
         Part? part = null;
         if (_zip.GetEntry(path) is { } entry)
         {
-            using var stream = entry.Open();
-            var root = XDocument.Load(stream).Root!;
+            using var stream = PackageResources.Open(entry);
+            var root = PackageResources.LoadXml(stream).Root!;
             part = new Part(path, root, LoadRels(path));
         }
         _parts[path] = part;
@@ -1181,8 +1183,8 @@ internal sealed class PptxReader
         var dir = Path.GetDirectoryName(partPath)?.Replace('\\', '/') ?? "";
         var relsPath = (dir.Length > 0 ? dir + "/" : "") + "_rels/" + Path.GetFileName(partPath) + ".rels";
         if (_zip.GetEntry(relsPath) is not { } entry) return rels;
-        using var stream = entry.Open();
-        foreach (var rel in XDocument.Load(stream).Root!.Elements(PR + "Relationship"))
+        using var stream = PackageResources.Open(entry);
+        foreach (var rel in PackageResources.LoadXml(stream).Root!.Elements(PR + "Relationship"))
         {
             var id = (string?)rel.Attribute("Id");
             var target = (string?)rel.Attribute("Target");

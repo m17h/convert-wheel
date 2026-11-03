@@ -712,7 +712,7 @@ internal sealed class DocxReader
         ext = ext switch { "jpg" or "jpeg" => "jpeg", "tif" => "tiff", _ => ext };
         var entry = _zip.GetEntry(path);
         if (entry == null) return null;
-        using var stream = entry.Open();
+        using var stream = PackageResources.Open(entry, media: true);
         using var ms = new MemoryStream();
         stream.CopyTo(ms);
         if (ext is "png" or "jpeg" or "gif" or "bmp" or "tiff") return (ms.ToArray(), ext);
@@ -896,8 +896,8 @@ internal sealed class DocxReader
     {
         var entry = _zip.GetEntry(path);
         if (entry == null) return null;
-        using var stream = entry.Open();
-        return XDocument.Load(stream, LoadOptions.PreserveWhitespace);
+        using var stream = PackageResources.Open(entry);
+        return PackageResources.LoadXml(stream, LoadOptions.PreserveWhitespace);
     }
 
     static string RelsPath(string part)

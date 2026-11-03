@@ -46,15 +46,15 @@ internal static class PlainText
         return doc;
     }
 
-    public static void Write(DDocument doc, string path) =>
-        File.WriteAllText(path, ToText(doc), new UTF8Encoding(false));
+    public static void Write(DDocument doc, string path, CancellationToken ct = default) =>
+        File.WriteAllText(path, ToText(doc, ct), new UTF8Encoding(false));
 
-    public static string ToText(DDocument doc)
+    public static string ToText(DDocument doc, CancellationToken ct = default)
     {
         var sb = new StringBuilder();
         var (header, footer) = doc.HeaderFooterFor(1);
         if (PartText(header) is { Length: > 0 } top) sb.Append(top).Append(Environment.NewLine).Append(Environment.NewLine);
-        Blocks(doc.Blocks, sb);
+        Blocks(doc.Blocks, sb, ct);
 
         // Notes are listed at the end, after a short rule.
         var notes = doc.Notes().OrderBy(n => n.Endnote).ThenBy(n => n.Number).ToList();
@@ -80,10 +80,11 @@ internal static class PlainText
     static bool IsOnlyPageWords(string s) =>
         s.Split(' ', StringSplitOptions.RemoveEmptyEntries).All(w => w.Equals("page", StringComparison.OrdinalIgnoreCase) || w.Equals("of", StringComparison.OrdinalIgnoreCase));
 
-    static void Blocks(IEnumerable<DBlock> blocks, StringBuilder sb)
+    static void Blocks(IEnumerable<DBlock> blocks, StringBuilder sb, CancellationToken ct)
     {
         foreach (var block in blocks)
         {
+            ct.ThrowIfCancellationRequested();
             if (block is DParagraph p)
             {
                 if (p.ListLabel != null) sb.Append(new string(' ', p.ListLevel * 2)).Append(p.ListLabel).Append(' ');
@@ -92,7 +93,10 @@ internal static class PlainText
             else if (block is DTable t)
             {
                 foreach (var row in t.Rows)
+                {
+                    ct.ThrowIfCancellationRequested();
                     sb.Append(string.Join('\t', row.Cells.Select(c => CellText(c)))).Append(Environment.NewLine);
+                }
                 sb.Append(Environment.NewLine);
             }
         }

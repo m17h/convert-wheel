@@ -9,7 +9,7 @@ internal sealed record AnimationFrame(byte[] Bgra, int Width, int Height, int De
 
 /// <summary>
 /// Writes animated GIFs: one shared median-cut palette, ordered dithering (stable between frames, so
-/// still areas don't shimmer), and only the pixels that change are stored after the first frame.
+/// still areas don't shimmer), and delta frames for opaque animations.
 /// </summary>
 internal sealed class GifWriter : IDisposable
 {
@@ -20,21 +20,23 @@ internal sealed class GifWriter : IDisposable
     readonly int _width, _height;
     readonly byte[] _palette; // 256 * RGB
     readonly byte[] _lookup;  // 15-bit RGB -> palette index
+    readonly bool _hasTransparency;
     byte[]? _previous;
     bool _first = true;
 
-    public GifWriter(string path, int width, int height, ColorHistogram histogram)
+    public GifWriter(string path, int width, int height, ColorHistogram histogram, bool hasTransparency = false)
     {
         _out = new BufferedStream(File.Create(path), 1 << 16);
         _width = width;
         _height = height;
+        _hasTransparency = hasTransparency || histogram.HasTransparency;
         (_palette, _lookup) = histogram.BuildPalette(255);
 
         Write("GIF89a"u8);
         U16(width);
         U16(height);
         _out.WriteByte(0xF7); // global colour table, 8 bits, 256 entries
-        _out.WriteByte(0);
+        _out.WriteByte(_hasTransparency ? (byte)Transparent : (byte)0);
         _out.WriteByte(0);
         _out.Write(_palette);
         // Loop forever (NETSCAPE2.0 application extension).
@@ -50,6 +52,11 @@ internal sealed class GifWriter : IDisposable
             for (int x = 0; x < _width; x++)
             {
                 int i = (y * _width + x) * 4;
+                if (bgra[i + 3] < 128)
+                {
+                    indices[y * _width + x] = Transparent;
+                    continue;
+                }
                 int b0 = bgra[i], g0 = bgra[i + 1], r0 = bgra[i + 2];
                 int direct = _lookup[(r0 >> 3) << 10 | (g0 >> 3) << 5 | (b0 >> 3)];
                 int dr = r0 - _palette[direct * 3], dg = g0 - _palette[direct * 3 + 1], db = b0 - _palette[direct * 3 + 2];
@@ -66,7 +73,7 @@ internal sealed class GifWriter : IDisposable
 
         int left = 0, top = 0, right = _width - 1, bottom = _height - 1;
         var frame = indices;
-        if (!_first && _previous != null)
+        if (!_hasTransparency && !_first && _previous != null)
         {
             // Store only the changed rectangle; unchanged pixels inside it become transparent.
             left = _width; top = _height; right = -1; bottom = -1;
@@ -87,9 +94,10 @@ internal sealed class GifWriter : IDisposable
                 }
         }
 
-        // Graphic control extension: keep previous frame, delay, transparency.
+        // Transparent animations must clear the whole canvas before drawing the next full frame.
         int delay = Math.Max(2, (int)Math.Round(delayMs / 10.0));
-        _out.Write([0x21, 0xF9, 0x04, (byte)(0x04 | (_first ? 0 : 1)), (byte)delay, (byte)(delay >> 8), Transparent, 0x00]);
+        int control = _hasTransparency ? 0x09 : 0x04 | (_first ? 0 : 1);
+        _out.Write([0x21, 0xF9, 0x04, (byte)control, (byte)delay, (byte)(delay >> 8), Transparent, 0x00]);
         _out.WriteByte(0x2C);
         U16(left); U16(top); U16(right - left + 1); U16(bottom - top + 1);
         _out.WriteByte(0);
@@ -198,10 +206,13 @@ internal sealed class ColorHistogram
     readonly int[] _counts = new int[32768];
     readonly long[] _sumR = new long[32768], _sumG = new long[32768], _sumB = new long[32768];
 
+    public bool HasTransparency { get; private set; }
+
     public void Add(byte[] bgra, int step = 1)
     {
         for (int i = 0; i < bgra.Length; i += 4 * step)
         {
+            if (bgra[i + 3] < 128) { HasTransparency = true; continue; }
             int bin = (bgra[i + 2] >> 3) << 10 | (bgra[i + 1] >> 3) << 5 | (bgra[i] >> 3);
             _counts[bin]++;
             _sumR[bin] += bgra[i + 2]; _sumG[bin] += bgra[i + 1]; _sumB[bin] += bgra[i];
@@ -302,7 +313,13 @@ internal static class Animation
     {
         var histogram = new ColorHistogram();
         foreach (var f in frames.Where((_, i) => i % Math.Max(1, frames.Count / 30) == 0)) histogram.Add(f.Bgra, step: 3);
-        using var gif = new GifWriter(output, frames[0].Width, frames[0].Height, histogram);
+        bool hasTransparency = frames.Any(f =>
+        {
+            for (int i = 3; i < f.Bgra.Length; i += 4)
+                if (f.Bgra[i] < 128) return true;
+            return false;
+        });
+        using var gif = new GifWriter(output, frames[0].Width, frames[0].Height, histogram, hasTransparency);
         foreach (var f in frames) gif.AddFrame(f.Bgra, f.DelayMs);
     }
 }
