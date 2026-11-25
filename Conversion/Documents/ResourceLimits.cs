@@ -12,9 +12,10 @@ internal static class PackageResources
     // Counts actual decompressed bytes across every part opened from this archive.
     static readonly ConditionalWeakTable<ZipArchive, Budget> Budgets = new();
 
-    public static Stream Open(ZipArchiveEntry entry, bool media = false)
+    /// <param name="streamed">The part is read piece by piece rather than held in memory, so only the limit for the whole archive applies.</param>
+    public static Stream Open(ZipArchiveEntry entry, bool media = false, bool streamed = false)
     {
-        long limit = media ? MediaLimit : XmlLimit;
+        long limit = streamed ? ArchiveLimit : media ? MediaLimit : XmlLimit;
         if (entry.Length > limit) throw TooLarge();
         return new LimitedStream(entry.Open(), Budgets.GetOrCreateValue(entry.Archive), limit);
     }

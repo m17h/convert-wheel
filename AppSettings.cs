@@ -8,12 +8,11 @@ public sealed class AppSettings
 {
     static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
-    static string FilePath => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "ConvertWheel", "settings.json");
+    static string FilePath => Path.Combine(Log.SettingsDir, "settings.json");
 
     /// <summary>Normalized virtual keys that must all be held to open the wheel.</summary>
     public List<int> TriggerKeys { get; set; } = [VirtualKeys.Ctrl];
-    public int HoldDelayMs { get; set; } = 300;
+    public int HoldDelayMs { get; set; } = 500;
     public bool AlwaysShowAll { get; set; }
     /// <summary>When true the original is sent to the Recycle Bin after a successful conversion.</summary>
     public bool ReplaceOriginal { get; set; }
@@ -21,7 +20,6 @@ public sealed class AppSettings
     public bool UseCustomOutputFolder { get; set; }
     public string? CustomOutputFolder { get; set; }
     public bool StartWithWindows { get; set; }
-    public string? FfmpegPath { get; set; }
     public bool Paused { get; set; }
     public bool HasShownWelcome { get; set; }
 
@@ -48,8 +46,16 @@ public sealed class AppSettings
         catch (Exception ex)
         {
             Log.Write(ex);
+            KeepUnreadable();
         }
         return new AppSettings { StartWithWindows = StartupRegistered() };
+    }
+
+    /// <summary>Saving starts afresh, so a settings file that couldn't be read is set aside first.</summary>
+    static void KeepUnreadable()
+    {
+        try { File.Copy(FilePath, Path.ChangeExtension(FilePath, ".unreadable.json"), overwrite: true); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException) { }
     }
 
     const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -94,8 +100,9 @@ public sealed class AppSettings
         try
         {
             using var key = Registry.CurrentUser.CreateSubKey(RunKey);
-            if (StartWithWindows) key.SetValue("ConvertWheel", $"\"{Environment.ProcessPath}\" --background");
-            else key.DeleteValue("ConvertWheel", throwOnMissingValue: false);
+            var command = $"\"{Environment.ProcessPath}\" --background";
+            if (!StartWithWindows) key.DeleteValue("ConvertWheel", throwOnMissingValue: false);
+            else if (key.GetValue("ConvertWheel") as string != command) key.SetValue("ConvertWheel", command);
         }
         catch (Exception ex)
         {

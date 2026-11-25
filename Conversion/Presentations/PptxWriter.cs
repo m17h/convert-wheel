@@ -28,6 +28,7 @@ internal sealed class PptxWriter
     readonly Dictionary<DImage, string> _media = [];
     readonly HashSet<string> _mediaTypes = [];
     List<XElement> _rels = [];
+    SlideNumbering _numbering = new();
     int _shapeId;
 
     PptxWriter(ZipArchive zip, Deck deck, CancellationToken ct) => (_zip, _deck, _ct) = (zip, deck, ct);
@@ -62,7 +63,8 @@ internal sealed class PptxWriter
             notes ? new XElement(P + "notesMasterIdLst", new XElement(P + "notesMasterId", new XAttribute(R + "id", "rIdNotesMaster"))) : null,
             new XElement(P + "sldIdLst", Enumerable.Range(0, count).Select(i =>
                 new XElement(P + "sldId", new XAttribute("id", 256 + i), new XAttribute(R + "id", $"rId{i + 2}")))),
-            new XElement(P + "sldSz", new XAttribute("cx", Emu(_deck.Width)), new XAttribute("cy", Emu(_deck.Height))),
+            // PowerPoint's limits: 1 to 56 inches.
+            new XElement(P + "sldSz", new XAttribute("cx", Math.Clamp(Emu(_deck.Width), 914400, 51206400)), new XAttribute("cy", Math.Clamp(Emu(_deck.Height), 914400, 51206400))),
             new XElement(P + "notesSz", new XAttribute("cx", 6858000), new XAttribute("cy", 9144000))));
 
         WriteMasterAndLayout();
@@ -104,8 +106,9 @@ internal sealed class PptxWriter
             new XElement(P + "grpSpPr", Xfrm(new Rect(), 0, false, false, group: true)));
         foreach (var shape in slide.Shapes)
         {
+            _ct.ThrowIfCancellationRequested();
             try { tree.Add(Shape(shape)); }
-            catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or NotSupportedException)
+            catch (Exception ex) when (SlideLimits.CanSkip(ex))
             {
                 Log.Write($"Skipped writing a shape: {ex.Message}");
             }
@@ -115,7 +118,7 @@ internal sealed class PptxWriter
         if (slide.Background is { } bg && Fill(bg) is { } bgFill)
             cSld.Add(new XElement(P + "bg", new XElement(P + "bgPr", bgFill, new XElement(A + "effectLst"))));
         cSld.Add(tree);
-        Save($"ppt/slides/slide{index + 1}.xml", new XElement(P + "sld", Ns(), cSld,
+        Save($"ppt/slides/slide{index + 1}.xml", new XElement(P + "sld", Ns(), slide.Hidden ? new XAttribute("show", 0) : null, cSld,
             new XElement(P + "clrMapOvr", new XElement(A + "masterClrMapping"))));
         if (slide.Notes.Count > 0)
         {
@@ -142,9 +145,11 @@ internal sealed class PptxWriter
             new XAttribute("rIns", Emu(shape.Insets.Right)), new XAttribute("bIns", Emu(shape.Insets.Bottom)),
             new XAttribute("rtlCol", 0),
             new XAttribute("anchor", shape.Anchor switch { TextAnchor.Middle => "ctr", TextAnchor.Bottom => "b", _ => "t" }));
-        if (shape.TextRotation != 0) bodyPr.Add(new XAttribute("vert", shape.TextRotation == 90 ? "vert" : "vert270"));
+        if (shape.TextRotation == 180) bodyPr.Add(new XAttribute("rot", 10800000));
+        else if (shape.TextRotation != 0) bodyPr.Add(new XAttribute("vert", shape.TextRotation == 90 ? "vert" : "vert270"));
         bodyPr.Add(shape.ShrinkToFit ? new XElement(A + "normAutofit") : new XElement(A + "noAutofit"));
 
+        _numbering = new SlideNumbering();
         var txBody = new XElement(P + "txBody", bodyPr, new XElement(A + "lstStyle"));
         foreach (var p in shape.Text.OfType<DParagraph>()) txBody.Add(Paragraph(p));
         if (!txBody.Elements(A + "p").Any()) txBody.Add(new XElement(A + "p", new XElement(A + "endParaRPr", new XAttribute("lang", "en-US"))));
@@ -160,11 +165,9 @@ internal sealed class PptxWriter
     XElement Picture(SlideShape shape, int id)
     {
         var rid = Media(shape.Picture!);
-        var blipFill = new XElement(P + "blipFill", new XElement(A + "blip", new XAttribute(R + "embed", rid)));
-        if (shape.Crop != default)
-            blipFill.Add(new XElement(A + "srcRect",
-                new XAttribute("l", Pct(shape.Crop.Left)), new XAttribute("t", Pct(shape.Crop.Top)),
-                new XAttribute("r", Pct(shape.Crop.Right)), new XAttribute("b", Pct(shape.Crop.Bottom))));
+        var blipFill = new XElement(P + "blipFill", new XElement(A + "blip", new XAttribute(R + "embed", rid),
+            shape.PictureOpacity < 0.999 ? new XElement(A + "alphaModFix", new XAttribute("amt", Pct(shape.PictureOpacity))) : null));
+        if (shape.Crop != default) blipFill.Add(SourceRect(shape.Crop));
         blipFill.Add(new XElement(A + "stretch", new XElement(A + "fillRect")));
         return new XElement(P + "pic",
             new XElement(P + "nvPicPr",
@@ -175,43 +178,55 @@ internal sealed class PptxWriter
             new XElement(P + "spPr", Xfrm(shape.Bounds, shape.Rotation, shape.FlipH, shape.FlipV), Geometry(shape), Line(shape)));
     }
 
+    static XElement SourceRect(Thickness crop) => new(A + "srcRect",
+        new XAttribute("l", Pct(crop.Left)), new XAttribute("t", Pct(crop.Top)), new XAttribute("r", Pct(crop.Right)), new XAttribute("b", Pct(crop.Bottom)));
+
     XElement Table(SlideShape shape, DTable table, int id)
     {
-        int columns = Math.Max(1, table.ColumnCount);
-        var widths = table.ColumnWidths is { } w && w.Count >= columns
-            ? w.Take(columns).ToList()
-            : Enumerable.Repeat(shape.Bounds.Width / columns, columns).ToList();
-        double rowHeight = table.Rows.Count > 0 ? shape.Bounds.Height / table.Rows.Count : shape.Bounds.Height;
+        var grid = new TableGrid(table);
+        var widths = grid.Widths(shape.Bounds.Width);
+        double known = table.Rows.Sum(r => r.Height ?? 0);
+        int unknown = table.Rows.Count(r => r.Height is not > 0);
+        double share = unknown > 0 ? Math.Max(0, shape.Bounds.Height - known) / unknown : 0;
 
         var tbl = new XElement(A + "tbl",
             new XElement(A + "tblPr", new XAttribute("firstRow", table.Rows.FirstOrDefault()?.Header == true ? 1 : 0)),
             new XElement(A + "tblGrid", widths.Select(cw => new XElement(A + "gridCol", new XAttribute("w", Emu(cw))))));
-        var border = table.Borders ? table.BorderColor ?? Color.FromRgb(0x80, 0x80, 0x80) : (Color?)null;
-        foreach (var row in table.Rows)
+        var plain = table.Borders ? new CellEdge(1, table.BorderColor ?? Color.FromRgb(0x80, 0x80, 0x80)) : new CellEdge(1, null);
+        for (int r = 0; r < grid.Rows; r++)
         {
-            var tr = new XElement(A + "tr", new XAttribute("h", Emu(rowHeight)));
-            int col = 0;
-            foreach (var cell in row.Cells)
+            var row = table.Rows[r];
+            var tr = new XElement(A + "tr", new XAttribute("h", Emu(row.Height is > 0 and var h ? h : share)));
+            for (int c = 0; c < grid.Columns; c++)
             {
-                if (col >= columns) break;
-                int span = Math.Clamp(cell.ColSpan, 1, columns - col);
+                var place = grid.At(r, c);
+                // Merged cells are all written; the ones a merge covers say so, and every corner says how far it reaches.
+                bool top = place == null || place.Row == r, left = place == null || place.Column == c;
                 var txBody = new XElement(A + "txBody", new XElement(A + "bodyPr"), new XElement(A + "lstStyle"));
-                foreach (var p in cell.Blocks.OfType<DParagraph>()) txBody.Add(Paragraph(p, row.Header));
+                if (place != null && top && left)
+                {
+                    _numbering = new SlideNumbering();
+                    foreach (var p in place.Cell.Blocks.OfType<DParagraph>()) txBody.Add(Paragraph(p, row.Header));
+                }
                 if (!txBody.Elements(A + "p").Any()) txBody.Add(new XElement(A + "p"));
+                var look = place?.Cell.Look;
                 var tcPr = new XElement(A + "tcPr");
-                foreach (var side in new[] { "lnL", "lnR", "lnT", "lnB" })
-                    tcPr.Add(border is { } b
-                        ? new XElement(A + side, new XAttribute("w", 12700), Solid(b))
-                        : new XElement(A + side, new XAttribute("w", 12700), new XElement(A + "noFill")));
-                tcPr.Add(cell.Shading is { } shade ? Solid(shade) : new XElement(A + "noFill"));
-                tr.Add(new XElement(A + "tc", span > 1 ? new XAttribute("gridSpan", span) : null, txBody, tcPr));
-                for (int s = 1; s < span; s++)
-                    tr.Add(new XElement(A + "tc", new XAttribute("hMerge", 1),
-                        new XElement(A + "txBody", new XElement(A + "bodyPr"), new XElement(A + "lstStyle"), new XElement(A + "p")), new XElement(A + "tcPr")));
-                col += span;
+                if ((look?.Padding ?? table.CellPadding) is { } pad)
+                    tcPr.Add(new XAttribute("marL", Emu(pad.Left)), new XAttribute("marR", Emu(pad.Right)), new XAttribute("marT", Emu(pad.Top)), new XAttribute("marB", Emu(pad.Bottom)));
+                if (look is { Anchor: not TextAnchor.Top }) tcPr.Add(new XAttribute("anchor", look.Anchor == TextAnchor.Middle ? "ctr" : "b"));
+                foreach (var (name, side) in new[] { ("lnL", TableGrid.Side.Left), ("lnR", TableGrid.Side.Right), ("lnT", TableGrid.Side.Top), ("lnB", TableGrid.Side.Bottom) })
+                {
+                    if (grid.Edge(r, c, side, plain) is not { } line) continue;
+                    tcPr.Add(new XElement(A + name, new XAttribute("w", Emu(line.Color != null && line.Width > 0 ? line.Width : 1)), line.Color is { } color ? Solid(color) : new XElement(A + "noFill")));
+                }
+                tcPr.Add(place?.Cell.Shading is { } shade ? Solid(shade) : new XElement(A + "noFill"));
+                tr.Add(new XElement(A + "tc",
+                    place is { RowSpan: > 1 } && top ? new XAttribute("rowSpan", place.RowSpan) : null,
+                    place is { ColumnSpan: > 1 } && left ? new XAttribute("gridSpan", place.ColumnSpan) : null,
+                    left ? null : new XAttribute("hMerge", 1),
+                    top ? null : new XAttribute("vMerge", 1),
+                    txBody, tcPr));
             }
-            for (; col < columns; col++)
-                tr.Add(new XElement(A + "tc", new XElement(A + "txBody", new XElement(A + "bodyPr"), new XElement(A + "lstStyle"), new XElement(A + "p")), new XElement(A + "tcPr")));
             tbl.Add(tr);
         }
 
@@ -234,11 +249,13 @@ internal sealed class PptxWriter
         var pPr = new XElement(A + "pPr");
         if (p.Align != TextAlignment.Left)
             pPr.Add(new XAttribute("algn", p.Align switch { TextAlignment.Center => "ctr", TextAlignment.Right => "r", _ => "just" }));
-        if (p.IndentLeft != 0) pPr.Add(new XAttribute("marL", Emu(p.IndentLeft)));
-        if (p.IndentFirst != 0) pPr.Add(new XAttribute("indent", Emu(p.IndentFirst)));
+        if (p.IndentLeft != 0) pPr.Add(new XAttribute("marL", Math.Clamp(Emu(p.IndentLeft), 0, 51206400)));
+        if (p.IndentFirst != 0) pPr.Add(new XAttribute("indent", Math.Clamp(Emu(p.IndentFirst), -51206400, 51206400)));
         if (p.ListLevel > 0) pPr.Add(new XAttribute("lvl", Math.Min(8, p.ListLevel)));
+        if (p.RightToLeft) pPr.Add(new XAttribute("rtl", 1));
+        var (scheme, around, _, start) = _numbering.Next(p);
         if (Math.Abs(p.LineSpacing - 1) > 0.01)
-            pPr.Add(new XElement(A + "lnSpc", new XElement(A + "spcPct", new XAttribute("val", (int)(p.LineSpacing * 100000)))));
+            pPr.Add(new XElement(A + "lnSpc", new XElement(A + "spcPct", new XAttribute("val", Math.Clamp((int)Math.Round(p.LineSpacing * 100000), 0, 13200000)))));
         pPr.Add(new XElement(A + "spcBef", new XElement(A + "spcPts", new XAttribute("val", (int)(p.SpaceBefore * 100)))));
         pPr.Add(new XElement(A + "spcAft", new XElement(A + "spcPts", new XAttribute("val", (int)(p.SpaceAfter * 100)))));
         if (p.List == ListKind.None || string.IsNullOrEmpty(p.ListLabel))
@@ -248,10 +265,11 @@ internal sealed class PptxWriter
         else
         {
             if (p.ListColor is { } bc) pPr.Add(new XElement(A + "buClr", Rgb(bc)));
-            if (p.ListSize is { } bs) pPr.Add(new XElement(A + "buSzPct", new XAttribute("val", (int)(bs * 100000))));
+            if (p.ListSize is { } bs) pPr.Add(new XElement(A + "buSzPct", new XAttribute("val", Math.Clamp((int)(bs * 100000), 25000, 400000))));
             if (p.List == ListKind.Number)
             {
-                var (type, start) = NumberFormat(p.ListLabel);
+                var type = scheme switch { "a" => "alphaLc", "A" => "alphaUc", "i" => "romanLc", "I" => "romanUc", _ => "arabic" }
+                    + around switch { "(x)" => "ParenBoth", "x)" => "ParenR", "x" when scheme == "1" => "Plain", _ => "Period" };
                 pPr.Add(new XElement(A + "buFont", new XAttribute("typeface", "+mj-lt")));
                 pPr.Add(new XElement(A + "buAutoNum", new XAttribute("type", type), start > 1 ? new XAttribute("startAt", start) : null));
             }
@@ -295,7 +313,7 @@ internal sealed class PptxWriter
     XElement RunProps(TextStyle s, string? link, bool bold, string name)
     {
         var rPr = new XElement(A + name, new XAttribute("lang", "en-US"));
-        if (s.Size is { } size) rPr.Add(new XAttribute("sz", (int)Math.Round(size * 100)));
+        if (s.Size is { } size) rPr.Add(new XAttribute("sz", Math.Clamp((int)Math.Round(size * 100), 100, 400000)));
         if (s.Bold || bold) rPr.Add(new XAttribute("b", 1));
         if (s.Italic) rPr.Add(new XAttribute("i", 1));
         if (s.Underline) rPr.Add(new XAttribute("u", "sng"));
@@ -306,27 +324,14 @@ internal sealed class PptxWriter
         if (s.Color is { } c) rPr.Add(Solid(c));
         if (s.Highlight is { } h) rPr.Add(new XElement(A + "highlight", Rgb(h)));
         if (s.Font is { Length: > 0 } font) rPr.Add(new XElement(A + "latin", new XAttribute("typeface", font)));
-        if (link != null && Uri.TryCreate(link, UriKind.Absolute, out _) && name == "rPr")
+        if (name == "rPr" && SlideLimits.Link(link) is { } address)
         {
             var rid = $"rId{_rels.Count + 1}";
             _rels.Add(new XElement(PR + "Relationship", new XAttribute("Id", rid), new XAttribute("Type", RelBase + "hyperlink"),
-                new XAttribute("Target", link), new XAttribute("TargetMode", "External")));
+                new XAttribute("Target", address), new XAttribute("TargetMode", "External")));
             rPr.Add(new XElement(A + "hlinkClick", new XAttribute(R + "id", rid)));
         }
         return rPr;
-    }
-
-    /// <summary>The DrawingML numbering scheme for a label like "3.", "b)" or "IV.".</summary>
-    static (string type, int start) NumberFormat(string label)
-    {
-        var core = label.Trim().TrimStart('(').TrimEnd('.', ')');
-        string suffix = label.StartsWith('(') ? "ParenBoth" : label.EndsWith(')') ? "ParenR" : "Period";
-        if (int.TryParse(core, out var n)) return ("arabic" + suffix, n);
-        if (core.Length > 0 && core.All(ch => "ivxlcdm".Contains(ch))) return ("romanLc" + suffix, 1);
-        if (core.Length > 0 && core.All(ch => "IVXLCDM".Contains(ch))) return ("romanUc" + suffix, 1);
-        if (core.Length == 1 && char.IsLetter(core[0]))
-            return ((char.IsUpper(core[0]) ? "alphaUc" : "alphaLc") + suffix, char.ToLowerInvariant(core[0]) - 'a' + 1);
-        return ("arabicPeriod", 1);
     }
 
     /// <summary>Characters XML can't hold (control codes) are dropped.</summary>
@@ -389,23 +394,22 @@ internal sealed class PptxWriter
     /// <summary>A freeform outline as straight segments in the shape's own coordinates (EMU).</summary>
     static XElement CustomGeometry(SlideShape shape)
     {
-        var flat = shape.Path!.GetFlattenedPathGeometry(0.25, ToleranceType.Absolute);
-        var path = new XElement(A + "path", new XAttribute("w", Emu(shape.Bounds.Width)), new XAttribute("h", Emu(shape.Bounds.Height)));
         XElement Pt(Point p) => new(A + "pt", new XAttribute("x", Emu(p.X)), new XAttribute("y", Emu(p.Y)));
-        foreach (var figure in flat.Figures)
+        var paths = new List<XElement>();
+        // Parts that aren't filled (open lines) go in a path of their own.
+        foreach (var group in SlideRenderer.Flatten(shape.Path!).GroupBy(run => run.filled))
         {
-            path.Add(new XElement(A + "moveTo", Pt(figure.StartPoint)));
-            foreach (var segment in figure.Segments)
+            var path = new XElement(A + "path", new XAttribute("w", Emu(shape.Bounds.Width)), new XAttribute("h", Emu(shape.Bounds.Height)), group.Key ? null : new XAttribute("fill", "none"));
+            foreach (var (points, closed, _) in group)
             {
-                if (segment is PolyLineSegment poly) foreach (var pt in poly.Points) path.Add(new XElement(A + "lnTo", Pt(pt)));
-                else if (segment is LineSegment line) path.Add(new XElement(A + "lnTo", Pt(line.Point)));
+                path.Add(new XElement(A + "moveTo", Pt(points[0])), points.Skip(1).Select(p => new XElement(A + "lnTo", Pt(p))), closed ? new XElement(A + "close") : null);
             }
-            if (figure.IsClosed) path.Add(new XElement(A + "close"));
+            paths.Add(path);
         }
         return new XElement(A + "custGeom",
             new XElement(A + "avLst"), new XElement(A + "gdLst"), new XElement(A + "ahLst"), new XElement(A + "cxnLst"),
             new XElement(A + "rect", new XAttribute("l", 0), new XAttribute("t", 0), new XAttribute("r", "r"), new XAttribute("b", "b")),
-            new XElement(A + "pathLst", path));
+            new XElement(A + "pathLst", paths));
     }
 
     XElement? Fill(SlideFill fill)
@@ -414,6 +418,7 @@ internal sealed class PptxWriter
         {
             var blipFill = new XElement(A + "blipFill", new XAttribute("rotWithShape", 1), new XElement(A + "blip", new XAttribute(R + "embed", Media(fill.Image)),
                 fill.Opacity < 0.999 ? new XElement(A + "alphaModFix", new XAttribute("amt", (int)(fill.Opacity * 100000))) : null));
+            if (fill.Tile == null && fill.Crop != default) blipFill.Add(SourceRect(fill.Crop));
             blipFill.Add(fill.Tile is { } tile
                 ? new XElement(A + "tile", new XAttribute("tx", 0), new XAttribute("ty", 0), new XAttribute("sx", (int)(tile * 100000)),
                     new XAttribute("sy", (int)(tile * 100000)), new XAttribute("flip", "none"), new XAttribute("algn", "tl"))
@@ -439,10 +444,15 @@ internal sealed class PptxWriter
         if (shape.Line is not { A: > 0 } color) return new XElement(A + "ln", new XElement(A + "noFill"));
         var ln = new XElement(A + "ln", new XAttribute("w", Emu(shape.LineWidth)), Solid(color));
         if (shape.Dashed) ln.Add(new XElement(A + "prstDash", new XAttribute("val", "dash")));
-        if (shape.HeadEnd == ArrowHead.Triangle) ln.Add(new XElement(A + "headEnd", new XAttribute("type", "triangle")));
-        if (shape.TailEnd == ArrowHead.Triangle) ln.Add(new XElement(A + "tailEnd", new XAttribute("type", "triangle")));
+        if (shape.HeadEnd != ArrowHead.None) ln.Add(new XElement(A + "headEnd", new XAttribute("type", LineEnd(shape.HeadEnd))));
+        if (shape.TailEnd != ArrowHead.None) ln.Add(new XElement(A + "tailEnd", new XAttribute("type", LineEnd(shape.TailEnd))));
         return ln;
     }
+
+    static string LineEnd(ArrowHead end) => end switch
+    {
+        ArrowHead.Stealth => "stealth", ArrowHead.Open => "arrow", ArrowHead.Diamond => "diamond", ArrowHead.Oval => "oval", _ => "triangle",
+    };
 
     static XElement Solid(Color c) => new(A + "solidFill", Rgb(c));
 

@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Windows.Automation;
 using System.Windows.Media;
@@ -9,100 +9,30 @@ namespace ConvertWheel.Shell;
 
 /// <summary>
 /// Finds the file under the mouse in Explorer windows (including tabs) and on the desktop.
-/// UI Automation gives the hovered item's display name; the Explorer view hosting it gives the
-/// folder, and together they produce a real path. COM work runs on an STA worker, replaced if it hangs.
+/// UI Automation gives the hovered item's name and place in the view; the Explorer view hosting it gives the
+/// real item. COM work runs on STA workers, replaced if they hang, so a stuck Explorer can't hold anything up.
 /// </summary>
 internal sealed class ShellResolver : IDisposable
 {
-    sealed record Work(Action Run, Action Cancel);
+    static readonly TimeSpan ResolveTimeout = TimeSpan.FromMilliseconds(1500);
+    static readonly TimeSpan ThumbnailTimeout = TimeSpan.FromSeconds(5);
 
-    sealed class Worker
-    {
-        public readonly BlockingCollection<Work> Queue = new(32);
-        public bool Retired;
-    }
+    // Asking Explorer for every item of a huge view would take seconds.
+    const int MaxViewItems = 4000;
+    const int ViewBudgetMs = 600;
+    const int ViewCacheMs = 2000;
 
-    readonly object _gate = new();
-    Worker? _worker;
-    Work? _pendingResolve;
-    bool _disposed;
+    readonly StaLane _resolveLane = new("Shell resolver");
+    readonly StaLane _thumbnailLane = new("Shell thumbnails"); // a slow thumbnail mustn't delay the next hover
+    volatile ViewListing? _listing;
 
-    Worker StartWorker()
-    {
-        var worker = new Worker();
-        var thread = new Thread(() =>
-        {
-            try
-            {
-                foreach (var work in worker.Queue.GetConsumingEnumerable())
-                {
-                    lock (_gate)
-                    {
-                        if (ReferenceEquals(_pendingResolve, work)) _pendingResolve = null;
-                        if (worker.Retired) { work.Cancel(); continue; }
-                    }
-                    work.Run();
-                }
-            }
-            finally { lock (_gate) worker.Queue.Dispose(); }
-        })
-        { IsBackground = true, Name = "Shell resolver" };
-        thread.SetApartmentState(ApartmentState.STA);
-        thread.Start();
-        return worker;
-    }
+    readonly record struct ViewItem(string Name, string Path, bool IsFolder);
 
-    async Task<T?> Invoke<T>(Func<T?> func, TimeSpan timeout, bool resolve = false) where T : class
-    {
-        var tcs = new TaskCompletionSource<T?>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var work = new Work(() =>
-        {
-            if (tcs.Task.IsCompleted) return;
-            try { tcs.TrySetResult(func()); }
-            catch (Exception ex) { Log.Write(ex); tcs.TrySetResult(null); }
-        }, () => tcs.TrySetResult(null));
-        Worker worker;
-        lock (_gate)
-        {
-            if (_disposed) return null;
-            worker = _worker ??= StartWorker();
-            if (resolve)
-            {
-                _pendingResolve?.Cancel(); // Superseded requests need not enter Explorer at all.
-                _pendingResolve = work;
-            }
-            if (!worker.Queue.TryAdd(work))
-            {
-                if (ReferenceEquals(_pendingResolve, work)) _pendingResolve = null;
-                work.Cancel();
-            }
-        }
-        try { return await tcs.Task.WaitAsync(timeout).ConfigureAwait(false); }
-        catch (TimeoutException)
-        {
-            lock (_gate)
-            {
-                if (!tcs.Task.IsCompleted && ReferenceEquals(_worker, worker))
-                {
-                    Retire(worker);
-                    _worker = null; // The next request gets a fresh STA, not the hung provider.
-                }
-            }
-            return null;
-        }
-    }
+    sealed record ViewListing(nint View, string? Folder, int Count, long Time, IReadOnlyList<ViewItem> Items);
 
-    void Retire(Worker worker)
-    {
-        worker.Retired = true;
-        worker.Queue.CompleteAdding();
-        while (worker.Queue.TryTake(out var work)) work.Cancel();
-        _pendingResolve = null;
-    }
+    public Task<HoveredFile?> ResolveAsync(POINT pt) => _resolveLane.Invoke(() => Resolve(pt), ResolveTimeout);
 
-    public Task<string?> ResolveFileAsync(POINT pt) => Invoke(() => ResolveFile(pt), TimeSpan.FromSeconds(3), resolve: true);
-
-    public Task<BitmapSource?> GetThumbnailAsync(string path, int size) => Invoke(() => Thumbnail(path, size), TimeSpan.FromSeconds(5));
+    public Task<BitmapSource?> GetThumbnailAsync(string path, int size) => _thumbnailLane.Invoke(() => Thumbnail(path, size), ThumbnailTimeout);
 
     /// <summary>Cheap pre-check: is the point over a shell item view (Explorer or desktop)?</summary>
     public static bool IsOverShellView(POINT pt) => FindDefView(Win32.WindowFromPoint(pt)) != 0;
@@ -117,46 +47,26 @@ internal sealed class ShellResolver : IDisposable
         return 0;
     }
 
-    static string? ResolveFile(POINT pt)
+    HoveredFile? Resolve(POINT pt)
     {
         var defView = FindDefView(Win32.WindowFromPoint(pt));
         if (defView == 0) return null;
+        var element = HoveredItem(pt);
+        return element == null ? null : Resolve(defView, element);
+    }
 
-        var (name, itemType) = HoveredItem(pt);
-        if (string.IsNullOrWhiteSpace(name)) return null;
-
+    HoveredFile? Resolve(nint defView, AutomationElement element)
+    {
+        var name = Clean(element.Current.Name);
+        if (name.Length == 0) return null;
         var view = FindFolderView(defView);
         if (view == null) return null;
         try
         {
-            var candidates = new List<string>();
-            string? direct = null;
-            var folder = FolderPath(view);
-            if (folder != null)
-            {
-                direct = Path.Combine(folder, name);
-                if (File.Exists(direct)) candidates.Add(direct);
-                try
-                {
-                    // Extensions are hidden in Explorer: "song" could be song.ogg, song.mp3, ...
-                    candidates.AddRange(Directory.EnumerateFiles(folder, name + ".*")
-                        .Where(f => string.Equals(Path.GetFileNameWithoutExtension(f), name, StringComparison.OrdinalIgnoreCase)));
-                }
-                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException) { }
-            }
-
-            // Virtual folders (Libraries, search results, the merged desktop): ask the view itself.
-            if (candidates.Count == 0) candidates.AddRange(MatchViewItems(view, name));
-
-            if (candidates.Count > 1 && !string.IsNullOrEmpty(itemType))
-            {
-                var typed = candidates.Where(c => string.Equals(TypeName(c), itemType, StringComparison.OrdinalIgnoreCase)).ToList();
-                if (typed.Count > 0) candidates = typed;
-            }
-            var existing = candidates.Where(File.Exists).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-            if (existing.Count == 1) return existing[0];
-            // Still ambiguous: an exact name match (extensions shown) wins; otherwise don't guess.
-            return existing.FirstOrDefault(c => string.Equals(c, direct, StringComparison.OrdinalIgnoreCase));
+            var path = FindPath(defView, view, element, name);
+            if (path == null || !File.Exists(path)) return null;
+            var (selection, count) = Selection(view, path);
+            return new HoveredFile(path, selection, count);
         }
         finally
         {
@@ -164,23 +74,153 @@ internal sealed class ShellResolver : IDisposable
         }
     }
 
-    static (string? name, string? itemType) HoveredItem(POINT pt)
+    string? FindPath(nint defView, IFolderView2 view, AutomationElement element, string name)
+    {
+        // Explorer numbers its items, which is exact whatever they're called. (Grouped views number each group.)
+        if (int.TryParse(element.Current.AutomationId, out int index) && index >= 0 && !IsGrouped(view)
+            && ItemAt(view, index) is { } item && SameText(item.Name, name))
+            return item.IsFolder ? null : item.Path;
+
+        var type = new Lazy<string>(() => ShownType(element));
+        var folder = FolderPath(view);
+        // The desktop shows two folders at once (yours and everyone's), so there only the view itself knows.
+        bool merged = folder == null || SameText(folder, Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory));
+        if (!merged && OnDisk(folder!, name, type.Value) is { } onDisk) return onDisk;
+        return InView(defView, view, folder, name, type);
+    }
+
+    /// <summary>Looks the name up in the folder itself: a couple of direct checks, however big the folder is.</summary>
+    static string? OnDisk(string folder, string name, string type)
+    {
+        if (name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0) return null;
+        const int enough = 100; // more than this many files called "name.something" is too many to tell apart
+        var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { Path.Combine(folder, name) };
+        try
+        {
+            // Extensions may be hidden: "song" could be song.ogg, song.mp3, ...
+            paths.UnionWith(Directory.EnumerateFileSystemEntries(folder, name + ".*").Take(enough));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException) { }
+        if (paths.Count >= enough) return null;
+
+        var candidates = new List<ItemCandidate>();
+        foreach (var path in paths)
+        {
+            bool isFolder = Directory.Exists(path);
+            if (isFolder || File.Exists(path))
+                candidates.Add(new ItemCandidate(path, ShownName(path), TypeName(path, isFolder), isFolder));
+        }
+        return HoverMatch.Choose(name, type, candidates, complete: false);
+    }
+
+    /// <summary>Looks through the view's own items (libraries, search results, the desktop, Home).</summary>
+    string? InView(nint defView, IFolderView2 view, string? folder, string name, Lazy<string> type)
+    {
+        if (view.ItemCount(ShellIds.SVGIO_ALLVIEW, out int count) != 0) return null;
+        if (_listing is { } cached && cached.View == defView && cached.Folder == folder && cached.Count == count
+            && Environment.TickCount64 - cached.Time < ViewCacheMs && Pick(cached) is { } known)
+            return known;
+
+        var fresh = List(defView, view, folder, count);
+        _listing = fresh;
+        return fresh == null ? null : Pick(fresh); // not read in full: a match might not be the only one
+
+        string? Pick(ViewListing listing)
+        {
+            var named = listing.Items.Where(i => SameText(i.Name, name)).ToList();
+            bool needType = named.Count > 1;
+            return HoverMatch.Choose(name, needType ? type.Value : "",
+                named.Select(i => new ItemCandidate(i.Path, i.Name, needType ? TypeName(i.Path, i.IsFolder) : "", i.IsFolder)).ToList(),
+                complete: true);
+        }
+    }
+
+    static ViewListing? List(nint defView, IFolderView2 view, string? folder, int count)
+    {
+        if (count > MaxViewItems) return null;
+        var clock = Stopwatch.StartNew();
+        var items = new List<ViewItem>(count);
+        for (int i = 0; i < count; i++)
+        {
+            if (clock.ElapsedMilliseconds > ViewBudgetMs) return null;
+            if (ItemAt(view, i) is { } item) items.Add(item);
+        }
+        return new ViewListing(defView, folder, count, Environment.TickCount64, items);
+    }
+
+    static ViewItem? ItemAt(IFolderView2 view, int index)
+    {
+        var iid = ShellIds.IID_IShellItem;
+        if (view.GetItem(index, ref iid, out var obj) != 0 || obj == null) return null;
+        try
+        {
+            return obj is IShellItem item && DisplayName(item, ShellIds.SIGDN_NORMALDISPLAY) is { Length: > 0 } name
+                ? new ViewItem(name, DisplayName(item, ShellIds.SIGDN_FILESYSPATH) ?? "", IsFolder(item))
+                : null;
+        }
+        finally { Marshal.ReleaseComObject(obj); }
+    }
+
+    /// <summary>A real folder. (ZIPs and the like also open as folders, but they're files.)</summary>
+    static bool IsFolder(IShellItem item)
+    {
+        const uint mask = ShellIds.SFGAO_FOLDER | ShellIds.SFGAO_STREAM;
+        return item.GetAttributes(mask, out var attributes) >= 0 && (attributes & mask) == ShellIds.SFGAO_FOLDER;
+    }
+
+    static bool IsGrouped(IFolderView2 view) => view.GetGroupBy(out var key, out _) < 0 || key.fmtid != Guid.Empty;
+
+    /// <summary>The selected files, when the hovered one is part of the selection.</summary>
+    static (IReadOnlyList<string> Files, int Count) Selection(IFolderView2 view, string hovered)
+    {
+        const int limit = 200;
+        if (view.GetSelection(0, out var obj) != 0 || obj == null) return ([], 0);
+        try
+        {
+            if (obj is not IShellItemArray array || array.GetCount(out int count) != 0 || count < 2) return ([], 0);
+            var files = new List<string>();
+            for (int i = 0; i < Math.Min(count, limit); i++)
+            {
+                if (array.GetItemAt(i, out var item) != 0 || item == null) continue;
+                try
+                {
+                    if (!IsFolder(item) && DisplayName(item, ShellIds.SIGDN_FILESYSPATH) is { } path) files.Add(path);
+                }
+                finally { Marshal.ReleaseComObject(item); }
+            }
+            return files.Contains(hovered, StringComparer.OrdinalIgnoreCase) ? (files, count) : ([], 0);
+        }
+        finally { Marshal.ReleaseComObject(obj); }
+    }
+
+    static AutomationElement? HoveredItem(POINT pt)
     {
         var element = AutomationElement.FromPoint(new System.Windows.Point(pt.X, pt.Y));
         var walker = TreeWalker.ControlViewWalker;
         for (int i = 0; element != null && i < 6; i++)
         {
             var type = element.Current.ControlType;
-            if (type == ControlType.ListItem || type == ControlType.DataItem)
-                return (Clean(element.Current.Name), Clean(element.Current.ItemType));
+            if (type == ControlType.ListItem || type == ControlType.DataItem) return element;
             if (type == ControlType.List || type == ControlType.Window || type == ControlType.Pane ||
                 type == ControlType.DataGrid || type == ControlType.Tree || type == ControlType.Header)
                 break;
             element = walker.GetParent(element);
         }
-        return (null, null);
+        return null;
     }
 
+    /// <summary>The item's "Type" text (details and tiles views show it), or "".</summary>
+    static string ShownType(AutomationElement element)
+    {
+        var cell = element.FindFirst(TreeScope.Children, new PropertyCondition(AutomationElement.AutomationIdProperty, "System.ItemTypeText"));
+        return cell != null && cell.TryGetCurrentPattern(ValuePattern.Pattern, out var value)
+            ? Clean(((ValuePattern)value).Current.Value)
+            : Clean(element.Current.ItemType);
+    }
+
+    static bool SameText(string a, string b) => string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Without the invisible direction marks Explorer adds.</summary>
     static string Clean(string? text) =>
         new string((text ?? "").Where(c => c is not ('‎' or '‏' or (>= '‪' and <= '‮'))).ToArray()).Trim();
 
@@ -260,27 +300,6 @@ internal sealed class ShellResolver : IDisposable
         finally { Marshal.ReleaseComObject(obj); }
     }
 
-    static IEnumerable<string> MatchViewItems(IFolderView2 view, string name)
-    {
-        var matches = new List<string>();
-        if (view.ItemCount(ShellIds.SVGIO_ALLVIEW, out int count) != 0) return matches;
-        var iid = ShellIds.IID_IShellItem;
-        for (int i = 0; i < Math.Min(count, 20000); i++)
-        {
-            if (view.GetItem(i, ref iid, out var obj) != 0 || obj is not IShellItem item) continue;
-            try
-            {
-                if (DisplayName(item, ShellIds.SIGDN_NORMALDISPLAY) == name || DisplayName(item, ShellIds.SIGDN_PARENTRELATIVE) == name)
-                {
-                    var path = DisplayName(item, ShellIds.SIGDN_FILESYSPATH);
-                    if (path != null) matches.Add(path);
-                }
-            }
-            finally { Marshal.ReleaseComObject(item); }
-        }
-        return matches;
-    }
-
     static string? DisplayName(IShellItem item, uint sigdn)
     {
         if (item.GetDisplayName(sigdn, out var ptr) != 0 || ptr == 0) return null;
@@ -288,12 +307,22 @@ internal sealed class ShellResolver : IDisposable
         finally { Marshal.FreeCoTaskMem(ptr); }
     }
 
-    static string TypeName(string path)
+    /// <summary>The name Explorer shows for a file, following the "hide extensions" setting.</summary>
+    static string ShownName(string path)
     {
-        const uint SHGFI_TYPENAME = 0x400, SHGFI_USEFILEATTRIBUTES = 0x10, FILE_ATTRIBUTE_NORMAL = 0x80;
+        const uint SHGFI_DISPLAYNAME = 0x200;
         var info = new SHFILEINFO();
-        Win32.SHGetFileInfo(path, FILE_ATTRIBUTE_NORMAL, ref info, (uint)Marshal.SizeOf<SHFILEINFO>(), SHGFI_TYPENAME | SHGFI_USEFILEATTRIBUTES);
-        return info.szTypeName ?? "";
+        Win32.SHGetFileInfo(path, 0, ref info, (uint)Marshal.SizeOf<SHFILEINFO>(), SHGFI_DISPLAYNAME);
+        return Clean(info.szDisplayName);
+    }
+
+    static string TypeName(string path, bool isFolder)
+    {
+        const uint SHGFI_TYPENAME = 0x400, SHGFI_USEFILEATTRIBUTES = 0x10, FILE_ATTRIBUTE_NORMAL = 0x80, FILE_ATTRIBUTE_DIRECTORY = 0x10;
+        var info = new SHFILEINFO();
+        Win32.SHGetFileInfo(path, isFolder ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL, ref info,
+            (uint)Marshal.SizeOf<SHFILEINFO>(), SHGFI_TYPENAME | SHGFI_USEFILEATTRIBUTES);
+        return Clean(info.szTypeName);
     }
 
     static BitmapSource? Thumbnail(string path, int size)
@@ -346,12 +375,7 @@ internal sealed class ShellResolver : IDisposable
 
     public void Dispose()
     {
-        lock (_gate)
-        {
-            if (_disposed) return;
-            _disposed = true;
-            if (_worker != null) Retire(_worker);
-            _worker = null;
-        }
+        _resolveLane.Dispose();
+        _thumbnailLane.Dispose();
     }
 }

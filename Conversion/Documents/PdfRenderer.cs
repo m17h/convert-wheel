@@ -62,7 +62,7 @@ internal static class PdfRenderer
                 pdfPage.Height = XUnit.FromPoint(part.PageHeight);
                 using var gfx = XGraphics.FromPdfPage(pdfPage);
                 gfx.ScaleTransform(72.0 / 96.0); // draw in WPF device-independent pixels
-                var writer = new PageWriter(gfx, images);
+                var writer = new PageWriter(gfx, images, pdfPage);
                 var here = overlays.Where(o => o.page == i).Select(o => o.Float).ToList();
 
                 foreach (var f in here.Where(f => f.Wrap == FloatWrap.Behind)) DrawFloat(writer, part, ctx, f, Units.ToDip(part.Margins.Top));
@@ -72,6 +72,7 @@ internal static class PdfRenderer
                 var (header, footer) = part.HeaderFooterFor(number, firstOfSection: i == 0);
                 DrawHeaderFooter(writer, part, header, number, total, isHeader: true);
                 DrawHeaderFooter(writer, part, footer, number, total, isHeader: false);
+                writer.Finish();
             }
         }
         if (pdf.PageCount == 0) pdf.AddPage();
@@ -130,6 +131,30 @@ internal static class PdfRenderer
         return WindowsFontResolver.Instance.Fallback(size);
     }
 
+    internal static XFont FontFor(GlyphTypeface typeface, double size) => WindowsFontResolver.Instance.FontFor(typeface, size);
+
+    /// <summary>
+    /// Characters whose glyphs depend on their neighbours (joining and reordered scripts, combining marks, emoji
+    /// sequences). PDFsharp draws one plain glyph per character, so these need WPF's own shapes.
+    /// </summary>
+    internal static bool IsComplex(char c) => c switch
+    {
+        < '\u0300' => c == '\u00AD',
+        <= '\u036F' => true, // combining marks
+        >= '\u0590' and <= '\u109F' => true, // Hebrew and Arabic to Indic, Thai, Tibetan and Myanmar
+        >= '\u1100' and <= '\u11FF' => true, // Hangul pieces
+        >= '\u1780' and <= '\u18AF' => true, // Khmer, Mongolian
+        >= '\u1900' and <= '\u1CFF' => true, // Limbu to Vedic marks
+        >= '\u1DC0' and <= '\u1DFF' => true,
+        >= '\u200B' and <= '\u200F' or >= '\u202A' and <= '\u202E' or >= '\u2060' and <= '\u206F' => true, // joiners and direction marks
+        >= '\u20D0' and <= '\u20FF' => true,
+        >= '\u302A' and <= '\u302F' or '\u3099' or '\u309A' => true,
+        >= '\uA800' and <= '\uABFF' => true,
+        >= '\uD800' and <= '\uDFFF' => true, // emoji and other characters beyond the first plane
+        >= '\uFB1D' and <= '\uFDFF' or >= '\uFE00' and <= '\uFE0F' or >= '\uFE20' and <= '\uFE2F' or >= '\uFE70' and <= '\uFEFF' => true,
+        _ => false,
+    };
+
     /// <summary>Writes ready-made WPF visuals (e.g. slides), one per page, as vector PDF pages.</summary>
     /// <param name="page">Builds page <c>i</c>; the returned action releases it once drawn.</param>
     public static void RenderVisuals(string output, double widthPt, double heightPt, int count, Func<int, (Visual visual, Action release)> page, string? title, CancellationToken ct = default)
@@ -149,7 +174,9 @@ internal static class PdfRenderer
             {
                 using var gfx = XGraphics.FromPdfPage(pdfPage);
                 gfx.ScaleTransform(72.0 / 96.0);
-                new PageWriter(gfx, images).Visual(visual, Matrix.Identity);
+                var writer = new PageWriter(gfx, images, pdfPage);
+                writer.Visual(visual, Matrix.Identity);
+                writer.Finish();
             }
             finally { release(); }
         }
@@ -288,8 +315,32 @@ internal static class PdfRenderer
         }
     }
 
-    sealed class PageWriter(XGraphics gfx, Dictionary<ImageSource, XImage> images)
+    internal sealed class PageWriter(XGraphics gfx, Dictionary<ImageSource, XImage> images, PdfPage page)
     {
+        readonly List<(Rect area, string url, object source)> _links = [];
+        double _from = double.NegativeInfinity, _to = double.PositiveInfinity;
+
+        /// <summary>Adds what can only be added once the whole page is drawn: its links.</summary>
+        public void Finish()
+        {
+            double height = page.Height.Point;
+            foreach (var (area, url, _) in _links)
+            {
+                var r = area;
+                r.Scale(0.75, 0.75);
+                page.AddWebLink(new PdfRectangle(new XPoint(r.Left, height - r.Bottom), new XPoint(r.Right, height - r.Top)), url);
+            }
+            _links.Clear();
+        }
+
+        /// <summary>Draws only the text whose baseline lies between two heights (a table cell that continues on the next page).</summary>
+        public void Visual(Visual visual, Matrix parent, double from, double to)
+        {
+            (_from, _to) = (from, to);
+            Visual(visual, parent);
+            (_from, _to) = (double.NegativeInfinity, double.PositiveInfinity);
+        }
+
         public void Box(Rect rect, Color? fill, Color? border)
         {
             if (fill == null && border == null) return;
@@ -360,25 +411,48 @@ internal static class PdfRenderer
             var map = run.ClusterMap;
             var x = new double[advances.Count + 1];
             for (int g = 0; g < advances.Count; g++) x[g + 1] = x[g] + advances[g];
+            int GlyphOf(int character) => character >= chars.Count ? advances.Count : Math.Min(map is { Count: > 0 } && character < map.Count ? map[character] : character, advances.Count);
 
             var xbrush = new XSolidBrush(color);
             var font = WindowsFontResolver.Instance.FontFor(run.GlyphTypeface, run.FontRenderingEmSize);
             var origin = run.BaselineOrigin;
+            bool rightToLeft = (run.BidiLevel & 1) != 0;
+            if (matrix.Transform(origin).Y is var baseline && (baseline < _from || baseline >= _to)) return;
 
             WithTransform(matrix, () =>
             {
+                // Right-to-left runs stay in one piece, so readers can put the words back in order.
+                if (rightToLeft)
+                {
+                    Shaped(run, new string(chars.ToArray()), 0, advances.Count, x, font, xbrush);
+                    return;
+                }
                 // Draw word by word at WPF's positions, so justified and kerned spacing is preserved.
                 int i = 0;
                 while (i < chars.Count)
                 {
                     if (char.IsWhiteSpace(chars[i]) || chars[i] == '​') { i++; continue; }
                     int start = i;
-                    while (i < chars.Count && !char.IsWhiteSpace(chars[i]) && chars[i] != '​') i++;
-                    int glyph = map != null && start < map.Count ? map[start] : start;
+                    bool complex = false;
+                    while (i < chars.Count && !char.IsWhiteSpace(chars[i]) && chars[i] != '​') complex |= IsComplex(chars[i++]);
+                    int glyph = GlyphOf(start);
                     var word = new string(chars.Skip(start).Take(i - start).ToArray());
-                    var at = new XPoint(origin.X + x[Math.Min(glyph, x.Length - 1)], origin.Y);
+                    if (complex)
+                    {
+                        Shaped(run, i < chars.Count ? word + " " : word, glyph, GlyphOf(i), x, font, xbrush);
+                        continue;
+                    }
+                    var at = new XPoint(origin.X + x[glyph], origin.Y);
+                    int glyphs = GlyphOf(i) - glyph;
                     try
                     {
+                        // PDFsharp doesn't kern: a word that WPF set noticeably tighter goes in letter by letter.
+                        if (glyphs == word.Length && Math.Abs(x[glyph + glyphs] - x[glyph] - Enumerable.Range(glyph, glyphs).Sum(g => run.GlyphTypeface.AdvanceWidths[run.GlyphIndices[g]]) * run.FontRenderingEmSize) > run.FontRenderingEmSize * 0.06)
+                        {
+                            for (int c = 0; c < word.Length; c++)
+                                gfx.DrawString(word[c].ToString(), font, xbrush, new XPoint(origin.X + x[glyph + c], origin.Y), XStringFormats.BaseLineLeft);
+                            continue;
+                        }
                         gfx.DrawString(word, font, xbrush, at, XStringFormats.BaseLineLeft);
                     }
                     catch (Exception ex) when (ex is not OutOfMemoryException)
@@ -389,6 +463,82 @@ internal static class PdfRenderer
                     }
                 }
             });
+
+            if (brush.GetValue(FlowBridge.LinkProperty) is string url)
+            {
+                double em = run.FontRenderingEmSize;
+                var area = new Rect(rightToLeft ? origin.X - x[^1] : origin.X, origin.Y - em * run.GlyphTypeface.Baseline, x[^1], em * run.GlyphTypeface.Height);
+                area.Transform(matrix);
+                // Pieces of one link on the same line become one area.
+                if (_links.Count > 0 && _links[^1] is var last && ReferenceEquals(last.source, brush) && Math.Abs(last.area.Bottom - area.Bottom) < em / 2 && area.Left <= last.area.Right + em)
+                    _links[^1] = (Rect.Union(last.area, area), url, brush);
+                else _links.Add((area, url, brush));
+            }
+        }
+
+        /// <summary>Text drawn as the exact outlines WPF shaped, with the real characters invisibly on top for searching and copying.</summary>
+        void Shaped(GlyphRun run, string text, int from, int to, double[] x, XFont font, XBrush brush)
+        {
+            if (to <= from) return;
+            bool rightToLeft = (run.BidiLevel & 1) != 0;
+            var origin = new Point(run.BaselineOrigin.X + (rightToLeft ? -x[from] : x[from]), run.BaselineOrigin.Y);
+            var glyphs = new GlyphRun(run.GlyphTypeface, run.BidiLevel, run.IsSideways, run.FontRenderingEmSize, run.PixelsPerDip,
+                run.GlyphIndices.Skip(from).Take(to - from).ToArray(), origin, run.AdvanceWidths.Skip(from).Take(to - from).ToArray(),
+                run.GlyphOffsets is { Count: > 0 } offsets ? offsets.Skip(from).Take(to - from).ToArray() : null, null, null, null, null, null);
+            var outline = PathGeometry.CreateFromGeometry(glyphs.BuildGeometry());
+            if (outline.Figures.Count > 0) gfx.DrawPath(brush, Path(outline));
+
+            // Right-to-left text is stored the way it's drawn, left to right; readers turn it around again.
+            // (PDFsharp can't name characters beyond the first plane, so emoji are only drawn.)
+            text = string.Concat(text.Where(c => !char.IsSurrogate(c) && c is not ('‍' or '️')));
+            if (rightToLeft)
+            {
+                var elements = new List<string>();
+                for (var e = System.Globalization.StringInfo.GetTextElementEnumerator(text); e.MoveNext();) elements.Insert(0, (string)e.Current);
+                text = string.Concat(elements);
+            }
+            if (string.IsNullOrWhiteSpace(text)) return;
+            try
+            {
+                double width = Math.Abs(x[to] - x[from]), measured = gfx.MeasureString(rightToLeft ? text : text.TrimEnd(), font).Width;
+                if (width < 0.01 || measured < 0.01) return;
+                var place = Matrix.Identity;
+                place.Scale(width / measured, 1);
+                place.Translate(rightToLeft ? origin.X - width : origin.X, origin.Y);
+                WithTransform(place, () => gfx.DrawString(text, font, Invisible, new XPoint(0, 0), XStringFormats.BaseLineLeft));
+            }
+            catch (Exception ex) when (ex is not OutOfMemoryException) { Log.Write($"PDF search text left out: {ex.Message}"); }
+        }
+
+        static readonly XSolidBrush Invisible = new(XColor.FromArgb(0, 0, 0, 0));
+
+        static XGraphicsPath Path(PathGeometry geometry)
+        {
+            var path = new XGraphicsPath { FillMode = geometry.FillRule == FillRule.Nonzero ? XFillMode.Winding : XFillMode.Alternate };
+            static XPoint P(Point p) => new(p.X, p.Y);
+            foreach (var figure in geometry.Figures)
+            {
+                var at = figure.StartPoint;
+                path.StartFigure();
+                void Line(Point p) { path.AddLine(P(at), P(p)); at = p; }
+                void Cubic(Point a, Point b, Point p) { path.AddBezier(P(at), P(a), P(b), P(p)); at = p; }
+                void Quadratic(Point c, Point p) => Cubic(at + (c - at) * (2 / 3.0), p + (c - p) * (2 / 3.0), p);
+                foreach (var segment in figure.Segments)
+                {
+                    switch (segment)
+                    {
+                        case LineSegment l: Line(l.Point); break;
+                        case PolyLineSegment l: foreach (var p in l.Points) Line(p); break;
+                        case BezierSegment c: Cubic(c.Point1, c.Point2, c.Point3); break;
+                        case PolyBezierSegment c: for (int i = 0; i + 2 < c.Points.Count; i += 3) Cubic(c.Points[i], c.Points[i + 1], c.Points[i + 2]); break;
+                        case QuadraticBezierSegment q: Quadratic(q.Point1, q.Point2); break;
+                        case PolyQuadraticBezierSegment q: for (int i = 0; i + 1 < q.Points.Count; i += 2) Quadratic(q.Points[i], q.Points[i + 1]); break;
+                        case ArcSegment a: Line(a.Point); break; // glyph outlines have none
+                    }
+                }
+                path.CloseFigure();
+            }
+            return path;
         }
 
         void Geometry(GeometryDrawing drawing, Matrix matrix)

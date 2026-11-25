@@ -29,10 +29,9 @@ internal sealed class DocxWriter
     readonly List<XElement> _footnotes = [], _endnotes = [];
     readonly List<(string name, string type, XElement root, List<XElement> rels)> _parts = [];
     readonly List<(string name, byte[] data)> _media = [];
-    readonly List<XElement> _nums = [];
+    readonly ListPlanner _lists = new();
+    readonly Dictionary<string, int> _bookmarks = new(StringComparer.Ordinal);
     int _nextRel = 10, _nextDrawing = 1, _nextFootnote = 1, _nextEndnote = 1;
-    int? _currentNumId;
-    ListKind _currentKind;
 
     DocxWriter(DDocument doc, CancellationToken ct)
     {
@@ -96,6 +95,9 @@ internal sealed class DocxWriter
         var settings = new XElement(W + "settings", new XAttribute(XNamespace.Xmlns + "w", W),
             new XElement(W + "defaultTabStop", new XAttribute(W + "val", 720)));
         if (_doc.EvenHeader != null || _doc.EvenFooter != null) settings.Add(new XElement(W + "evenAndOddHeaders"));
+        // Without this Word opens the file in its "compatibility mode".
+        settings.Add(new XElement(W + "compat", new XElement(W + "compatSetting", new XAttribute(W + "name", "compatibilityMode"),
+            new XAttribute(W + "uri", "http://schemas.microsoft.com/office/word"), new XAttribute(W + "val", 15))));
 
         using var zip = new ZipArchive(File.Create(path), ZipArchiveMode.Create);
         Put(zip, "[Content_Types].xml", ContentTypes());
@@ -138,18 +140,18 @@ internal sealed class DocxWriter
             if (topLevel && i > 0 && blocks[i].Section is { } next)
             {
                 // A section ends: Word keeps its settings in the last paragraph of the section.
-                parent.Add(new XElement(W + "p", new XElement(W + "pPr", SectPr(_section))));
+                if (parent.LastNode is XElement last && last.Name == W + "p" && last.Element(W + "pPr") is { } ending && ending.Element(W + "sectPr") == null) ending.Add(SectPr(_section));
+                else parent.Add(new XElement(W + "p", new XElement(W + "pPr", SectPr(_section))));
                 _section = next;
                 available = next.ContentWidth;
             }
             if (blocks[i] is DParagraph p) parent.Add(Paragraph(p, available));
             else if (blocks[i] is DTable t)
             {
-                _currentNumId = null;
                 parent.Add(Table(t, available));
                 // Word merges back-to-back tables, and a cell must end with a paragraph.
-                bool last = i == blocks.Count - 1;
-                if ((!topLevel && last) || (!last && blocks[i + 1] is DTable)) parent.Add(new XElement(W + "p"));
+                bool ends = i == blocks.Count - 1;
+                if ((!topLevel && ends) || (!ends && blocks[i + 1] is DTable)) parent.Add(new XElement(W + "p"));
             }
         }
         if (!topLevel && !parent.Elements(W + "p").Any()) parent.Add(new XElement(W + "p"));
@@ -161,63 +163,62 @@ internal sealed class DocxWriter
         if (p.Heading > 0) pPr.Add(new XElement(W + "pStyle", new XAttribute(W + "val", $"Heading{p.Heading}")));
         if (p.PageBreakBefore) pPr.Add(new XElement(W + "pageBreakBefore"));
 
-        if (p.List != ListKind.None)
-        {
-            if (_currentNumId == null || _currentKind != p.List || (p.ListLevel == 0 && StartsNewList(p)))
-            {
-                _currentNumId = _nums.Count + 1;
-                _currentKind = p.List;
-                var num = new XElement(W + "num", new XAttribute(W + "numId", _currentNumId),
-                    new XElement(W + "abstractNumId", new XAttribute(W + "val", p.List == ListKind.Bullet ? 0 : 1)));
-                if (p.List == ListKind.Number && LeadingNumber(p.ListLabel) is int start && start != 1)
-                    num.Add(new XElement(W + "lvlOverride", new XAttribute(W + "ilvl", 0),
-                        new XElement(W + "startOverride", new XAttribute(W + "val", start))));
-                _nums.Add(num);
-            }
+        var numbered = p.List != ListKind.None ? _lists.Next(p) : null;
+        if (numbered is var (list, level))
             pPr.Add(new XElement(W + "numPr",
-                new XElement(W + "ilvl", new XAttribute(W + "val", Math.Clamp(p.ListLevel, 0, 8))),
-                new XElement(W + "numId", new XAttribute(W + "val", _currentNumId))));
-        }
-        else
-        {
-            _currentNumId = null;
-        }
+                new XElement(W + "ilvl", new XAttribute(W + "val", level)),
+                new XElement(W + "numId", new XAttribute(W + "val", list.Id))));
+        if (p.RightToLeft) pPr.Add(new XElement(W + "bidi"));
 
         var spacing = new XElement(W + "spacing",
             new XAttribute(W + "before", Units.ToTwips(p.SpaceBefore)), new XAttribute(W + "after", Units.ToTwips(p.SpaceAfter)),
             new XAttribute(W + "line", (int)Math.Round(p.LineSpacing * 240)), new XAttribute(W + "lineRule", "auto"));
         pPr.Add(spacing);
 
-        if (p.List == ListKind.None && (p.IndentLeft != 0 || p.IndentFirst != 0))
+        if (numbered == null ? p.IndentLeft != 0 || p.IndentFirst != 0 : p.IndentLeft > 0 && p.IndentFirst < 0)
         {
             var ind = new XElement(W + "ind", new XAttribute(W + "left", Units.ToTwips(p.IndentLeft)));
             if (p.IndentFirst > 0) ind.Add(new XAttribute(W + "firstLine", Units.ToTwips(p.IndentFirst)));
             else if (p.IndentFirst < 0) ind.Add(new XAttribute(W + "hanging", Units.ToTwips(-p.IndentFirst)));
             pPr.Add(ind);
         }
-        if (p.Align != TextAlignment.Left)
+        // Word's "left" is the starting side, which is the right in right-to-left text.
+        if (p.Align != (p.RightToLeft ? TextAlignment.Right : TextAlignment.Left))
             pPr.Add(new XElement(W + "jc", new XAttribute(W + "val", p.Align switch
             {
                 TextAlignment.Center => "center",
-                TextAlignment.Right => "right",
-                _ => "both",
+                TextAlignment.Justify => "both",
+                _ => "right",
             })));
         if (p.Inlines.Count == 0 && p.MarkSize is double mark && Math.Abs(mark - _doc.FontSize) > 0.1)
             pPr.Add(new XElement(W + "rPr", new XElement(W + "sz", new XAttribute(W + "val", (int)Math.Round(mark * 2)))));
 
         var para = new XElement(W + "p", pPr);
+        // A marker that isn't a list Word can number.
+        if (p.ListLabel is { Length: > 0 } label && numbered == null)
+            para.Add(new XElement(W + "r", new XElement(W + "t", Clean(label)), new XElement(W + "tab")));
         foreach (var inline in p.Inlines)
         {
             switch (inline)
             {
                 case DText t:
-                    var runs = Runs(t, p.Heading > 0);
-                    if (t.Link != null && Uri.IsWellFormedUriString(t.Link, UriKind.Absolute))
+                    var target = LinkTarget(t.Link);
+                    var runs = Runs(t, p.Heading > 0, target != null, p.RightToLeft);
+                    if (target is ['#', .. var place]) para.Add(new XElement(W + "hyperlink", new XAttribute(W + "anchor", Bookmark(place)), new XAttribute(W + "history", 1), runs));
+                    else if (target != null)
                     {
-                        var id = NewRel("hyperlink", t.Link, external: true);
+                        if (!_links.TryGetValue((_rels, target), out var id)) _links[(_rels, target)] = id = NewRel("hyperlink", target, external: true);
                         para.Add(new XElement(W + "hyperlink", new XAttribute(R + "id", id), runs));
                     }
                     else para.Add(runs);
+                    break;
+                case DAnchor a:
+                    if (_placed.Add(a.Name))
+                    {
+                        int bookmarkId = _placed.Count;
+                        para.Add(new XElement(W + "bookmarkStart", new XAttribute(W + "id", bookmarkId), new XAttribute(W + "name", Bookmark(a.Name))),
+                            new XElement(W + "bookmarkEnd", new XAttribute(W + "id", bookmarkId)));
+                    }
                     break;
                 case DLineBreak:
                     para.Add(new XElement(W + "r", new XElement(W + "br")));
@@ -242,6 +243,27 @@ internal sealed class DocxWriter
         return para;
     }
 
+    readonly Dictionary<(List<XElement> part, string target), string> _links = [];
+    readonly HashSet<string> _placed = new(StringComparer.Ordinal);
+
+    /// <summary>A link Word can follow: a place in the document, an address, or a relative one.</summary>
+    static string? LinkTarget(string? link)
+    {
+        if (link is ['#', _, ..]) return link;
+        if (Links.ForDocument(link) is not { } safe || safe.StartsWith('#')) return null;
+        if (Uri.IsWellFormedUriString(safe, UriKind.RelativeOrAbsolute)) return safe;
+        return Uri.TryCreate(safe, UriKind.Absolute, out var uri) && Uri.IsWellFormedUriString(uri.AbsoluteUri, UriKind.Absolute) ? uri.AbsoluteUri : null;
+    }
+
+    /// <summary>A bookmark's name as Word allows it: letters, digits and underscores, 40 at most, each only once.</summary>
+    string Bookmark(string name)
+    {
+        if (!_bookmarks.TryGetValue(name, out int number)) _bookmarks[name] = number = _bookmarks.Count + 1;
+        var clean = new string(name.Select(c => char.IsLetterOrDigit(c) && !char.IsSurrogate(c) ? c : '_').ToArray());
+        if (clean == name && name.Length <= 40 && char.IsLetter(name[0]) || clean == name && name.Length <= 40 && name[0] == '_') return name;
+        return $"b{number}_{(clean.Length > 30 ? clean[..30] : clean)}";
+    }
+
     // ------------------------------------------------------------------ notes, headers, floats
 
     XElement NoteReference(DNote note)
@@ -256,7 +278,7 @@ internal sealed class DocxWriter
         var element = new XElement(W + tag, new XAttribute(W + "id", id));
         var blocks = FlowBridge.WithoutMark(note);
         Blocks(blocks, element, _doc.ContentWidth, topLevel: false);
-        var first = element.Element(W + "p")!;
+        if (element.FirstNode is not XElement first || first.Name != W + "p") element.AddFirst(first = new XElement(W + "p"));
         var pPr = first.Element(W + "pPr");
         var markRun = new XElement(W + "r",
             new XElement(W + "rPr", new XElement(W + "rStyle", new XAttribute(W + "val", endnote ? "EndnoteReference" : "FootnoteReference"))),
@@ -369,7 +391,7 @@ internal sealed class DocxWriter
                 FloatWrap.Behind or FloatWrap.InFront => new XElement(WP + "wrapNone"),
                 _ => new XElement(WP + "wrapSquare", new XAttribute("wrapText", "bothSides")),
             },
-            new XElement(WP + "docPr", new XAttribute("id", id), new XAttribute("name", f.Image != null ? $"Picture {id}" : $"Text Box {id}")),
+            new XElement(WP + "docPr", new XAttribute("id", id), new XAttribute("name", f.Image != null ? $"Picture {id}" : $"Text Box {id}"), Description(f.Image)),
             new XElement(WP + "cNvGraphicFramePr"),
             graphic);
 
@@ -380,48 +402,79 @@ internal sealed class DocxWriter
             : new XElement(W + "r", new XElement(MC + "AlternateContent", new XElement(MC + "Choice", new XAttribute("Requires", "wps"), drawing)));
     }
 
-    bool StartsNewList(DParagraph p) => p.List == ListKind.Number && LeadingNumber(p.ListLabel) == 1;
-
-    static int? LeadingNumber(string? label)
+    static IEnumerable<XElement> Runs(DText t, bool heading, bool link, bool rtl)
     {
-        if (label == null) return null;
-        var digits = new string(label.TakeWhile(char.IsDigit).ToArray());
-        return int.TryParse(digits, out var n) ? n : null;
+        // Word needs to be told which text runs right to left (it sizes and orders it separately).
+        var pieces = rtl || t.Text.Any(c => Bidi.IsRightToLeft(c)) ? ByDirection(t.Text, rtl) : [(t.Text, false)];
+        foreach (var (text, backwards) in pieces)
+            foreach (var run in Run(text, t.Style, heading, link, backwards)) yield return run;
     }
 
-    IEnumerable<XElement> Runs(DText t, bool heading)
+    /// <summary>Text split where its direction changes; spaces and punctuation go with what's before them.</summary>
+    static IEnumerable<(string text, bool rtl)> ByDirection(string text, bool rtl)
     {
-        var rPr = RunProps(t.Style, t.Link != null, heading);
-        var parts = t.Text.Split('\t');
+        int start = 0;
+        bool current = rtl, any = false;
+        for (int i = 0; i < text.Length; i++)
+        {
+            bool strong = char.IsLetter(text[i]) || char.IsDigit(text[i]);
+            if (!strong) continue;
+            bool here = Bidi.IsRightToLeft(text[i]);
+            if (any && here != current)
+            {
+                yield return (text[start..i], current);
+                start = i;
+            }
+            (current, any) = (here, true);
+        }
+        if (start < text.Length) yield return (text[start..], current);
+    }
+
+    static IEnumerable<XElement> Run(string text, TextStyle style, bool heading, bool link, bool rtl)
+    {
+        var rPr = RunProps(style, link, heading, rtl);
+        var parts = text.Split('\t');
         var run = new XElement(W + "r");
         if (rPr.HasElements) run.Add(rPr);
         for (int i = 0; i < parts.Length; i++)
         {
             if (i > 0) run.Add(new XElement(W + "tab"));
-            if (parts[i].Length > 0) run.Add(new XElement(W + "t", new XAttribute(XNamespace.Xml + "space", "preserve"), Clean(parts[i])));
+            var lines = parts[i].Split('\n');
+            for (int k = 0; k < lines.Length; k++)
+            {
+                if (k > 0) run.Add(new XElement(W + "br"));
+                if (lines[k].Length > 0) run.Add(new XElement(W + "t", new XAttribute(XNamespace.Xml + "space", "preserve"), Clean(lines[k])));
+            }
         }
         yield return run;
     }
 
     /// <param name="heading">Source-styled heading text stays unbolded if it was, rather than taking the heading style's bold.</param>
-    static XElement RunProps(TextStyle s, bool link, bool heading)
+    static XElement RunProps(TextStyle s, bool link, bool heading, bool rtl = false)
     {
         var rPr = new XElement(W + "rPr");
         if (link) rPr.Add(new XElement(W + "rStyle", new XAttribute(W + "val", "Hyperlink")));
-        if (s.Font != null)
-            rPr.Add(new XElement(W + "rFonts", new XAttribute(W + "ascii", s.Font), new XAttribute(W + "hAnsi", s.Font), new XAttribute(W + "cs", s.Font)));
-        if (s.Bold) rPr.Add(new XElement(W + "b"));
+        if (s.Font is { Length: > 0 })
+        {
+            var font = FontName(s.Font);
+            rPr.Add(new XElement(W + "rFonts", new XAttribute(W + "ascii", font), new XAttribute(W + "hAnsi", font), new XAttribute(W + "cs", font)));
+        }
+        if (s.Bold) rPr.Add(new XElement(W + "b"), rtl ? new XElement(W + "bCs") : null);
         else if (heading && s.Size != null) rPr.Add(new XElement(W + "b", new XAttribute(W + "val", 0)));
-        if (s.Italic) rPr.Add(new XElement(W + "i"));
+        if (s.Italic) rPr.Add(new XElement(W + "i"), rtl ? new XElement(W + "iCs") : null);
         if (s.Strike) rPr.Add(new XElement(W + "strike"));
         if (s.Color is { } c) rPr.Add(new XElement(W + "color", new XAttribute(W + "val", Units.Hex(c))));
-        if (s.Size is double size) rPr.Add(new XElement(W + "sz", new XAttribute(W + "val", (int)Math.Round(size * 2))));
+        if (s.Size is double size) rPr.Add(new XElement(W + "sz", new XAttribute(W + "val", (int)Math.Round(size * 2))), rtl ? new XElement(W + "szCs", new XAttribute(W + "val", (int)Math.Round(size * 2))) : null);
         if (s.Underline) rPr.Add(new XElement(W + "u", new XAttribute(W + "val", "single")));
         if (s.Highlight is { } h)
             rPr.Add(new XElement(W + "shd", new XAttribute(W + "val", "clear"), new XAttribute(W + "color", "auto"), new XAttribute(W + "fill", Units.Hex(h))));
         if (s.Superscript || s.Subscript) rPr.Add(new XElement(W + "vertAlign", new XAttribute(W + "val", s.Superscript ? "superscript" : "subscript")));
+        if (rtl) rPr.Add(new XElement(W + "rtl"));
         return rPr;
     }
+
+    /// <summary>Word gives up on font names longer than 31 characters.</summary>
+    static string FontName(string name) => name.Length > 31 ? name[..31] : name;
 
     /// <summary>Removes characters that are illegal in XML.</summary>
     static string Clean(string s) => SafeXml.Text(s);
@@ -436,18 +489,29 @@ internal sealed class DocxWriter
         return new XElement(W + "r", new XElement(W + "drawing",
             new XElement(WP + "inline", new XAttribute("distT", 0), new XAttribute("distB", 0), new XAttribute("distL", 0), new XAttribute("distR", 0),
                 new XElement(WP + "extent", new XAttribute("cx", cx), new XAttribute("cy", cy)),
-                new XElement(WP + "docPr", new XAttribute("id", id), new XAttribute("name", $"Picture {id}")),
+                new XElement(WP + "docPr", new XAttribute("id", id), new XAttribute("name", $"Picture {id}"), Description(img)),
                 new XElement(A + "graphic",
                     new XElement(A + "graphicData", new XAttribute("uri", PIC.NamespaceName), Picture(id, name, rid, cx, cy))))));
     }
 
+    static XAttribute? Description(DImage? img) => img?.Alt is { Length: > 0 } alt ? new XAttribute("descr", alt) : null;
+
+    readonly Dictionary<byte[], string> _mediaNames = new(ReferenceEqualityComparer.Instance);
+    readonly Dictionary<(List<XElement> part, string name), string> _mediaRels = [];
+
     /// <summary>Stores the picture in word/media and links it from the part being written.</summary>
     string AddMedia(DImage img, out string name)
     {
-        var ext = img.Ext == "jpeg" ? "jpg" : img.Ext;
-        name = $"image{_media.Count + 1}.{ext}";
-        _media.Add((name, img.Data));
-        return NewRel("image", "media/" + name, external: false);
+        // The type is in the bytes; the name may be out of date.
+        var ext = HtmlReader.ImageExt(img.Data) ?? img.Ext;
+        if (ext == "jpeg") ext = "jpg";
+        if (!_mediaNames.TryGetValue(img.Data, out name!))
+        {
+            _mediaNames[img.Data] = name = $"image{_media.Count + 1}.{ext}";
+            _media.Add((name, img.Data));
+        }
+        if (!_mediaRels.TryGetValue((_rels, name), out var id)) _mediaRels[(_rels, name)] = id = NewRel("image", "media/" + name, external: false);
+        return id;
     }
 
     static XElement Picture(int id, string name, string rid, long cx, long cy) =>
@@ -483,29 +547,40 @@ internal sealed class DocxWriter
         var table = new XElement(W + "tbl", tblPr,
             new XElement(W + "tblGrid", widths.Select(w => new XElement(W + "gridCol", new XAttribute(W + "w", Units.ToTwips(w))))));
 
-        foreach (var row in t.Rows)
+        int rowsLeft = t.Rows.Count;
+        foreach (var (row, slots) in t.Slots())
         {
             _ct.ThrowIfCancellationRequested();
+            rowsLeft--;
             var tr = new XElement(W + "tr");
             if (row.Header) tr.Add(new XElement(W + "trPr", new XElement(W + "tblHeader")));
             int col = 0;
-            foreach (var cell in row.Cells)
+            foreach (var (cell, column, span, covered) in slots)
             {
-                int span = Math.Max(1, cell.ColSpan);
+                for (; col < column; col++) tr.Add(EmptyCell(widths[col]));
                 double width = widths.Skip(col).Take(span).Sum();
                 col += span;
                 var tcPr = new XElement(W + "tcPr", new XElement(W + "tcW", new XAttribute(W + "w", Units.ToTwips(width)), new XAttribute(W + "type", "dxa")));
                 if (span > 1) tcPr.Add(new XElement(W + "gridSpan", new XAttribute(W + "val", span)));
+                if (covered || cell.RowSpan > 1 && rowsLeft > 0) tcPr.Add(new XElement(W + "vMerge", covered ? null : new XAttribute(W + "val", "restart")));
                 if (cell.Shading is { } shade)
                     tcPr.Add(new XElement(W + "shd", new XAttribute(W + "val", "clear"), new XAttribute(W + "color", "auto"), new XAttribute(W + "fill", Units.Hex(shade))));
                 var tc = new XElement(W + "tc", tcPr);
-                Blocks(cell.Blocks, tc, Math.Max(20, width - 10.8), topLevel: false);
+                if (covered) tc.Add(new XElement(W + "p"));
+                else Blocks(cell.Blocks, tc, Math.Max(20, width - 10.8), topLevel: false);
                 tr.Add(tc);
             }
+            // Word calls a row with no cells damage.
+            if (slots.Count == 0) tr.Add(EmptyCell(widths.Sum(), columns));
             table.Add(tr);
         }
         return table;
     }
+
+    static XElement EmptyCell(double width, int span = 1) => new(W + "tc",
+        new XElement(W + "tcPr", new XElement(W + "tcW", new XAttribute(W + "w", Units.ToTwips(width)), new XAttribute(W + "type", "dxa")),
+            span > 1 ? new XElement(W + "gridSpan", new XAttribute(W + "val", span)) : null),
+        new XElement(W + "p"));
 
     // ------------------------------------------------------------------ package parts
 
@@ -535,7 +610,7 @@ internal sealed class DocxWriter
         if (_footnotes.Count > 0) types.Add(Override("/word/footnotes.xml", Ml + "footnotes+xml"));
         if (_endnotes.Count > 0) types.Add(Override("/word/endnotes.xml", Ml + "endnotes+xml"));
         foreach (var ext in _media.Select(m => Path.GetExtension(m.name).TrimStart('.')).Distinct())
-            types.Add(Default(ext, ext switch { "jpg" => "image/jpeg", "tiff" => "image/tiff", _ => $"image/{ext}" }));
+            types.Add(Default(ext, ext switch { "jpg" => "image/jpeg", "tiff" => "image/tiff", "emf" or "wmf" => $"image/x-{ext}", _ => $"image/{ext}" }));
         return types;
 
         static XElement Default(string ext, string type) => new(CT + "Default", new XAttribute("Extension", ext), new XAttribute("ContentType", type));
@@ -544,7 +619,7 @@ internal sealed class DocxWriter
 
     XElement Styles()
     {
-        var font = _doc.Font;
+        var font = FontName(_doc.Font);
         var styles = new XElement(W + "styles", new XAttribute(XNamespace.Xmlns + "w", W),
             new XElement(W + "docDefaults",
                 new XElement(W + "rPrDefault", new XElement(W + "rPr",
@@ -583,29 +658,29 @@ internal sealed class DocxWriter
         new(W + "style", new XAttribute(W + "type", "character"), new XAttribute(W + "styleId", id),
             new XElement(W + "name", new XAttribute(W + "val", name)), new XElement(W + "rPr", runProps));
 
+    /// <summary>
+    /// Each list has a definition of its own: Word carries numbers on from one list to the next when they share one.
+    /// </summary>
     XElement Numbering()
     {
         string[] bullets = ["•", "◦", "▪"];
-        string[] formats = ["decimal", "lowerLetter", "lowerRoman"];
-        var numbering = new XElement(W + "numbering", new XAttribute(XNamespace.Xmlns + "w", W),
-            Abstract(0, level => ("bullet", bullets[level % 3])),
-            Abstract(1, level => (formats[level % 3], $"%{level + 1}.")));
-        numbering.Add(_nums);
-        return numbering;
-
-        static XElement Abstract(int id, Func<int, (string format, string text)> level) =>
-            new(W + "abstractNum", new XAttribute(W + "abstractNumId", id),
+        var numbering = new XElement(W + "numbering", new XAttribute(XNamespace.Xmlns + "w", W));
+        foreach (var list in _lists.Definitions)
+            numbering.Add(new XElement(W + "abstractNum", new XAttribute(W + "abstractNumId", list.Id),
                 new XElement(W + "multiLevelType", new XAttribute(W + "val", "hybridMultilevel")),
                 Enumerable.Range(0, 9).Select(i =>
                 {
-                    var (format, text) = level(i);
+                    var look = list.Levels[i] ?? new ListPlanner.LevelLook(ListKind.Bullet, "bullet", bullets[i % 3], 1);
                     return new XElement(W + "lvl", new XAttribute(W + "ilvl", i),
-                        new XElement(W + "start", new XAttribute(W + "val", 1)),
-                        new XElement(W + "numFmt", new XAttribute(W + "val", format)),
-                        new XElement(W + "lvlText", new XAttribute(W + "val", text)),
+                        new XElement(W + "start", new XAttribute(W + "val", Math.Max(0, look.Start))),
+                        new XElement(W + "numFmt", new XAttribute(W + "val", look.Format)),
+                        new XElement(W + "lvlText", new XAttribute(W + "val", look.Text)),
                         new XElement(W + "lvlJc", new XAttribute(W + "val", "left")),
                         new XElement(W + "pPr", new XElement(W + "ind", new XAttribute(W + "left", 720 * (i + 1)), new XAttribute(W + "hanging", 360))));
-                }));
+                })));
+        foreach (var list in _lists.Definitions)
+            numbering.Add(new XElement(W + "num", new XAttribute(W + "numId", list.Id), new XElement(W + "abstractNumId", new XAttribute(W + "val", list.Id))));
+        return numbering;
     }
 
     static void Put(ZipArchive zip, string name, XElement root)

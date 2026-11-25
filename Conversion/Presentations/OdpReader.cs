@@ -20,15 +20,18 @@ internal sealed partial class OdpReader
 
     readonly ZipArchive _zip;
     readonly CancellationToken _ct;
-    readonly OdfRepetitions _repeats = new();
     readonly Dictionary<string, XElement> _styles = [];
+    /// <summary>Styles only the master pages use; the slides may have others by the same name.</summary>
+    readonly Dictionary<string, XElement> _masterStyles = [];
     readonly Dictionary<string, XElement> _listStyles = [];
     readonly Dictionary<string, XElement> _gradients = [];
     readonly Dictionary<string, XElement> _fillImages = [];
+    readonly Dictionary<string, XElement> _opacities = [];
     readonly Dictionary<string, string> _fontFaces = [];
     readonly Dictionary<string, DImage?> _images = [];
     XElement? _defaultGraphic;
-    int _pageNumber;
+    int _pageNumber, _shapes;
+    bool _onMaster;
 
     sealed class Run
     {
@@ -42,18 +45,7 @@ internal sealed partial class OdpReader
 
     OdpReader(ZipArchive zip, CancellationToken ct) => (_zip, _ct) = (zip, ct);
 
-    public static Deck Read(string path, CancellationToken ct = default)
-    {
-        try
-        {
-            using var zip = ZipFile.OpenRead(path);
-            return new OdpReader(zip, ct).Build(Path.GetFileNameWithoutExtension(path));
-        }
-        catch (InvalidDataException)
-        {
-            throw new ConversionException("This presentation is damaged or password-protected.");
-        }
-    }
+    public static Deck Read(ZipArchive zip, string title, CancellationToken ct = default) => new OdpReader(zip, ct).Build(title);
 
     Deck Build(string title)
     {
@@ -66,11 +58,14 @@ internal sealed partial class OdpReader
                 if ((string?)face.Attribute(St + "name") is { } name)
                     _fontFaces[name] = ((string?)face.Attribute(Svg + "font-family") ?? name).Trim('\'', '"');
             foreach (var s in root.Descendants(St + "style"))
-                if ((string?)s.Attribute(St + "name") is { } name) _styles[name] = s;
+                if ((string?)s.Attribute(St + "name") is { } name)
+                    (root == styles && s.Parent?.Name.LocalName == "automatic-styles" ? _masterStyles : _styles)[name] = s;
             foreach (var s in root.Descendants(Text + "list-style"))
                 if ((string?)s.Attribute(St + "name") is { } name) _listStyles[name] = s;
             foreach (var g in root.Descendants(Draw + "gradient"))
                 if ((string?)g.Attribute(Draw + "name") is { } name) _gradients[name] = g;
+            foreach (var o in root.Descendants(Draw + "opacity"))
+                if ((string?)o.Attribute(Draw + "name") is { } name) _opacities[name] = o;
             foreach (var f in root.Descendants(Draw + "fill-image"))
                 if ((string?)f.Attribute(Draw + "name") is { } name) _fillImages[name] = f;
             _defaultGraphic ??= root.Descendants(St + "default-style").FirstOrDefault(d => (string?)d.Attribute(St + "family") == "graphic");
@@ -80,8 +75,13 @@ internal sealed partial class OdpReader
         var defaultText = _defaultGraphic?.Element(St + "text-properties");
         deck.Font = FontOf(defaultText) ?? "Liberation Sans";
 
-        var masters = styles?.Descendants(St + "master-page").ToDictionary(m => (string?)m.Attribute(St + "name") ?? "", m => m) ?? [];
-        var layoutName = (string?)masters.Values.FirstOrDefault()?.Attribute(St + "page-layout-name");
+        var pages = content.Element(Office + "body")?.Element(Office + "presentation")?.Elements(Draw + "page").ToList()
+            ?? throw new ConversionException("This isn't an OpenDocument presentation.");
+        var masters = new Dictionary<string, XElement>();
+        foreach (var m in styles?.Descendants(St + "master-page") ?? []) masters.TryAdd((string?)m.Attribute(St + "name") ?? "", m);
+        // Pages have one size in every app: the one the first slide's master uses.
+        masters.TryGetValue((string?)pages.FirstOrDefault()?.Attribute(Draw + "master-page-name") ?? "", out var firstMaster);
+        var layoutName = (string?)(firstMaster ?? masters.Values.FirstOrDefault())?.Attribute(St + "page-layout-name");
         var layout = styles?.Descendants(St + "page-layout").FirstOrDefault(l => (string?)l.Attribute(St + "name") == layoutName)?.Element(St + "page-layout-properties");
         if (Len(layout, Fo + "page-width") is double w && Len(layout, Fo + "page-height") is double h && w > 36 && h > 36)
         {
@@ -90,17 +90,29 @@ internal sealed partial class OdpReader
         }
         else (deck.Width, deck.Height) = (792, 612);
 
-        var pages = content.Element(Office + "body")?.Element(Office + "presentation")?.Elements(Draw + "page") ?? [];
         foreach (var page in pages)
         {
             _ct.ThrowIfCancellationRequested();
-            _pageNumber++;
+            SlideLimits.CheckSlides(++_pageNumber);
             masters.TryGetValue((string?)page.Attribute(Draw + "master-page-name") ?? "", out var master);
             master ??= masters.Values.FirstOrDefault();
-            var slide = new Slide { Background = Background(page) ?? (master != null ? Background(master) : null) ?? SlideFill.Solid(Colors.White) };
-            var pageStyle = Style((string?)page.Attribute(Draw + "style-name"));
-            bool showMaster = (string?)pageStyle?.Element(St + "drawing-page-properties")?.Attribute(Pres + "background-objects-visible") != "false";
-            if (master != null && showMaster) ReadShapes(master.Elements(), slide.Shapes, onMaster: true);
+            var background = Background(page);
+            _onMaster = true;
+            background ??= master != null ? Background(master) : null;
+            _onMaster = false;
+            var pageProps = Style((string?)page.Attribute(Draw + "style-name"))?.Element(St + "drawing-page-properties");
+            var slide = new Slide
+            {
+                Background = background ?? SlideFill.Solid(Colors.White),
+                Hidden = (string?)pageProps?.Attribute(Pres + "visibility") == "hidden",
+            };
+            bool showMaster = (string?)pageProps?.Attribute(Pres + "background-objects-visible") != "false";
+            if (master != null && showMaster)
+            {
+                _onMaster = true;
+                ReadShapes(master.Elements(), slide.Shapes, onMaster: true);
+                _onMaster = false;
+            }
             ReadShapes(page.Elements(), slide.Shapes, onMaster: false);
             foreach (var frame in page.Element(Pres + "notes")?.Elements(Draw + "frame").Where(f => (string?)f.Attribute(Pres + "class") == "notes") ?? [])
                 foreach (var p in frame.Descendants().Where(e => e.Name == Text + "p" || e.Name == Text + "h"))
@@ -125,6 +137,7 @@ internal sealed partial class OdpReader
     {
         foreach (var el in elements)
         {
+            SlideLimits.CheckShapes(++_shapes);
             try
             {
                 // Master pages hold placeholder prompts ("Click to add Title") that never show on slides.
@@ -133,12 +146,18 @@ internal sealed partial class OdpReader
                 switch (el.Name.LocalName)
                 {
                     case "g":
+                        int start = into.Count;
+                        ReadShapes(el.Elements(), into, onMaster);
+                        if (TransformOf(el) is { } move)
+                            for (int i = start; i < into.Count; i++) into[i].Transform(move.matrix);
+                        break;
+                    case "a": // a link around shapes
                         ReadShapes(el.Elements(), into, onMaster);
                         break;
                     case "frame":
                         ReadFrame(el, into);
                         break;
-                    case "custom-shape" or "rect" or "ellipse" or "circle" or "polygon" or "polyline" or "path" or "regular-polygon":
+                    case "custom-shape" or "rect" or "ellipse" or "circle" or "polygon" or "polyline" or "path" or "regular-polygon" or "caption":
                         if (ReadShape(el) is { } shape) into.Add(shape);
                         break;
                     case "line" or "connector":
@@ -146,7 +165,7 @@ internal sealed partial class OdpReader
                         break;
                 }
             }
-            catch (Exception ex) when (ex is FormatException or ArgumentException or InvalidOperationException)
+            catch (Exception ex) when (SlideLimits.CanSkip(ex))
             {
                 Log.Write($"Skipped a shape on slide {_pageNumber}: {ex.Message}");
             }
@@ -184,7 +203,7 @@ internal sealed partial class OdpReader
         {
             var shape = NewShape(frame);
             shape.Picture = picture;
-            ApplyStroke(shape, chain);
+            PictureLook(shape, chain, picture);
             into.Add(shape);
             if (image.Elements(Text + "p").Any(p => p.Value.Trim().Length > 0))
             {
@@ -203,6 +222,25 @@ internal sealed partial class OdpReader
             into.Add(shape);
         }
     }
+
+    /// <summary>A picture's outline, mirroring, cropping and transparency.</summary>
+    void PictureLook(SlideShape shape, List<XElement> chain, DImage picture)
+    {
+        ApplyStroke(shape, chain);
+        var mirror = Graphic(chain, St + "mirror") ?? "";
+        if (mirror.Contains("horizontal")) shape.FlipH ^= true;
+        if (mirror.Contains("vertical")) shape.FlipV ^= true;
+        if (Percent(Graphic(chain, Draw + "image-opacity")) is double opacity) shape.PictureOpacity = Math.Clamp(opacity, 0, 1);
+        // Cropping is given as lengths of the picture at its own size.
+        if (ClipRegex().Match(Graphic(chain, Fo + "clip") ?? "") is { Success: true } clip && picture.Width > 0 && picture.Height > 0)
+        {
+            double Side(int group, double size) => Math.Clamp((Units.ParseLength(clip.Groups[group].Value) ?? 0) / size, -100, 1);
+            shape.Crop = new Thickness(Side(4, picture.Width), Side(1, picture.Height), Side(2, picture.Width), Side(3, picture.Height));
+        }
+    }
+
+    [GeneratedRegex(@"rect\s*\(\s*([-+0-9.a-z]+)[\s,]+([-+0-9.a-z]+)[\s,]+([-+0-9.a-z]+)[\s,]+([-+0-9.a-z]+)\s*\)")]
+    private static partial Regex ClipRegex();
 
     SlideShape? ReadShape(XElement el)
     {
@@ -255,33 +293,53 @@ internal sealed partial class OdpReader
         return shape;
     }
 
-    /// <summary>Position, size and rotation (ODF rotates about the top-left corner, counter-clockwise, then moves).</summary>
+    /// <summary>Position, size and turn (ODF transforms the shape's box about its top-left corner).</summary>
     static SlideShape NewShape(XElement el)
     {
         double w = Len(el, Svg + "width") ?? 0, h = Len(el, Svg + "height") ?? 0;
-        var shape = new SlideShape { Bounds = new Rect(Len(el, Svg + "x") ?? 0, Len(el, Svg + "y") ?? 0, w, h) };
-        var transform = (string?)el.Attribute(Draw + "transform");
-        if (transform != null)
+        double x = Len(el, Svg + "x") ?? 0, y = Len(el, Svg + "y") ?? 0;
+        var shape = new SlideShape { Bounds = new Rect(x, y, Math.Max(0, w), Math.Max(0, h)) };
+        if (TransformOf(el) is not { } move) return shape;
+        if (move.placed) shape.Bounds = new Rect(0, 0, shape.Bounds.Width, shape.Bounds.Height);
+        else
         {
-            var rotate = RotateRegex().Match(transform);
-            var translate = TranslateRegex().Match(transform);
-            double a = rotate.Success ? -double.Parse(rotate.Groups[1].Value, CultureInfo.InvariantCulture) : 0; // clockwise radians
-            if (translate.Success && Units.ParseLength(translate.Groups[1].Value) is double tx && Units.ParseLength(translate.Groups[2].Value) is double ty)
-            {
-                // The translate puts the turned top-left corner in place; recover the centre from it.
-                double cx = tx + w / 2 * Math.Cos(a) - h / 2 * Math.Sin(a);
-                double cy = ty + w / 2 * Math.Sin(a) + h / 2 * Math.Cos(a);
-                shape.Bounds = new Rect(cx - w / 2, cy - h / 2, w, h);
-            }
-            shape.Rotation = a * 180 / Math.PI;
+            // Turned without being moved: it stays where it was, about its centre.
+            move.matrix.OffsetX = move.matrix.OffsetY = 0;
+            move.matrix.TranslatePrepend(-(x + w / 2), -(y + h / 2));
+            move.matrix.Translate(x + w / 2, y + h / 2);
         }
+        shape.Transform(move.matrix);
         return shape;
     }
 
-    [GeneratedRegex(@"rotate\s*\(\s*([-+0-9.eE]+)\s*\)")]
-    private static partial Regex RotateRegex();
-    [GeneratedRegex(@"translate\s*\(\s*([-+0-9.a-z]+)[\s,]+([-+0-9.a-z]+)\s*\)")]
-    private static partial Regex TranslateRegex();
+    /// <summary>An element's draw:transform, applied left to right; angles turn counter-clockwise.</summary>
+    static (Matrix matrix, bool placed)? TransformOf(XElement el)
+    {
+        if ((string?)el.Attribute(Draw + "transform") is not { } text) return null;
+        var matrix = Matrix.Identity;
+        bool placed = false, any = false;
+        foreach (Match step in TransformRegex().Matches(text))
+        {
+            var args = step.Groups[2].Value.Split([' ', ',', '\t', '\n', '\r'], StringSplitOptions.RemoveEmptyEntries);
+            double Number(int i) => i < args.Length && double.TryParse(args[i], NumberStyles.Float, CultureInfo.InvariantCulture, out var v) ? v : 0;
+            double Length(int i) => i < args.Length ? Units.ParseLength(args[i]) ?? 0 : 0;
+            switch (step.Groups[1].Value)
+            {
+                case "rotate": matrix.Rotate(-Number(0) * 180 / Math.PI); break;
+                case "scale": matrix.Scale(Number(0), args.Length > 1 ? Number(1) : Number(0)); break;
+                case "skewX": matrix.Skew(-Number(0) * 180 / Math.PI, 0); break;
+                case "skewY": matrix.Skew(0, -Number(0) * 180 / Math.PI); break;
+                case "translate": matrix.Translate(Length(0), Length(1)); placed = true; break;
+                case "matrix": matrix.Append(new Matrix(Number(0), Number(1), Number(2), Number(3), Length(4), Length(5))); placed = true; break;
+            }
+            any = true;
+        }
+        bool usable = new[] { matrix.M11, matrix.M12, matrix.M21, matrix.M22, matrix.OffsetX, matrix.OffsetY }.All(double.IsFinite) && Math.Abs(matrix.Determinant) > 1e-9;
+        return any && usable ? (matrix, placed) : null;
+    }
+
+    [GeneratedRegex(@"(rotate|scale|skewX|skewY|translate|matrix)\s*\(([^)]*)\)")]
+    private static partial Regex TransformRegex();
 
     void Enhanced(XElement? geometry, SlideShape shape)
     {
@@ -321,8 +379,9 @@ internal sealed partial class OdpReader
             }
             else if (shape.Geometry == ShapeGeometry.Custom) shape.Geometry = ShapeGeometry.Rect;
         }
-        if ((string?)geometry?.Attribute(Draw + "mirror-horizontal") == "true") shape.FlipH = true;
-        if ((string?)geometry?.Attribute(Draw + "mirror-vertical") == "true") shape.FlipV = true;
+        if ((string?)geometry?.Attribute(Draw + "mirror-horizontal") == "true") shape.FlipH ^= true;
+        if ((string?)geometry?.Attribute(Draw + "mirror-vertical") == "true") shape.FlipV ^= true;
+        if (Math.Abs(Angle((string?)geometry?.Attribute(Draw + "text-rotate-angle"), plainDegrees: true) % 360) is > 135 and < 225) shape.TextRotation = 180;
     }
 
     /// <summary>An enhanced path with plain numbers (paths using formulas fall back to the shape type).</summary>
@@ -416,7 +475,7 @@ internal sealed partial class OdpReader
         var chain = new List<XElement>();
         void Walk(string? name)
         {
-            for (int guard = 0; name != null && guard < 20 && _styles.TryGetValue(name, out var s); guard++)
+            for (int guard = 0; guard < 20 && Style(name) is { } s; guard++)
             {
                 if (chain.Contains(s)) break;
                 chain.Add(s);
@@ -455,7 +514,8 @@ internal sealed partial class OdpReader
         shape.Insets = new Thickness(Pad("left", 7.2), Pad("top", 3.6), Pad("right", 7.2), Pad("bottom", 3.6));
         shape.Wrap = Graphic(chain, Fo + "wrap-option") != "no-wrap";
         shape.ShrinkToFit = Graphic(chain, Draw + "fit-to-size") is "shrink-to-fit" || Graphic(chain, St + "shrink-to-fit") == "true";
-        if (Graphic(chain, St + "writing-mode") is "tb-rl" or "tb") shape.TextRotation = 90;
+        if (Graphic(chain, St + "writing-mode") is "tb-rl" or "tb") shape.TextRotation = (shape.TextRotation + 90) % 360;
+        else if (Graphic(chain, St + "writing-mode") is "bt-lr") shape.TextRotation = 270;
     }
 
     void ApplyStroke(SlideShape shape, List<XElement> chain)
@@ -463,12 +523,21 @@ internal sealed partial class OdpReader
         var stroke = Graphic(chain, Draw + "stroke") ?? "solid";
         if (stroke == "none") { shape.Line = null; return; }
         var color = Units.ParseHex(Graphic(chain, Svg + "stroke-color")) ?? Color.FromRgb(0x34, 0x65, 0xA4);
-        if (Percent(Graphic(chain, Svg + "stroke-opacity")) is double alpha) color.A = (byte)(alpha * 255);
+        if (Percent(Graphic(chain, Svg + "stroke-opacity")) is double alpha) color.A = (byte)Math.Round(Math.Clamp(alpha, 0, 1) * 255);
         shape.Line = color;
         shape.LineWidth = Math.Max(0.75, Units.ParseLength(Graphic(chain, Svg + "stroke-width")) ?? 0.75);
         shape.Dashed = stroke == "dash";
-        if (Graphic(chain, Draw + "marker-start") is { Length: > 0 }) shape.HeadEnd = ArrowHead.Triangle;
-        if (Graphic(chain, Draw + "marker-end") is { Length: > 0 }) shape.TailEnd = ArrowHead.Triangle;
+        shape.HeadEnd = LineEnd(Graphic(chain, Draw + "marker-start"));
+        shape.TailEnd = LineEnd(Graphic(chain, Draw + "marker-end"));
+    }
+
+    /// <summary>Arrow heads go by name ("Arrow", "Diamond_20_unfilled", "Circle", "msArrowStealthEnd_20_5"…).</summary>
+    static ArrowHead LineEnd(string? marker)
+    {
+        if (string.IsNullOrEmpty(marker)) return ArrowHead.None;
+        bool Has(string word) => marker.Contains(word, StringComparison.OrdinalIgnoreCase);
+        return Has("stealth") || Has("concave") ? ArrowHead.Stealth : Has("diamond") ? ArrowHead.Diamond : Has("oval") || Has("circle") ? ArrowHead.Oval
+            : Has("open") || Has("line") ? ArrowHead.Open : ArrowHead.Triangle;
     }
 
     SlideFill? FillFrom(string? kind, Func<XName, string?> get)
@@ -477,7 +546,7 @@ internal sealed partial class OdpReader
         {
             case "solid":
                 var color = Units.ParseHex(get(Draw + "fill-color")) ?? Color.FromRgb(0x72, 0x9F, 0xCF);
-                if (Percent(get(Draw + "opacity")) is double opacity) color.A = (byte)(opacity * 255);
+                if (Percent(get(Draw + "opacity")) is double opacity) color.A = (byte)Math.Round(Math.Clamp(opacity, 0, 1) * 255);
                 return SlideFill.Solid(color);
             case "gradient" when get(Draw + "fill-gradient-name") is { } name && _gradients.TryGetValue(name, out var g):
                 var start = Units.ParseHex((string?)g.Attribute(Draw + "start-color")) ?? Colors.White;
@@ -486,6 +555,20 @@ internal sealed partial class OdpReader
                 bool radial = style is "radial" or "ellipsoid" or "square" or "rectangular";
                 // Axial gradients mirror about the middle; radial ones run from the edge (start) to the centre (end).
                 var stops = style == "axial" ? new List<(double, Color)> { (0, end), (0.5, start), (1, end) } : radial ? [(0, end), (1, start)] : [(0, start), (1, end)];
+                // Gradients with more than two colours list them all as an extension.
+                var listed = g.Elements().Where(e => e.Name.LocalName == "gradient-stop")
+                    .Select(e => (at: Number((string?)e.Attribute(Svg + "offset")), color: Units.ParseHex((string?)e.Attributes().FirstOrDefault(a => a.Name.LocalName == "color-value"))))
+                    .Where(s => s.at != null && s.color != null).Select(s => (Math.Clamp(s.at!.Value, 0, 1), s.color!.Value)).ToList();
+                if (listed.Count > 2 && style == "linear") stops = listed;
+                else if (listed.Count > 2 && radial) stops = listed.Select(s => (1 - s.Item1, s.Item2)).Reverse().ToList();
+                if (get(Draw + "opacity-name") is { Length: > 0 } fade && _opacities.TryGetValue(fade, out var opacities))
+                {
+                    double from = Percent((string?)opacities.Attribute(Draw + "start")) ?? 1, to = Percent((string?)opacities.Attribute(Draw + "end")) ?? 1;
+                    if (radial) (from, to) = (to, from);
+                    stops = stops.Select(s => (s.Item1, Color.FromArgb((byte)Math.Round(Math.Clamp(from + (to - from) * s.Item1, 0, 1) * 255), s.Item2.R, s.Item2.G, s.Item2.B))).ToList();
+                }
+                else if (Percent(get(Draw + "opacity")) is double see)
+                    stops = stops.Select(s => (s.Item1, Color.FromArgb((byte)Math.Round(Math.Clamp(see, 0, 1) * 255), s.Item2.R, s.Item2.G, s.Item2.B))).ToList();
                 return new SlideFill
                 {
                     Gradient = stops,
@@ -496,7 +579,12 @@ internal sealed partial class OdpReader
             case "bitmap" when get(Draw + "fill-image-name") is { } name && _fillImages.TryGetValue(name, out var f):
                 var picture = Picture((string?)f.Attribute(XLink + "href"));
                 if (picture == null) return null;
-                return new SlideFill { Image = picture, Tile = get(St + "repeat") == "repeat" ? 1 : null };
+                return new SlideFill
+                {
+                    Image = picture,
+                    Tile = get(St + "repeat") == "repeat" ? 1 : null,
+                    Opacity = Percent(get(Draw + "opacity")) is double through ? Math.Clamp(through, 0, 1) : 1,
+                };
             case "hatch":
                 return Units.ParseHex(get(Draw + "fill-color")) is { } hatchBack ? SlideFill.Solid(hatchBack) : null;
             default:
@@ -505,14 +593,14 @@ internal sealed partial class OdpReader
     }
 
     /// <summary>ODF angles: plain numbers are tenths of a degree; "deg", "rad" and "grad" units are allowed.</summary>
-    static double Angle(string? value)
+    static double Angle(string? value, bool plainDegrees = false)
     {
         if (string.IsNullOrEmpty(value)) return 0;
         double Num(string s) => double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out var v) ? v : 0;
         if (value.EndsWith("deg")) return Num(value[..^3]);
         if (value.EndsWith("grad")) return Num(value[..^4]) * 0.9;
         if (value.EndsWith("rad")) return Num(value[..^3]) * 180 / Math.PI;
-        return Num(value) / 10;
+        return plainDegrees ? Num(value) : Num(value) / 10;
     }
 
     SlideFill? Background(XElement page)
@@ -592,6 +680,7 @@ internal sealed partial class OdpReader
         {
             if ((string?)props!.Attribute(Fo + "text-align") is { } align)
                 p.Align = align switch { "center" => TextAlignment.Center, "end" or "right" => TextAlignment.Right, "justify" => TextAlignment.Justify, _ => TextAlignment.Left };
+            if ((string?)props.Attribute(St + "writing-mode") is { } mode && mode != "page") p.RightToLeft = mode.StartsWith("rl");
             if (Len(props, Fo + "margin-left") is double ml) p.IndentLeft = ml;
             if (Len(props, Fo + "text-indent") is double ti) p.IndentFirst = ti;
             if (Len(props, Fo + "margin-top") is double mt) p.SpaceBefore = mt;
@@ -601,6 +690,9 @@ internal sealed partial class OdpReader
             if ((string?)props.Attribute(St + "line-height-at-least") is { } least && Units.ParseLength(least) is double atLeast)
                 p.LineSpacing = Math.Max(p.LineSpacing, atLeast / (run.Size * 1.2));
         }
+
+        // Right-to-left text without a side of its own is on the right. ("start" and "end" mean left and right to LibreOffice, whichever way text runs.)
+        if (p.RightToLeft && !paragraphProps.Any(x => x?.Attribute(Fo + "text-align") != null)) p.Align = TextAlignment.Right;
 
         Inlines(el, p, run, null);
 
@@ -683,7 +775,7 @@ internal sealed partial class OdpReader
                 case "a":
                     var linked = run.Clone();
                     linked.Underline = true;
-                    Inlines(child, p, linked, (string?)child.Attribute(XLink + "href"));
+                    Inlines(child, p, linked, SlideLimits.Link((string?)child.Attribute(XLink + "href")));
                     break;
                 case "s":
                     int count = Units.OdfSpaceCount((string?)child.Attribute(Text + "c"));
@@ -745,44 +837,124 @@ internal sealed partial class OdpReader
 
     DTable ReadTable(XElement table, List<XElement> chain)
     {
-        var result = new DTable { Borders = true, BorderColor = Color.FromRgb(0x80, 0x80, 0x80), CellPadding = new Thickness(5.4, 3.6, 5.4, 3.6) };
-        foreach (var (tr, cells) in _repeats.Rows(table, _ct))
+        var result = new DTable { CellPadding = new Thickness(5.4, 3.6, 5.4, 3.6) };
+        XElement? Props(XElement? style, string kind) => style?.Elements().FirstOrDefault(e => e.Name.LocalName == kind);
+
+        var columnStyles = new List<XElement?>();
+        var widths = new List<double>();
+        foreach (var col in table.Descendants(Table + "table-column").Where(c => c.Ancestors(Table + "table").First() == table))
         {
-            var row = new DRow();
-            foreach (var item in cells)
+            var style = Style((string?)col.Attribute(Table + "style-name"));
+            for (long n = Math.Min(OdfRepetitions.Count(col, "number-columns-repeated"), SlideLimits.MaxColumns - widths.Count); n > 0; n--)
             {
-                var tc = item ?? new XElement(Table + "table-cell");
-                if (tc.Name == Table + "covered-table-cell") continue;
-                var cell = new DCell { ColSpan = int.TryParse((string?)tc.Attribute(Table + "number-columns-spanned"), out var span) ? span : 1 };
-                var cellStyle = Style((string?)tc.Attribute(Table + "style-name"));
-                var fill = (string?)cellStyle?.Element(St + "graphic-properties")?.Attribute(Draw + "fill-color")
-                           ?? (string?)cellStyle?.Element(St + "table-cell-properties")?.Attribute(Fo + "background-color");
-                if ((string?)cellStyle?.Element(St + "graphic-properties")?.Attribute(Draw + "fill") != "none") cell.Shading = Units.ParseHex(fill);
+                widths.Add(Len(Props(style, "table-column-properties"), St + "column-width") ?? 0);
+                columnStyles.Add(Style((string?)col.Attribute(Table + "default-cell-style-name")));
+            }
+        }
+
+        // Rows and cells as they're listed; only empty repeats may be cut short.
+        var rows = new List<(XElement tr, List<XElement> cells)>();
+        long total = 0;
+        foreach (var tr in table.Descendants(Table + "table-row").Where(r => r.Ancestors(Table + "table").First() == table))
+        {
+            _ct.ThrowIfCancellationRequested();
+            var cells = new List<XElement>();
+            foreach (var tc in tr.Elements().Where(e => e.Name == Table + "table-cell" || e.Name == Table + "covered-table-cell"))
+                Repeat(OdfRepetitions.Count(tc, "number-columns-repeated"), SlideLimits.MaxColumns - cells.Count, HasText(tc), () => cells.Add(tc));
+            Repeat(OdfRepetitions.Count(tr, "number-rows-repeated"), (SlideLimits.MaxTableCells - total) / Math.Max(1, cells.Count), cells.Any(HasText), () =>
+            {
+                rows.Add((tr, cells));
+                total += Math.Max(1, cells.Count);
+            });
+        }
+        static void Repeat(long count, long room, bool content, Action add)
+        {
+            if (count > room && content) throw SlideLimits.TooLarge();
+            for (long n = Math.Min(count, room); n > 0; n--) add();
+        }
+
+        bool anyEdges = false;
+        var covered = new HashSet<(int, int)>();
+        for (int r = 0; r < rows.Count; r++)
+        {
+            var (tr, cells) = rows[r];
+            var rowProps = Props(Style((string?)tr.Attribute(Table + "style-name")), "table-row-properties");
+            var row = new DRow { Height = Len(rowProps, St + "row-height") ?? Len(rowProps, St + "min-row-height") };
+            var rowStyle = Style((string?)tr.Attribute(Table + "default-cell-style-name"));
+            for (int c = 0; c < cells.Count; c++)
+            {
+                if (covered.Contains((r, c))) continue;
+                var tc = cells[c];
+                var cell = new DCell { Look = new CellLook() };
+                if (tc.Name != Table + "covered-table-cell")
+                {
+                    bool Covered(int row, int col) => row < rows.Count && col < rows[row].cells.Count && rows[row].cells[col].Name == Table + "covered-table-cell";
+                    long wantedColumns = OdfRepetitions.Count(tc, "number-columns-spanned"), wantedRows = OdfRepetitions.Count(tc, "number-rows-spanned");
+                    while (cell.ColSpan < wantedColumns && Covered(r, c + cell.ColSpan)) cell.ColSpan++;
+                    while (cell.RowSpan < wantedRows && Covered(r + cell.RowSpan, c)) cell.RowSpan++;
+                }
+                for (int i = 0; i < cell.RowSpan; i++) for (int k = 0; k < cell.ColSpan; k++) covered.Add((r + i, c + k));
+
+                var style = Style((string?)tc.Attribute(Table + "style-name")) ?? rowStyle ?? (c < columnStyles.Count ? columnStyles[c] : null);
+                // LibreOffice keeps a cell's fill and padding with drawing properties, the standard with cell properties.
+                XElement? graphic = Props(style, "graphic-properties"), box = Props(style, "table-cell-properties"), paragraph = Props(style, "paragraph-properties");
+                var kind = (string?)graphic?.Attribute(Draw + "fill");
+                var fill = Units.ParseHex((string?)graphic?.Attribute(Draw + "fill-color")) is { } drawn && kind is null or "solid" ? drawn : Units.ParseHex((string?)box?.Attribute(Fo + "background-color"));
+                if (kind != "none") cell.Shading = fill;
+                if (cell.Shading is { } shade && Percent((string?)graphic?.Attribute(Draw + "opacity")) is double opacity)
+                    cell.Shading = Color.FromArgb((byte)Math.Round(Math.Clamp(opacity, 0, 1) * 255), shade.R, shade.G, shade.B);
+
+                string? Setting(XName name) => (string?)box?.Attribute(name) ?? (string?)graphic?.Attribute(name) ?? (string?)paragraph?.Attribute(name);
+                CellEdge? Edge(string side) => EdgeOf(Setting(Fo + $"border-{side}") ?? Setting(Fo + "border"));
+                (cell.Look.Left, cell.Look.Top, cell.Look.Right, cell.Look.Bottom) = (Edge("left"), Edge("top"), Edge("right"), Edge("bottom"));
+                anyEdges |= cell.Look.Left != null || cell.Look.Top != null || cell.Look.Right != null || cell.Look.Bottom != null;
+                double Pad(string side, double fallback) => Math.Clamp(Units.ParseLength(Setting(Fo + $"padding-{side}") ?? Setting(Fo + "padding")) ?? fallback, 0, 1000);
+                cell.Look.Padding = new Thickness(Pad("left", 5.4), Pad("top", 3.6), Pad("right", 5.4), Pad("bottom", 3.6));
+                cell.Look.Anchor = ((string?)graphic?.Attribute(Draw + "textarea-vertical-align") ?? (string?)box?.Attribute(St + "vertical-align")) switch
+                {
+                    "middle" => TextAnchor.Middle, "bottom" => TextAnchor.Bottom, _ => TextAnchor.Top,
+                };
+
                 var baseRun = new Run();
                 ApplyRun(baseRun, _defaultGraphic?.Element(St + "text-properties"));
-                ApplyRun(baseRun, cellStyle?.Element(St + "text-properties"));
+                ApplyRun(baseRun, style?.Element(St + "text-properties"));
                 var counters = new Dictionary<int, int>();
-                foreach (var child in tc.Elements())
-                    Blocks(child, cell.Blocks, 0, null, baseRun, [cellStyle?.Element(St + "paragraph-properties")], null, null, counters, chain);
+                if (tc.Name != Table + "covered-table-cell")
+                    foreach (var child in tc.Elements())
+                        Blocks(child, cell.Blocks, 0, null, baseRun, [paragraph], null, null, counters, chain);
                 if (cell.Blocks.Count == 0) cell.Blocks.Add(new DParagraph());
                 row.Cells.Add(cell);
             }
             result.Rows.Add(row);
         }
-        var widths = OdfRepetitions.Widths(table, result.Rows.Select(r => r.Cells.Sum(c => c.ColSpan)).DefaultIfEmpty(0).Max(),
-            col => Len(Style((string?)col.Attribute(Table + "style-name"))?.Element(St + "table-column-properties"), St + "column-width") ?? 72);
-        if (widths.Count > 0 && widths.All(w => w > 0)) result.ColumnWidths = widths;
+        // A table that says nothing about its lines gets a plain grid, so it still reads as a table.
+        if (!anyEdges) (result.Borders, result.BorderColor) = (true, Color.FromRgb(0x80, 0x80, 0x80));
+        if (widths.Any(w => w > 0)) result.ColumnWidths = widths;
         return result;
+    }
+
+    /// <summary>A border like "0.75pt solid #808080": a line, explicitly none, or null when nothing is said.</summary>
+    static CellEdge? EdgeOf(string? border)
+    {
+        if (string.IsNullOrWhiteSpace(border)) return null;
+        var parts = border.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Contains("none") || parts.Contains("hidden")) return new CellEdge(0, null);
+        var color = parts.Select(Units.ParseHex).FirstOrDefault(c => c != null);
+        return color == null ? null : new CellEdge(Math.Clamp(parts.Select(Units.ParseLength).FirstOrDefault(w => w > 0) ?? 0.75, 0.25, 72), color);
     }
 
     // ------------------------------------------------------------------ helpers
 
-    XElement? Style(string? name) => name != null && _styles.TryGetValue(name, out var s) ? s : null;
+    XElement? Style(string? name)
+    {
+        if (name == null) return null;
+        return _onMaster && _masterStyles.TryGetValue(name, out var own) || _styles.TryGetValue(name, out own) ? own : null;
+    }
 
     List<XElement> StyleChain(string? name)
     {
         var chain = new List<XElement>();
-        for (int guard = 0; name != null && guard < 20 && _styles.TryGetValue(name, out var s) && !chain.Contains(s); guard++)
+        for (int guard = 0; guard < 20 && Style(name) is { } s && !chain.Contains(s); guard++)
         {
             chain.Add(s);
             name = (string?)s.Attribute(St + "parent-style-name");
@@ -798,12 +970,16 @@ internal sealed partial class OdpReader
         DImage? image = null;
         if (_zip.GetEntry(href) is { } entry)
         {
-            using var stream = PackageResources.Open(entry, media: true);
-            using var ms = new MemoryStream();
-            stream.CopyTo(ms);
-            var data = ms.ToArray();
-            var (w, h) = DocxReader.ImageSize(data);
-            image = new DImage(data, Path.GetExtension(href).TrimStart('.').ToLowerInvariant(), w, h);
+            try
+            {
+                using var stream = PackageResources.Open(entry, media: true);
+                using var ms = new MemoryStream();
+                stream.CopyTo(ms);
+                var data = ms.ToArray();
+                var (w, h) = DocxReader.ImageSize(data);
+                image = new DImage(data, Path.GetExtension(href).TrimStart('.').ToLowerInvariant(), w, h);
+            }
+            catch (InvalidDataException ex) { Log.Write($"Left out a damaged picture ({href}): {ex.Message}"); }
         }
         _images[href] = image;
         return image;
@@ -813,10 +989,12 @@ internal sealed partial class OdpReader
     {
         if (_zip.GetEntry(name) is not { } entry) return null;
         using var stream = PackageResources.Open(entry);
-        return PackageResources.LoadXml(stream).Root;
+        return SlideLimits.Check(PackageResources.LoadXml(stream).Root!);
     }
 
     static double? Len(XElement? el, XName name) => Units.ParseLength((string?)el?.Attribute(name));
+
+    static double? Number(string? value) => double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var v) && double.IsFinite(v) ? v : null;
 
     static double? Percent(string? value) =>
         value != null && value.EndsWith('%') && double.TryParse(value[..^1], NumberStyles.Float, CultureInfo.InvariantCulture, out var v) ? v / 100 : null;

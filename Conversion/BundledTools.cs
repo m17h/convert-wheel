@@ -82,8 +82,8 @@ internal static class BundledTools
 internal static class Outputs
 {
     /// <summary>
-    /// One page: written to the reserved file. Several: the reserved file is replaced by a folder
-    /// "name (PNG)" holding name-01.png, name-02.png… Returns the path to show the user.
+    /// One page: written to the conversion's own working file. Several: that file is replaced by a folder
+    /// "name (PNG)" next to it, holding name-01.png, name-02.png… Returns whichever was made.
     /// </summary>
     public static string Pages(string reserved, int count, Action<int, string> write)
     {

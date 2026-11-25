@@ -1,10 +1,5 @@
 using System.Buffers.Binary;
 using System.Runtime.InteropServices;
-using Concentus;
-using Concentus.Enums;
-using Concentus.Oggfile;
-using NVorbis;
-using OggVorbisEncoder;
 
 namespace ConvertWheel.Conversion.Media;
 
@@ -18,6 +13,8 @@ internal interface IAudioSource : IDisposable
     AudioFormat Format { get; }
     /// <summary>Bit depth of the original audio, so lossless outputs can keep 24-bit sources at 24 bits.</summary>
     int SourceBits { get; }
+    /// <summary>Which speaker each channel is for, as WAVE speaker bits in channel order; 0 when unknown.</summary>
+    int ChannelMask { get; }
     long? TotalFrames { get; }
     /// <summary>Fills <paramref name="buffer"/> with whole frames; returns samples written, 0 at the end.</summary>
     int Read(float[] buffer, int count);
@@ -35,18 +32,36 @@ internal interface IAudioSink : IDisposable
 internal sealed class MfAudioSource : IAudioSource
 {
     readonly IMFSourceReader _reader;
+    readonly bool _keepTiming;
+    readonly int _pcmBits;
+    readonly long? _duration; // 100 ns, of audio-only files
+    readonly long _tolerance; // how much less than that is still normal
     float[] _pending = [];
     int _pendingOffset;
     bool _ended;
+    long _framesRead, _firstTime;
+    byte[]? _first; // read ahead while opening
+    double _shift;
+    bool _started;
 
     public AudioFormat Format { get; }
     public int SourceBits { get; }
+    public int ChannelMask { get; }
     public long? TotalFrames { get; }
     public Guid NativeSubtype { get; }
 
-    public MfAudioSource(string path)
+    /// <summary>When the first sound starts, in 100-ns units as Windows reports it.</summary>
+    public long FirstTime => _firstTime;
+
+    /// <summary>With timing kept: seconds to add to the times Windows reports, so 0 is where the output starts.</summary>
+    public double Shift { set => _shift = value; }
+
+    /// <param name="keepTiming">Fills a late start or a gap with silence, so the sound stays in step with the picture.</param>
+    public MfAudioSource(string path, bool keepTiming = false)
     {
+        _keepTiming = keepTiming;
         MF.EnsureStarted();
+        MediaCheck.EnsureComplete(path);
         MF.MFCreateSourceReaderFromURL(path, null, out _reader);
         try
         {
@@ -57,26 +72,50 @@ internal sealed class MfAudioSource : IAudioSource
             }
             catch (COMException)
             {
-                throw new NotSupportedException("This file has no audio track.");
+                throw NoAudio(path);
             }
             if (_reader.GetNativeMediaType(MF.SourceReaderFirstAudio, 0, out var native) < 0)
-                throw new NotSupportedException("This file has no audio track.");
+                throw NoAudio(path);
             try
             {
                 NativeSubtype = native.GetGuid(MF.MT_SUBTYPE) ?? Guid.Empty;
-                SourceBits = native.GetInt(MF.MT_AUDIO_BITS_PER_SAMPLE) is int b and >= 16 and <= 32 && (NativeSubtype == MF.AudioPCM || NativeSubtype == MF.AudioFLAC) ? b : 16;
+                // Float and 32-bit audio counts as 24-bit, the most our lossless outputs hold.
+                bool lossless = NativeSubtype == MF.AudioPCM || NativeSubtype == MF.AudioFLAC || NativeSubtype == MF.AudioALAC || NativeSubtype == MF.AudioMp4ALAC || NativeSubtype == MF.AudioWMALossless;
+                int bits = native.GetInt(MF.MT_AUDIO_BITS_PER_SAMPLE) ?? 0;
+                SourceBits = NativeSubtype == MF.AudioFloat || lossless && bits > 16 ? 24 : 16;
+                // Uncompressed samples are taken as they are (Windows' own conversion isn't exact for 32-bit ones).
+                if (NativeSubtype == MF.AudioPCM && bits is 8 or 16 or 24 or 32 && native.GetInt(MF.MT_AUDIO_BLOCK_ALIGNMENT) == native.GetInt(MF.MT_AUDIO_NUM_CHANNELS) * bits / 8)
+                    _pcmBits = _reader.SetCurrentMediaType(MF.SourceReaderFirstAudio, IntPtr.Zero, native) >= 0 ? bits : 0;
             }
             finally { MF.Release(native); }
 
-            var want = MF.NewType(MF.MediaTypeAudio, MF.AudioFloat);
-            int hr;
-            try { hr = _reader.SetCurrentMediaType(MF.SourceReaderFirstAudio, IntPtr.Zero, want); }
-            finally { MF.Release(want); }
+            int hr = 0;
+            if (_pcmBits == 0)
+            {
+                var want = MF.NewType(MF.MediaTypeAudio, MF.AudioFloat);
+                try { hr = _reader.SetCurrentMediaType(MF.SourceReaderFirstAudio, IntPtr.Zero, want); }
+                finally { MF.Release(want); }
+            }
             if (hr < 0) throw new NotSupportedException("Windows can't decode this audio.");
+            // Some decoders (AC-3) only say what they really produce once they've decoded something.
+            while (_first == null && !_ended) (_first, _firstTime) = NextSample();
             Marshal.ThrowExceptionForHR(_reader.GetCurrentMediaType(MF.SourceReaderFirstAudio, out var current));
-            try { Format = new AudioFormat(current.GetInt(MF.MT_AUDIO_SAMPLES_PER_SECOND) ?? 44100, current.GetInt(MF.MT_AUDIO_NUM_CHANNELS) ?? 2); }
+            try
+            {
+                Format = new AudioFormat(current.GetInt(MF.MT_AUDIO_SAMPLES_PER_SECOND) ?? 44100, current.GetInt(MF.MT_AUDIO_NUM_CHANNELS) ?? 2);
+                ChannelMask = current.GetInt(MF.MT_AUDIO_CHANNEL_MASK) ?? 0;
+            }
             finally { MF.Release(current); }
-            if (MF.Duration(_reader) is long d) TotalFrames = d * Format.SampleRate / 10_000_000;
+            if (MF.Duration(_reader) is long d)
+            {
+                TotalFrames = (long)((decimal)d * Format.SampleRate / 10_000_000);
+                // MP3, raw AAC and ADPCM durations are guesses, and in a video the audio may simply be shorter.
+                bool certain = NativeSubtype == MF.AudioPCM || NativeSubtype == MF.AudioFloat || NativeSubtype == MF.AudioFLAC || NativeSubtype == MF.AudioAAC
+                    || NativeSubtype == MF.AudioALAC || NativeSubtype == MF.AudioMp4ALAC || NativeSubtype == MF.AudioWMAV8 || NativeSubtype == MF.AudioWMAV9;
+                if (certain && Path.GetExtension(path).ToLowerInvariant() is ".flac" or ".wav" or ".m4a" or ".m4b" or ".wma") _duration = d;
+                // FLAC and WAV count samples; the others' encoders add and drop a little.
+                _tolerance = NativeSubtype == MF.AudioFLAC || NativeSubtype == MF.AudioPCM ? 500_000 : Math.Max(3_000_000, d / 50);
+            }
         }
         catch
         {
@@ -84,6 +123,10 @@ internal sealed class MfAudioSource : IAudioSource
             throw;
         }
     }
+
+    static Exception NoAudio(string path) => MediaCheck.HasAudio(path) == false || Path.GetExtension(path).ToLowerInvariant() is ".wmv" or ".asf"
+        ? new ConversionException("This video has no audio track")
+        : new NotSupportedException("Windows found no audio track in this file.");
 
     public int Read(float[] buffer, int count)
     {
@@ -104,91 +147,73 @@ internal sealed class MfAudioSource : IAudioSource
         return written - written % Format.Channels;
     }
 
+    /// <summary>The next decoded piece, or null when there's none this time (see _ended).</summary>
+    (byte[]? data, long time) NextSample()
+    {
+        _reader.ReadSample(MF.SourceReaderFirstAudio, 0, out _, out var flags, out long time, out var sample);
+        try
+        {
+            if ((flags & MF.ReaderError) != 0) throw new InvalidOperationException("Windows couldn't decode this audio.");
+            if ((flags & MF.ReaderTypeChanged) != 0 && Format.Channels > 0) CheckFormat();
+            if ((flags & MF.ReaderEndOfStream) != 0) _ended = true;
+            return (sample == null ? null : MF.Bytes(sample), time);
+        }
+        finally { MF.Release(sample); }
+    }
+
+    void CheckFormat()
+    {
+        Marshal.ThrowExceptionForHR(_reader.GetCurrentMediaType(MF.SourceReaderFirstAudio, out var current));
+        try
+        {
+            if (current.GetInt(MF.MT_AUDIO_SAMPLES_PER_SECOND) != Format.SampleRate || current.GetInt(MF.MT_AUDIO_NUM_CHANNELS) != Format.Channels)
+                throw new NotSupportedException("This audio changes format partway, which needs FFmpeg.");
+        }
+        finally { MF.Release(current); }
+    }
+
     bool Refill()
     {
-        _reader.ReadSample(MF.SourceReaderFirstAudio, 0, out _, out var flags, out _, out var sample);
-        if ((flags & MF.ReaderError) != 0)
+        long time = _firstTime;
+        var bytes = _first;
+        _first = null;
+        if (bytes == null) (bytes, time) = NextSample();
+        int count = bytes == null ? 0 : bytes.Length / (_pcmBits == 0 ? 4 : _pcmBits / 8);
+        if (bytes != null)
         {
-            MF.Release(sample);
-            throw new InvalidOperationException("Windows couldn't decode this audio.");
+            long lead = 0, drop = 0;
+            if (_keepTiming)
+            {
+                long gap = (long)((decimal)time * Format.SampleRate / 10_000_000 + (decimal)_shift * Format.SampleRate) - _framesRead;
+                if (gap > (_started ? Format.SampleRate / 25 : 0)) lead = Math.Min(gap, Format.SampleRate * 3600L) * Format.Channels; // gaps over 40 ms aren't just rounding
+                else if (gap < 0 && !_started) drop = Math.Min(-gap * Format.Channels, count); // encoder warm-up before the start
+                _started = drop < count;
+            }
+            _pending = new float[lead + count - drop];
+            _pendingOffset = 0;
+            var samples = _pending.AsSpan((int)lead);
+            for (int i = 0, from = (int)drop; i < samples.Length; i++, from++)
+                samples[i] = _pcmBits switch
+                {
+                    0 => BinaryPrimitives.ReadSingleLittleEndian(bytes.AsSpan(from * 4)),
+                    8 => (bytes[from] - 128) / 128f,
+                    16 => BinaryPrimitives.ReadInt16LittleEndian(bytes.AsSpan(from * 2)) / 32768f,
+                    24 => (bytes[from * 3] << 8 | bytes[from * 3 + 1] << 16 | bytes[from * 3 + 2] << 24) / 2147483648f,
+                    _ => BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan(from * 4)) / 2147483648f,
+                };
+            _framesRead += _pending.Length / Format.Channels;
         }
-        if ((flags & MF.ReaderEndOfStream) != 0) _ended = true;
-        if (sample == null) return !_ended;
-        byte[] bytes;
-        try { bytes = MF.Bytes(sample); }
-        finally { MF.Release(sample); }
-        _pending = MemoryMarshal.Cast<byte, float>(bytes).ToArray();
-        _pendingOffset = 0;
-        return true;
+        if (_ended)
+        {
+            // Damaged files can just stop; a shorter result without a word would be worse than trying FFmpeg.
+            long read = (long)((decimal)_framesRead * 10_000_000 / Format.SampleRate);
+            if (_duration is long expected && expected - read > _tolerance)
+                throw new InvalidOperationException($"Only {MediaCheck.Clock(read)} of {MediaCheck.Clock(expected)} could be read, so this file is cut short or damaged.");
+        }
+        return bytes != null || !_ended;
     }
 
     public void Dispose() => MF.Release(_reader);
-}
-
-/// <summary>Ogg Vorbis through NVorbis (managed, so it works even without Windows' web media extensions).</summary>
-internal sealed class VorbisSource(string path) : IAudioSource
-{
-    readonly VorbisReader _reader = new(path);
-    public AudioFormat Format => new(_reader.SampleRate, _reader.Channels);
-    public int SourceBits => 16;
-    public long? TotalFrames => _reader.TotalSamples > 0 ? _reader.TotalSamples : null;
-    public VorbisReader Reader => _reader;
-    public int Read(float[] buffer, int count) => _reader.ReadSamples(buffer, 0, count - count % _reader.Channels);
-    public void Dispose() => _reader.Dispose();
-}
-
-/// <summary>Ogg Opus through Concentus.</summary>
-internal sealed class OpusSource : IAudioSource
-{
-    readonly FileStream _file;
-    readonly OpusOggReadStream _reader;
-    short[] _pending = [];
-    int _offset;
-
-    public AudioFormat Format { get; }
-    public int SourceBits => 16;
-    public long? TotalFrames { get; }
-    public OpusTags? Tags => _reader.Tags;
-
-    public OpusSource(string path, int channels)
-    {
-        if (channels is not (1 or 2)) throw new NotSupportedException("This Opus channel layout needs FFmpeg.");
-        _file = File.OpenRead(path);
-        try
-        {
-            Format = new AudioFormat(48000, Math.Clamp(channels, 1, 2));
-            _reader = new OpusOggReadStream(OpusCodecFactory.CreateDecoder(48000, Format.Channels, null), _file);
-            if (_reader.TotalTime > TimeSpan.Zero) TotalFrames = (long)(_reader.TotalTime.TotalSeconds * 48000);
-        }
-        catch
-        {
-            _file.Dispose();
-            throw;
-        }
-    }
-
-    public int Read(float[] buffer, int count)
-    {
-        count -= count % Format.Channels;
-        int written = 0;
-        while (written < count)
-        {
-            if (_offset >= _pending.Length)
-            {
-                if (!_reader.HasNextPacket) break;
-                _pending = _reader.DecodeNextPacket() ?? [];
-                _offset = 0;
-                continue;
-            }
-            int n = Math.Min(count - written, _pending.Length - _offset);
-            for (int i = 0; i < n; i++) buffer[written + i] = _pending[_offset + i] / 32768f;
-            _offset += n;
-            written += n;
-        }
-        return written - written % Format.Channels;
-    }
-
-    public void Dispose() => _file.Dispose();
 }
 
 /// <summary>Uncompressed AIFF/AIFC, which Windows can't read on its own.</summary>
@@ -201,6 +226,7 @@ internal sealed class AiffSource : IAudioSource
 
     public AudioFormat Format { get; }
     public int SourceBits { get; }
+    public int ChannelMask => 0;
     public long? TotalFrames { get; }
 
     public AiffSource(string path)
@@ -219,7 +245,7 @@ internal sealed class AiffSource : IAudioSource
             var id = System.Text.Encoding.ASCII.GetString(file, pos, 4);
             int size = BinaryPrimitives.ReadInt32BigEndian(file.AsSpan(pos + 4));
             int body = pos + 8;
-            if (size < 0 || size > file.Length - body) throw new NotSupportedException("This AIFF file is damaged.");
+            if (size < 0 || size > file.Length - body) throw new NotSupportedException("This AIFF file is cut short or damaged.");
             if (id == "COMM")
             {
                 if (size < (aifc ? 22 : 18)) throw new NotSupportedException("This AIFF file is damaged.");
@@ -285,49 +311,92 @@ internal sealed class AiffSource : IAudioSource
 // ---------------------------------------------------------------------- processors
 
 /// <summary>Converts to a target channel count: mono to stereo, or surround downmixed to stereo.</summary>
-internal sealed class ChannelMixer(IAudioSource source, int channels) : IAudioSource
+internal sealed class ChannelMixer : IAudioSource
 {
+    readonly IAudioSource _source;
+    readonly int _channels;
+    readonly float[] _gains; // [input * output channels + output]
     float[] _scratch = [];
-    public AudioFormat Format => source.Format with { Channels = channels };
-    public int SourceBits => source.SourceBits;
-    public long? TotalFrames => source.TotalFrames;
+
+    public AudioFormat Format => _source.Format with { Channels = _channels };
+    public int SourceBits => _source.SourceBits;
+    public int ChannelMask => Speakers.Default(_channels);
+    public long? TotalFrames => _source.TotalFrames;
+
+    public ChannelMixer(IAudioSource source, int channels)
+    {
+        _source = source;
+        _channels = channels;
+        int inputs = source.Format.Channels;
+        _gains = new float[inputs * channels];
+        var speakers = Speakers.Of(source.ChannelMask, inputs);
+        for (int i = 0; i < inputs; i++)
+        {
+            if (channels == 1) _gains[i] = 1f / inputs;
+            else if (inputs == 1) for (int c = 0; c < channels; c++) _gains[c] = 1;
+            else
+            {
+                // Centre and surrounds fold in at -3 dB, a single back speaker at -6 dB to each side; the subwoofer is left out.
+                const float K = 0.7071f;
+                (_gains[i * channels], _gains[i * channels + 1]) = speakers[i] switch
+                {
+                    Speakers.FrontLeft or Speakers.FrontLeftOfCentre => (1f, 0f),
+                    Speakers.FrontRight or Speakers.FrontRightOfCentre => (0f, 1f),
+                    Speakers.FrontCentre => (K, K),
+                    Speakers.BackLeft or Speakers.SideLeft => (K, 0f),
+                    Speakers.BackRight or Speakers.SideRight => (0f, K),
+                    Speakers.BackCentre => (0.5f, 0.5f),
+                    Speakers.LowFrequency => (0f, 0f),
+                    _ => (0.5f, 0.5f), // ceiling speakers and the like
+                };
+            }
+        }
+        if (channels == 1 || inputs == 1) return;
+        // Turn everything down just enough that it can't clip.
+        float loudest = 1;
+        for (int c = 0; c < 2; c++) loudest = Math.Max(loudest, Enumerable.Range(0, inputs).Sum(i => _gains[i * channels + c]));
+        for (int i = 0; i < _gains.Length; i++) _gains[i] /= loudest;
+    }
 
     public int Read(float[] buffer, int count)
     {
-        int inCh = source.Format.Channels, frames = count / channels;
+        int inCh = _source.Format.Channels, frames = count / _channels;
         if (_scratch.Length < frames * inCh) _scratch = new float[frames * inCh];
-        int read = source.Read(_scratch, frames * inCh) / inCh;
+        int read = _source.Read(_scratch, frames * inCh) / inCh;
+        Array.Clear(buffer, 0, read * _channels);
         for (int f = 0; f < read; f++)
-        {
-            var frame = _scratch.AsSpan(f * inCh, inCh);
-            if (channels == 1)
+            for (int i = 0; i < inCh; i++)
             {
-                float sum = 0;
-                foreach (var v in frame) sum += v;
-                buffer[f] = sum / inCh;
+                float v = _scratch[f * inCh + i];
+                for (int c = 0; c < _channels; c++) buffer[f * _channels + c] += v * _gains[i * _channels + c];
             }
-            else if (inCh == 1)
-            {
-                for (int c = 0; c < channels; c++) buffer[f * channels + c] = frame[0];
-            }
-            else
-            {
-                // WAVE channel order: L R C LFE BL BR SL SR. Centre and surrounds fold in at -3 dB.
-                const float k = 0.7071f;
-                float l = frame[0], r = frame[1];
-                if (inCh > 2) { l += k * frame[2]; r += k * frame[2]; }
-                if (inCh > 4) { l += k * frame[4]; r += k * frame[Math.Min(5, inCh - 1)]; }
-                if (inCh > 6) { l += k * frame[6]; r += k * frame[Math.Min(7, inCh - 1)]; }
-                float norm = inCh switch { <= 2 => 1, <= 4 => 1 + k, <= 6 => 1 + 2 * k, _ => 1 + 3 * k };
-                buffer[f * channels] = l / norm;
-                buffer[f * channels + 1] = r / norm;
-                for (int c = 2; c < channels; c++) buffer[f * channels + c] = 0;
-            }
-        }
-        return read * channels;
+        return read * _channels;
     }
 
-    public void Dispose() => source.Dispose();
+    public void Dispose() => _source.Dispose();
+}
+
+/// <summary>WAVE speaker positions. Channels are stored in the order of these bits.</summary>
+internal static class Speakers
+{
+    public const int FrontLeft = 0x1, FrontRight = 0x2, FrontCentre = 0x4, LowFrequency = 0x8, BackLeft = 0x10, BackRight = 0x20,
+        FrontLeftOfCentre = 0x40, FrontRightOfCentre = 0x80, BackCentre = 0x100, SideLeft = 0x200, SideRight = 0x400;
+
+    /// <summary>The usual layout for a number of channels.</summary>
+    public static int Default(int channels) => channels switch
+    {
+        1 => 0x4, 2 => 0x3, 3 => 0x7, 4 => 0x33, 5 => 0x37, 6 => 0x3F, 7 => 0x13F, 8 => 0x63F, _ => 0,
+    };
+
+    /// <summary>The speaker for each channel.</summary>
+    public static int[] Of(int mask, int channels)
+    {
+        if (System.Numerics.BitOperations.PopCount((uint)mask) != channels) mask = Default(channels);
+        var result = new int[channels];
+        for (int i = 0, bit = 1; i < channels && bit != 0; bit <<= 1)
+            if ((mask & bit) != 0) result[i++] = bit;
+        return result;
+    }
 }
 
 /// <summary>Band-limited (windowed-sinc, polyphase) sample-rate conversion.</summary>
@@ -346,6 +415,7 @@ internal sealed class Resampler : IAudioSource
 
     public AudioFormat Format { get; }
     public int SourceBits => _source.SourceBits;
+    public int ChannelMask => _source.ChannelMask;
     public long? TotalFrames { get; }
 
     public Resampler(IAudioSource source, int rate)
@@ -438,8 +508,10 @@ internal static class Pcm
         int bytes = bits / 8;
         for (int i = 0; i < samples.Length; i++)
         {
-            float v = Math.Clamp(samples[i], -1f, 1f);
-            int value = bits == 16 ? (int)MathF.Round(v * 32767f) : (int)MathF.Round(v * 8388607f);
+            // The same scale audio is decoded with, so 16- and 24-bit samples come back exactly as they were.
+            int value = bits == 16
+                ? (int)Math.Clamp(MathF.Round(samples[i] * 32768f), -32768f, 32767f)
+                : (int)Math.Clamp(MathF.Round(samples[i] * 8388608f), -8388608f, 8388607f);
             var o = output.Slice(i * bytes, bytes);
             for (int b = 0; b < bytes; b++) o[bigEndian ? bytes - 1 - b : b] = (byte)(value >> (8 * b));
         }
@@ -450,16 +522,20 @@ internal static class Pcm
 internal sealed class MfAudioSink : IAudioSink
 {
     readonly IMFSinkWriter _writer;
-    readonly int _stream, _bits;
+    readonly int _stream, _bits, _tail;
     readonly AudioFormat _format;
+    readonly List<float> _held = [];
     long _frames;
     byte[] _bytes = [];
 
-    public MfAudioSink(string path, Guid container, IMFMediaType outputType, AudioFormat format, int bits)
+    /// <param name="mask">Speakers of multichannel audio.</param>
+    /// <param name="tail">Frames of silence the encoder needs at the end to let go of the last sounds.</param>
+    public MfAudioSink(string path, Guid container, IMFMediaType outputType, AudioFormat format, int bits, int mask = 0, int tail = 0)
     {
         MF.EnsureStarted();
         _format = format;
         _bits = bits;
+        _tail = tail;
         try
         {
             MF.MFCreateAttributes(out var attrs, 3);
@@ -473,6 +549,7 @@ internal sealed class MfAudioSink : IAudioSink
             finally { MF.Release(attrs); }
             _writer.AddStream(outputType, out _stream);
             var input = PcmType(format, bits);
+            if (mask != 0) input.SetInt(MF.MT_AUDIO_CHANNEL_MASK, mask);
             try { _writer.SetInputMediaType(_stream, input, null); }
             finally { MF.Release(input); }
             _writer.BeginWriting();
@@ -497,11 +574,28 @@ internal sealed class MfAudioSink : IAudioSink
         return t;
     }
 
+    // Windows' MP3 encoder drops the end of the audio when the last piece it gets is small, so the final
+    // pieces are held back and go in together.
+    const int Piece = 8192;
+
     public void Write(float[] samples, int count)
     {
-        int size = count * _bits / 8;
+        CollectionsMarshal.SetCount(_held, _held.Count + count);
+        samples.AsSpan(0, count).CopyTo(CollectionsMarshal.AsSpan(_held)[^count..]);
+        int piece = Piece * _format.Channels;
+        while (_held.Count >= 2 * piece)
+        {
+            WritePiece(CollectionsMarshal.AsSpan(_held)[..piece]);
+            _held.RemoveRange(0, piece);
+        }
+    }
+
+    void WritePiece(ReadOnlySpan<float> samples)
+    {
+        if (samples.Length == 0) return;
+        int count = samples.Length, size = count * _bits / 8;
         if (_bytes.Length < size) _bytes = new byte[size];
-        Pcm.ToInt(samples.AsSpan(0, count), _bytes, _bits);
+        Pcm.ToInt(samples, _bytes, _bits);
         long frames = count / _format.Channels;
         long time = _frames * 10_000_000 / _format.SampleRate;
         long duration = (_frames + frames) * 10_000_000 / _format.SampleRate - time;
@@ -511,7 +605,16 @@ internal sealed class MfAudioSink : IAudioSink
         _frames += frames;
     }
 
-    public void Finish() => _writer.DoFinalize();
+    public void Finish()
+    {
+        int silence = _tail * _format.Channels;
+        CollectionsMarshal.SetCount(_held, _held.Count + silence);
+        CollectionsMarshal.AsSpan(_held)[^silence..].Clear();
+        WritePiece(CollectionsMarshal.AsSpan(_held));
+        _held.Clear();
+        _writer.DoFinalize();
+    }
+
     public void Dispose() => MF.Release(_writer);
 }
 
@@ -519,16 +622,19 @@ internal sealed class WavSink : IAudioSink
 {
     readonly FileStream _file;
     readonly AudioFormat _format;
-    readonly int _bits;
+    readonly int _bits, _mask, _header;
     long _dataBytes;
     byte[] _bytes = [];
 
-    public WavSink(string path, AudioFormat format, int bits)
+    public WavSink(string path, AudioFormat format, int bits, int mask)
     {
         _file = File.Create(path);
         _format = format;
         _bits = bits;
-        _file.Write(new byte[44]); // header written at the end, once sizes are known
+        // More than two channels need the extended header, which says which speaker each is for.
+        _mask = format.Channels > 2 ? mask : 0;
+        _header = _mask != 0 ? 68 : 44;
+        _file.Write(new byte[_header]); // written at the end, once sizes are known
     }
 
     public void Write(float[] samples, int count)
@@ -542,22 +648,29 @@ internal sealed class WavSink : IAudioSink
 
     public void Finish()
     {
-        if (_dataBytes > uint.MaxValue - 36L - (_dataBytes & 1)) throw new ConversionException("This audio is too large for a WAV file.");
+        if (_dataBytes > uint.MaxValue - _header - (_dataBytes & 1)) throw new ConversionException("This audio is too large for a WAV file.");
         if ((_dataBytes & 1) != 0) _file.WriteByte(0);
         int block = _format.Channels * _bits / 8;
-        var h = new byte[44];
+        var h = new byte[_header];
         "RIFF"u8.CopyTo(h);
-        BinaryPrimitives.WriteUInt32LittleEndian(h.AsSpan(4), (uint)(36 + _dataBytes + (_dataBytes & 1)));
+        BinaryPrimitives.WriteUInt32LittleEndian(h.AsSpan(4), (uint)(_header - 8 + _dataBytes + (_dataBytes & 1)));
         "WAVEfmt "u8.CopyTo(h.AsSpan(8));
-        BinaryPrimitives.WriteInt32LittleEndian(h.AsSpan(16), 16);
-        BinaryPrimitives.WriteInt16LittleEndian(h.AsSpan(20), 1);
+        BinaryPrimitives.WriteInt32LittleEndian(h.AsSpan(16), _header - 28);
+        BinaryPrimitives.WriteInt16LittleEndian(h.AsSpan(20), (short)(_mask != 0 ? -2 : 1));
         BinaryPrimitives.WriteInt16LittleEndian(h.AsSpan(22), (short)_format.Channels);
         BinaryPrimitives.WriteInt32LittleEndian(h.AsSpan(24), _format.SampleRate);
         BinaryPrimitives.WriteInt32LittleEndian(h.AsSpan(28), _format.SampleRate * block);
         BinaryPrimitives.WriteInt16LittleEndian(h.AsSpan(32), (short)block);
         BinaryPrimitives.WriteInt16LittleEndian(h.AsSpan(34), (short)_bits);
-        "data"u8.CopyTo(h.AsSpan(36));
-        BinaryPrimitives.WriteUInt32LittleEndian(h.AsSpan(40), (uint)Math.Min(uint.MaxValue, _dataBytes));
+        if (_mask != 0)
+        {
+            BinaryPrimitives.WriteInt16LittleEndian(h.AsSpan(36), 22);
+            BinaryPrimitives.WriteInt16LittleEndian(h.AsSpan(38), (short)_bits);
+            BinaryPrimitives.WriteInt32LittleEndian(h.AsSpan(40), _mask);
+            MF.AudioPCM.TryWriteBytes(h.AsSpan(44));
+        }
+        "data"u8.CopyTo(h.AsSpan(_header - 8));
+        BinaryPrimitives.WriteUInt32LittleEndian(h.AsSpan(_header - 4), (uint)_dataBytes);
         _file.Position = 0;
         _file.Write(h);
     }
@@ -617,102 +730,5 @@ internal sealed class AiffSink : IAudioSink
         BinaryPrimitives.WriteUInt64BigEndian(b[2..], mantissa);
     }
 
-    public void Dispose() => _file.Dispose();
-}
-
-internal sealed class VorbisSink : IAudioSink
-{
-    readonly FileStream _file;
-    readonly OggStream _ogg;
-    readonly ProcessingState _state;
-    readonly int _channels;
-
-    public VorbisSink(string path, AudioFormat format, MediaTags tags)
-    {
-        _file = File.Create(path);
-        _channels = format.Channels;
-        // 0.5 (~160 kbps stereo) is the highest quality this encoder handles correctly; above it levels go wrong.
-        var info = VorbisInfo.InitVariableBitRate(format.Channels, format.SampleRate, 0.5f);
-        _ogg = new OggStream(Random.Shared.Next());
-        var comments = new Comments();
-        foreach (var (key, value) in tags.AsVorbisComments()) comments.AddTag(key, value);
-        _ogg.PacketIn(HeaderPacketBuilder.BuildInfoPacket(info));
-        _ogg.PacketIn(HeaderPacketBuilder.BuildCommentsPacket(comments));
-        _ogg.PacketIn(HeaderPacketBuilder.BuildBooksPacket(info));
-        Flush(force: true);
-        _state = ProcessingState.Create(info);
-
-        // The encoder drops the first half long-block of audio, so give it that much silence to drop.
-        int lead = info.CodecSetup.BlockSizes.Max() / 2;
-        var silence = new float[_channels][];
-        for (int c = 0; c < _channels; c++) silence[c] = new float[lead];
-        _state.WriteData(silence, lead, 0);
-    }
-
-    public void Write(float[] samples, int count)
-    {
-        const int Chunk = 512; // the size the encoder library is designed and tested around
-        int frames = count / _channels;
-        for (int start = 0; start < frames; start += Chunk)
-        {
-            int n = Math.Min(Chunk, frames - start);
-            // Fresh arrays per chunk: the encoder may hold on to what it was given.
-            var planar = new float[_channels][];
-            for (int c = 0; c < _channels; c++) planar[c] = new float[n];
-            for (int f = 0; f < n; f++)
-                for (int c = 0; c < _channels; c++)
-                    planar[c][f] = samples[(start + f) * _channels + c];
-            _state.WriteData(planar, n, 0);
-            Drain(false);
-        }
-    }
-
-    void Drain(bool force)
-    {
-        while (!_ogg.Finished && _state.PacketOut(out var packet))
-        {
-            _ogg.PacketIn(packet);
-            Flush(force);
-        }
-    }
-
-    void Flush(bool force)
-    {
-        while (_ogg.PageOut(out var page, force))
-        {
-            _file.Write(page.Header);
-            _file.Write(page.Body);
-        }
-    }
-
-    public void Finish()
-    {
-        _state.WriteEndOfStream();
-        Drain(true);
-        Flush(true);
-    }
-
-    public void Dispose() => _file.Dispose();
-}
-
-internal sealed class OpusSink : IAudioSink
-{
-    readonly OpusOggWriteStream _writer;
-    readonly FileStream _file;
-
-    public OpusSink(string path, AudioFormat format, MediaTags tags)
-    {
-        var encoder = OpusCodecFactory.CreateEncoder(48000, format.Channels, OpusApplication.OPUS_APPLICATION_AUDIO, null);
-        encoder.Bitrate = format.Channels == 1 ? 96_000 : 160_000;
-        encoder.Complexity = 10;
-        var opusTags = new OpusTags();
-        foreach (var (key, value) in tags.AsVorbisComments()) opusTags.Fields[key] = value;
-        _file = File.Create(path);
-        try { _writer = new OpusOggWriteStream(encoder, _file, opusTags, format.SampleRate, 8, leaveOpen: false); }
-        catch { _file.Dispose(); throw; }
-    }
-
-    public void Write(float[] samples, int count) => _writer.WriteSamples(samples, 0, count);
-    public void Finish() => _writer.Finish();
     public void Dispose() => _file.Dispose();
 }

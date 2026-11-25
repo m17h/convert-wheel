@@ -11,8 +11,15 @@
     <AssemblyName>ConvertWheel</AssemblyName>
     <RootNamespace>ConvertWheel</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- The installer takes all of these from the exe, so they only need changing here. -->
     <Product>Convert Wheel</Product>
     <Version>1.0.0</Version>
+    <AssemblyTitle>Convert Wheel</AssemblyTitle>
+    <Company>Convert Wheel</Company>
+    <Authors>Convert Wheel</Authors>
+    <Copyright>© 2026 Convert Wheel</Copyright>
+    <Description>Converts files from a wheel that opens over File Explorer</Description>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <!-- Single-file publish: also embed native libraries (Skia), extracted on first run. -->
@@ -39,7 +46,6 @@
     <PackageReference Include="AngleSharp" Version="1.8.6" />
     <PackageReference Include="bblanchon.PDFium.Win32" Version="158.0.8125" />
     <PackageReference Include="Concentus" Version="2.2.2" />
-    <PackageReference Include="Concentus.Oggfile" Version="1.0.7" />
     <PackageReference Include="ExcelDataReader" Version="3.9.0" />
     <PackageReference Include="Magick.NET-Q8-x64" Version="15.0.0" />
     <PackageReference Include="Markdig" Version="1.5.1" />
@@ -53,17 +59,41 @@
   </ItemGroup>
 
   <!--
-    FFmpeg (LGPL) is embedded compressed and unpacked on first use. The first build fetches and packs it
-    (tools\pack-ffmpeg.ps1); pass -p:SkipFfmpegPack=true to build without it (e.g. offline).
+    FFmpeg (LGPL) is embedded compressed and unpacked on first use. The first build fetches the pinned build and packs it
+    (tools\pack-ffmpeg.ps1, tools\ffmpeg.json); pass -p:SkipFfmpegPack=true to build without it (e.g. offline).
   -->
   <Target Name="PackFfmpeg" BeforeTargets="PrepareForBuild" Condition="!Exists('tools\ffmpeg.tar.xz') And '$(SkipFfmpegPack)' != 'true'">
     <Message Importance="high" Text="Fetching the LGPL FFmpeg build and packing tools\ffmpeg.tar.xz (first build only)..." />
     <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\tools\pack-ffmpeg.ps1&quot;" ContinueOnError="true" />
-    <Warning Condition="!Exists('tools\ffmpeg.tar.xz')" Text="FFmpeg couldn't be packed (offline?). The app still builds; WebM, AVI, MPG and AC3 will then need an ffmpeg.exe next to the app or on PATH." />
+    <Warning Condition="!Exists('tools\ffmpeg.tar.xz')" Text="FFmpeg couldn't be packed (offline, or not the pinned download). The app still builds; WebM, AVI, MPG and AC3 will then need an ffmpeg.exe next to the app or on PATH." />
   </Target>
   <Target Name="EmbedFfmpeg" BeforeTargets="AssignTargetPaths" AfterTargets="PackFfmpeg" Condition="Exists('tools\ffmpeg.tar.xz')">
     <ItemGroup>
       <EmbeddedResource Include="tools\ffmpeg.tar.xz" LogicalName="ffmpeg.tar.xz" />
+    </ItemGroup>
+  </Target>
+
+  <!-- Licence texts sit next to the exe, readable without starting anything. -->
+  <ItemGroup>
+    <None Include="licenses\**" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
+    <None Update="THIRD-PARTY-NOTICES.md" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
+  </ItemGroup>
+
+  <!-- PDFsharp's samples, which carry Microsoft's Segoe WP fonts. PdfSharp.dll doesn't use them, and neither does the app. -->
+  <Target Name="DropPdfSharpSamples" AfterTargets="_HandlePackageFileConflicts">
+    <ItemGroup>
+      <_PdfSharpSample Include="@(ReferenceCopyLocalPaths)" Condition="'%(Filename)' == 'PdfSharp.WPFonts' Or '%(Filename)' == 'PdfSharp.Snippets' Or '%(Filename)' == 'PdfSharp.Quality'" />
+      <ReferenceCopyLocalPaths Remove="@(_PdfSharpSample)" />
+      <RuntimeCopyLocalItems Remove="@(_PdfSharpSample)" />
+      <_ConflictPackageFiles Include="@(_PdfSharpSample)" />
+    </ItemGroup>
+  </Target>
+
+  <!-- ImageMagick's library holds LGPL parts (libheif, librsvg...), so it stays a file of its own that can be replaced. -->
+  <Target Name="AdjustPublishedFiles" AfterTargets="ComputeResolvedFilesToPublishList">
+    <ItemGroup>
+      <ResolvedFileToPublish Update="@(ResolvedFileToPublish)" Condition="'%(Filename)' == 'Magick.Native-Q8-x64'" ExcludeFromSingleFile="true" />
+      <ResolvedFileToPublish Remove="@(_PdfSharpSample)" />
     </ItemGroup>
   </Target>
 

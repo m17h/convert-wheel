@@ -69,6 +69,8 @@ internal delegate nint HookProc(int nCode, nint wParam, nint lParam);
 internal static class Win32
 {
     public const int WH_KEYBOARD_LL = 13, WH_MOUSE_LL = 14;
+    public const uint WM_APP = 0x8000;
+    public const int WM_ACTIVATE = 0x6, WM_MOUSEMOVE = 0x200;
     public const int WM_KEYDOWN = 0x100, WM_KEYUP = 0x101, WM_SYSKEYDOWN = 0x104, WM_SYSKEYUP = 0x105;
     public const int WM_LBUTTONDOWN = 0x201, WM_LBUTTONUP = 0x202, WM_RBUTTONDOWN = 0x204, WM_RBUTTONUP = 0x205;
     public const int WM_MBUTTONDOWN = 0x207, WM_MBUTTONUP = 0x208, WM_MOUSEWHEEL = 0x20A, WM_XBUTTONDOWN = 0x20B, WM_XBUTTONUP = 0x20C, WM_MOUSEHWHEEL = 0x20E;
@@ -92,6 +94,8 @@ internal static class Win32
     [DllImport("user32.dll")] public static extern nint DispatchMessage(ref MSG msg);
     [DllImport("user32.dll")] public static extern bool PostThreadMessage(uint threadId, uint msg, nint wParam, nint lParam);
     [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT pt);
+    [DllImport("user32.dll")] public static extern nint GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(nint hwnd);
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] public static extern nint WindowFromPoint(POINT pt);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(nint hwnd, out uint processId);

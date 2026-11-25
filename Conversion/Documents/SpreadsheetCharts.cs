@@ -36,6 +36,15 @@ internal static class SpreadsheetCharts
                     .ToDictionary(r => (string)r.Attribute("Id")!, r => Resolve(dir, (string)r.Attribute("Target")!)) ?? [];
             }
 
+            string? Drawing(string sheetPath)
+            {
+                int slash = sheetPath.LastIndexOf('/');
+                var dir = slash < 0 ? "" : sheetPath[..slash];
+                var target = (string?)Load($"{dir}/_rels/{sheetPath[(slash + 1)..]}.rels".TrimStart('/'))?.Elements(PkgRel + "Relationship")
+                    .FirstOrDefault(r => ((string?)r.Attribute("Type"))?.EndsWith("/drawing", StringComparison.Ordinal) == true && (string?)r.Attribute("TargetMode") != "External")?.Attribute("Target");
+                return target == null ? null : Resolve(dir, target);
+            }
+
             var colors = new Dictionary<string, Color>();
             string font = "Calibri";
             if (Load("xl/theme/theme1.xml") is { } theme)
@@ -52,8 +61,8 @@ internal static class SpreadsheetCharts
             foreach (var sheet in Load("xl/workbook.xml")?.Descendants(SsMain + "sheet") ?? [])
             {
                 if ((string?)sheet.Attribute(SsRel + "id") is not { } rid || !workbookRels.TryGetValue(rid, out var sheetPath)) continue;
-                var drawingId = (string?)Load(sheetPath)?.Element(SsMain + "drawing")?.Attribute(SsRel + "id");
-                if (drawingId == null || !Rels(sheetPath).TryGetValue(drawingId, out var drawingPath) || Load(drawingPath) is not { } drawing) continue;
+                // A sheet has at most one drawing, and its relationships name it: no need to read the cells.
+                if (Drawing(sheetPath) is not { } drawingPath || Load(drawingPath) is not { } drawing) continue;
                 var drawingRels = Rels(drawingPath);
                 var images = new List<DImage>();
                 foreach (var anchor in drawing.Elements())
@@ -75,7 +84,7 @@ internal static class SpreadsheetCharts
                 if (images.Count > 0) result[(string?)sheet.Attribute("name") ?? ""] = images;
             }
         }
-        catch (Exception ex) when (ex is InvalidDataException or System.Xml.XmlException or IOException)
+        catch (Exception ex) when (ex is InvalidDataException or System.Xml.XmlException or IOException or ArgumentException or FormatException or InvalidOperationException or OverflowException or ConversionException)
         {
             Log.Write($"Couldn't read the charts in {path}: {ex.Message}");
         }
@@ -95,7 +104,7 @@ internal static class SpreadsheetCharts
         return (w > 20 ? w : 360, h > 20 ? h : 216);
     }
 
-    static string Resolve(string dir, string target)
+    internal static string Resolve(string dir, string target)
     {
         if (target.StartsWith('/')) return target.TrimStart('/');
         var parts = dir.Split('/', StringSplitOptions.RemoveEmptyEntries).ToList();
@@ -124,23 +133,26 @@ internal static class SpreadsheetCharts
         return new DImage(output.ToArray(), "png", w, h);
     }
 
-    public static Dictionary<string, List<DImage>> Ods(ZipArchive zip, XElement root)
+    /// <summary>The charts and pictures in one OpenDocument sheet's frames.</summary>
+    public static List<DImage> Ods(ZipArchive zip, IEnumerable<XElement> frames)
     {
-        var result = new Dictionary<string, List<DImage>>();
-        foreach (var table in root.Descendants(Table + "table"))
+        var images = new List<DImage>();
+        foreach (var frame in frames)
         {
-            var images = new List<DImage>();
-            foreach (var frame in table.Descendants(Draw + "frame"))
+            double w = Units.ParseLength((string?)frame.Attribute(Svg + "width")) ?? 360, h = Units.ParseLength((string?)frame.Attribute(Svg + "height")) ?? 216;
+            try
             {
-                double w = Units.ParseLength((string?)frame.Attribute(Svg + "width")) ?? 360, h = Units.ParseLength((string?)frame.Attribute(Svg + "height")) ?? 216;
                 if ((string?)frame.Element(Draw + "object")?.Attribute(XLink + "href") is { } href && Charts.ReadOdf(zip, href) is { } chart)
                     images.Add(Charts.ToImage(chart, w, h));
                 else if ((string?)frame.Element(Draw + "image")?.Attribute(XLink + "href") is { } imageHref && !imageHref.Contains("://")
                          && zip.GetEntry(imageHref.TrimStart('.', '/')) is { } media && Picture(media, w, h) is { } picture)
                     images.Add(picture);
             }
-            if (images.Count > 0) result[(string?)table.Attribute(Table + "name") ?? ""] = images;
+            catch (Exception ex) when (ex is InvalidDataException or System.Xml.XmlException or IOException or ArgumentException or FormatException or InvalidOperationException or OverflowException or ConversionException)
+            {
+                Log.Write($"Couldn't read a chart: {ex.Message}");
+            }
         }
-        return result;
+        return images;
     }
 }

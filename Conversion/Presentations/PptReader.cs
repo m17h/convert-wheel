@@ -21,7 +21,9 @@ internal sealed class PptReader
     readonly Dictionary<int, int> _notesPersist = [];
     readonly List<string> _fonts = [];
     readonly List<(int offset, int size)> _blips = [];
-    readonly Dictionary<int, TextDefaults[]> _masterStyles = [];
+    readonly Dictionary<int, DImage?> _images = [];
+    Dictionary<int, TextDefaults[]> _masterStyles = [];
+    int _shapes;
     Color[] _scheme = [Colors.White, Colors.Black, Colors.Gray, Colors.Black, Color.FromRgb(0x99, 0xCC, 0x00), Color.FromRgb(0x33, 0x33, 0x99), Color.FromRgb(0x00, 0x99, 0x99), Color.FromRgb(0x99, 0x99, 0x00)];
 
     /// <summary>A record: type, instance, and where its body lies in the stream.</summary>
@@ -46,22 +48,13 @@ internal sealed class PptReader
 
     PptReader(byte[] doc, byte[]? pictures, CancellationToken ct) => (_doc, _pictures, _ct) = (doc, pictures, ct);
 
-    public static Deck Read(string path, CancellationToken ct = default)
+    public static Deck Read(WordBinaryReader.CompoundFile file, string title, string protectedMessage, CancellationToken ct = default)
     {
-        var bytes = File.ReadAllBytes(path);
-        var cfb = new WordBinaryReader.CompoundFile(bytes);
-        var doc = cfb.Stream("PowerPoint Document") ?? throw new ConversionException("This isn't a PowerPoint presentation.");
-        var user = cfb.Stream("Current User");
-        if (user == null || user.Length < 24) throw new ConversionException("This PowerPoint file is damaged.");
-        if (BinaryPrimitives.ReadUInt32LittleEndian(user.AsSpan(12)) == 0xF3D1C4DF) throw new ConversionException("This presentation is password-protected.");
-        try
-        {
-            return new PptReader(doc, cfb.Stream("Pictures"), ct).Build(BinaryPrimitives.ReadInt32LittleEndian(user.AsSpan(16)), Path.GetFileNameWithoutExtension(path));
-        }
-        catch (Exception ex) when (ex is IndexOutOfRangeException or ArgumentOutOfRangeException or ArgumentException)
-        {
-            throw new ConversionException("This PowerPoint file is damaged or uses features that can't be read.");
-        }
+        var doc = file.Stream("PowerPoint Document") ?? throw new ConversionException("This isn't a presentation, or it is damaged.");
+        var user = file.Stream("Current User");
+        if (user == null || user.Length < 24) throw SlideLimits.Damaged();
+        if (BinaryPrimitives.ReadUInt32LittleEndian(user.AsSpan(12)) == 0xF3D1C4DF) throw new ConversionException(protectedMessage);
+        return new PptReader(doc, file.Stream("Pictures"), ct).Build(BinaryPrimitives.ReadInt32LittleEndian(user.AsSpan(16)), title);
     }
 
     // ------------------------------------------------------------------ records
@@ -86,14 +79,19 @@ internal sealed class PptReader
 
     Rec? Child(Rec parent, int type) => Children(parent).Where(r => r.Type == type).Select(r => (Rec?)r).FirstOrDefault();
 
+    /// <summary>Records of a type at any depth, in document order. Containers (version 0xF) hold more records.</summary>
     IEnumerable<Rec> Descendants(Rec parent, int type)
     {
-        foreach (var c in Children(parent))
+        var open = new Stack<(int at, int end)>();
+        open.Push((parent.Start, parent.End));
+        while (open.Count > 0)
         {
-            if (c.Type == type) yield return c;
-            // Containers (version 0xF) hold more records.
-            if ((BinaryPrimitives.ReadUInt16LittleEndian(_doc.AsSpan(c.Start - 8)) & 0xF) == 0xF)
-                foreach (var d in Descendants(c, type)) yield return d;
+            var (at, end) = open.Pop();
+            if (at + 8 > end) continue;
+            var r = At(at);
+            open.Push((r.End, end));
+            if ((U16(at) & 0xF) == 0xF && open.Count < SlideLimits.Depth) open.Push((r.Start, r.End));
+            if (r.Type == type) yield return r;
         }
     }
 
@@ -127,7 +125,7 @@ internal sealed class PptReader
         var document = At(docOffset);
 
         var deck = new Deck { Title = title };
-        if (Child(document, 0x03E9) is { } docAtom)
+        if (Child(document, 0x03E9) is { Length: >= 8 } docAtom)
         {
             deck.Width = I32(docAtom.Start) * MasterUnit;
             deck.Height = I32(docAtom.Start + 4) * MasterUnit;
@@ -138,13 +136,25 @@ internal sealed class PptReader
 
         var lists = Children(document).Where(r => r.Type == 0x0FF0).ToList();
         var masterList = lists.FirstOrDefault(l => l.Instance == 1);
-        Rec? master = null;
-        if (masterList.Length > 0 && Descendants(masterList, 0x03F3).FirstOrDefault() is { Length: > 0 } mp && _persist.TryGetValue(I32(mp.Start), out var mo))
-        {
-            master = At(mo);
-            ReadMasterStyles(master.Value);
-            if (Scheme(master.Value) is { } masterScheme) _scheme = masterScheme;
-        }
+        // Every design in the deck, by the id its slides ask for; the first one steps in when there's no match.
+        var masters = new Dictionary<int, (Rec? rec, Color[] scheme, Dictionary<int, TextDefaults[]> styles)>();
+        (Rec? rec, Color[] scheme, Dictionary<int, TextDefaults[]> styles)? firstMaster = null;
+        if (masterList.Length > 0)
+            foreach (var mp in Descendants(masterList, 0x03F3).Where(r => r.Length >= 16))
+            {
+                if (!_persist.TryGetValue(I32(mp.Start), out var mo) || masters.Count >= 1000) continue;
+                var rec = At(mo);
+                if (rec.Type != 0x03F8 && (rec.Type != 0x03EE || firstMaster == null)) continue;
+                var styles = firstMaster is { } f ? new Dictionary<int, TextDefaults[]>(f.styles) : [];
+                var masterScheme = Scheme(rec) ?? firstMaster?.scheme ?? _scheme;
+                if (rec.Type == 0x03F8)
+                {
+                    (_scheme, _masterStyles) = (masterScheme, styles);
+                    ReadMasterStyles(rec);
+                }
+                firstMaster ??= (rec, masterScheme, styles);
+                masters.TryAdd(I32(mp.Start + 12), (rec, masterScheme, styles));
+            }
 
         foreach (var r in lists.Where(l => l.Instance == 2).SelectMany(Children).Where(r => r.Type == 0x03F3 && r.Length >= 16))
             _notesPersist[I32(r.Start + 12)] = I32(r.Start);
@@ -156,17 +166,28 @@ internal sealed class PptReader
         foreach (var r in Children(slideList))
         {
             _ct.ThrowIfCancellationRequested();
-            if (r.Type == 0x03F3) entries.Add((I32(r.Start), []));
+            if (r.Type == 0x03F3 && r.Length >= 4)
+            {
+                entries.Add((I32(r.Start), []));
+                SlideLimits.CheckSlides(entries.Count);
+            }
             else if (entries.Count > 0) entries[^1].texts.Add(r);
         }
         foreach (var (persist, texts) in entries)
         {
+            _ct.ThrowIfCancellationRequested();
             if (!_persist.TryGetValue(persist, out var offset)) continue;
             var slide = At(offset);
             if (slide.Type != 0x03EE) continue;
-            var scheme = Scheme(slide) ?? _scheme;
-            var read = ReadSlide(slide, master, scheme, Grouped(texts));
+            var slideAtom = Child(slide, 0x03EF);
+            var master = slideAtom is { Length: >= 16 } a && masters.TryGetValue(I32(a.Start + 12), out var named) ? named : firstMaster;
+            if (master is { } m) (_scheme, _masterStyles) = (m.scheme, m.styles);
+            bool ownScheme = slideAtom is { Length: >= 22 } s && (U16(s.Start + 20) & 0x2) == 0;
+            var scheme = (ownScheme ? Scheme(slide) : null) ?? (master?.scheme ?? Scheme(slide) ?? _scheme);
+            var read = ReadSlide(slide, master?.rec, scheme, Grouped(texts));
             read.Notes.AddRange(Notes(slide));
+            // The slide show settings say whether the slide is skipped.
+            read.Hidden = Child(slide, 0x03F9) is { Length: >= 12 } show && (U16(show.Start + 10) & 0x4) != 0;
             deck.Slides.Add(read);
         }
         if (deck.Slides.Count == 0) throw new ConversionException("This presentation has no slides.");
@@ -178,14 +199,14 @@ internal sealed class PptReader
     {
         var notes = new List<string>();
         // The slide names its notes page by notes id; the notes list maps that id to where the page is stored.
-        if (Child(slide, 0x03EF) is not { } atom || !_notesPersist.TryGetValue(I32(atom.Start + 16), out var persist)
+        if (Child(slide, 0x03EF) is not { Length: >= 20 } atom || !_notesPersist.TryGetValue(I32(atom.Start + 16), out var persist)
             || !_persist.TryGetValue(persist, out var offset) || offset <= 0) return notes;
         var page = At(offset);
         if (page.Type != 0x03F0) return notes;
         foreach (var box in Descendants(page, 0xF00D))
         {
             var records = Children(box).ToList();
-            if (records.FirstOrDefault() is not { Type: 0x0F9F } header || I32(header.Start) != 2) continue;
+            if (records.FirstOrDefault() is not { Type: 0x0F9F, Length: >= 4 } header || I32(header.Start) != 2) continue;
             foreach (var r in records)
             {
                 var text = r.Type switch
@@ -215,7 +236,7 @@ internal sealed class PptReader
 
     void ReadFonts(Rec document)
     {
-        foreach (var font in Descendants(document, 0x0FB7))
+        foreach (var font in Descendants(document, 0x0FB7).Where(r => r.Length >= 64))
         {
             var sb = new StringBuilder();
             for (int i = 0; i < 32; i++)
@@ -232,6 +253,7 @@ internal sealed class PptReader
     {
         foreach (var fbse in Descendants(document, 0xF007))
         {
+            if (fbse.Length < 32) { _blips.Add((-1, 0)); continue; }
             int size = I32(fbse.Start + 20), offset = I32(fbse.Start + 28);
             _blips.Add((offset, size));
         }
@@ -362,38 +384,70 @@ internal sealed class PptReader
         }
     }
 
-    /// <summary>Every shape in a drawing, with the mapping of the group it sits in.</summary>
-    IEnumerable<(Rec sp, GroupMap? map)> Shapes(Rec group, GroupMap? parent)
+    /// <summary>Reads a group's shapes (bottom to top), then mirrors and turns them as the group itself is.</summary>
+    void ReadGroup(Rec group, GroupMap? parent, int depth, Color[] scheme, List<List<Rec>> listTexts, List<SlideShape> into, ref SlideFill? background, bool onMaster)
     {
+        if (depth > SlideLimits.Depth) throw SlideLimits.Damaged();
         var items = Children(group).ToList();
-        GroupMap? map = parent;
-        if (items.Count > 0 && items[0].Type == 0xF004 && Child(items[0], 0xF009) is { } fspgr && Anchor(items[0], parent) is { } placed)
+        var map = parent;
+        Rec? own = null;
+        Rect placed = default;
+        double turn = 0;
+        if (items.Count > 0 && items[0].Type == 0xF004 && Child(items[0], 0xF009) is { Length: >= 16 } fspgr && Anchor(items[0], parent) is { } anchor)
         {
+            own = items[0];
+            turn = Properties(items[0]).TryGetValue(0x0004, out var angle) ? (int)angle / 65536.0 % 360 : 0;
+            placed = Upright(anchor, turn);
             var space = new Rect(I32(fspgr.Start), I32(fspgr.Start + 4),
-                Math.Max(0, I32(fspgr.Start + 8) - I32(fspgr.Start)), Math.Max(0, I32(fspgr.Start + 12) - I32(fspgr.Start + 4)));
+                Math.Max(0, (double)I32(fspgr.Start + 8) - I32(fspgr.Start)), Math.Max(0, (double)I32(fspgr.Start + 12) - I32(fspgr.Start + 4)));
             map = new GroupMap(space, placed);
         }
+        int start = into.Count;
         foreach (var item in items)
         {
-            if (item.Type == 0xF004) yield return (item, map);
-            else if (item.Type == 0xF003) foreach (var inner in Shapes(item, map)) yield return inner;
+            if (item.Type == 0xF003) ReadGroup(item, map, depth + 1, scheme, listTexts, into, ref background, onMaster);
+            else if (item.Type == 0xF004) Add(item, map, scheme, listTexts, into, ref background, onMaster);
         }
+
+        if (own is not { } shape || Child(shape, 0xF00A) is not { Length: >= 8 } head) return;
+        int flags = I32(head.Start + 4);
+        bool flipH = (flags & 0x40) != 0, flipV = (flags & 0x80) != 0;
+        if (!flipH && !flipV && Math.Abs(turn) < 0.01) return;
+        var center = new Point((placed.X + placed.Width / 2) * MasterUnit, (placed.Y + placed.Height / 2) * MasterUnit);
+        var about = Matrix.Identity;
+        about.Translate(-center.X, -center.Y);
+        about.Scale(flipH ? -1 : 1, flipV ? -1 : 1);
+        about.Rotate(turn);
+        about.Translate(center.X, center.Y);
+        for (int i = start; i < into.Count; i++) into[i].Transform(about);
+    }
+
+    void Add(Rec sp, GroupMap? map, Color[] scheme, List<List<Rec>> listTexts, List<SlideShape> into, ref SlideFill? background, bool onMaster)
+    {
+        SlideLimits.CheckShapes(++_shapes);
+        try
+        {
+            if (ReadShape(sp, map, scheme, listTexts, out var isBackground, onMaster) is not { } shape) return;
+            if (isBackground) background ??= shape.Fill;
+            else into.Add(shape);
+        }
+        catch (Exception ex) when (SlideLimits.CanSkip(ex)) { Log.Write($"Skipped a shape: {ex.Message}"); }
     }
 
     /// <summary>A shape's rectangle in master units: a slide anchor, or a child anchor inside its group.</summary>
     Rect? Anchor(Rec sp, GroupMap? map)
     {
-        if (Child(sp, 0xF010) is { } anchor)
+        if (Child(sp, 0xF010) is { Length: >= 8 } anchor)
         {
             double top, left, right, bottom;
             if (anchor.Length >= 16) (top, left, right, bottom) = (I32(anchor.Start), I32(anchor.Start + 4), I32(anchor.Start + 8), I32(anchor.Start + 12));
             else (top, left, right, bottom) = (S16(anchor.Start), S16(anchor.Start + 2), S16(anchor.Start + 4), S16(anchor.Start + 6));
-            return new Rect(left, top, Math.Max(0, right - left), Math.Max(0, bottom - top));
+            return new Rect(Math.Min(left, right), Math.Min(top, bottom), Math.Abs(right - left), Math.Abs(bottom - top));
         }
-        if (Child(sp, 0xF00F) is { } child)
+        if (Child(sp, 0xF00F) is { Length: >= 16 } child)
         {
-            int l = I32(child.Start), t = I32(child.Start + 4), r = I32(child.Start + 8), b = I32(child.Start + 12);
-            var rect = new Rect(l, t, Math.Max(0, r - l), Math.Max(0, b - t));
+            double l = I32(child.Start), t = I32(child.Start + 4), r = I32(child.Start + 8), b = I32(child.Start + 12);
+            var rect = new Rect(Math.Min(l, r), Math.Min(t, b), Math.Abs(r - l), Math.Abs(b - t));
             return map?.Apply(rect) ?? rect;
         }
         return null;
@@ -405,40 +459,43 @@ internal sealed class PptReader
         var drawing = Descendants(slideRec, 0xF003).FirstOrDefault();
         var shapes = new List<SlideShape>();
         SlideFill? background = null;
-        if (drawing.Length > 0)
-            foreach (var (sp, map) in Shapes(drawing, null))
-                if (ReadShape(sp, map, scheme, listTexts, out var isBackground) is { } shape)
-                {
-                    if (isBackground) background = shape.Fill;
-                    else shapes.Add(shape);
-                }
+        if (drawing.Length > 0) ReadGroup(drawing, null, 0, scheme, listTexts, shapes, ref background, onMaster: false);
         // The background shape sits outside the shape tree.
-        foreach (var sp in Descendants(slideRec, 0xF004))
-            if (background == null && ReadShape(sp, null, scheme, [], out var isBackground) is { } bg && isBackground) background = bg.Fill;
+        if (background == null)
+            foreach (var sp in Outside(slideRec)) Add(sp, null, scheme, [], [], ref background, onMaster: false);
 
         // Follow the master's background and decorations unless the slide says otherwise.
         var slideAtom = Child(slideRec, 0x03EF);
-        int flags = slideAtom is { } a ? U16(a.Start + 20) : 0x7;
+        int flags = slideAtom is { Length: >= 22 } a ? U16(a.Start + 20) : 0x7;
         bool followBackground = (flags & 0x4) != 0, followObjects = (flags & 0x1) != 0;
         if (master is { } m && (background == null || followBackground || followObjects))
         {
-            foreach (var sp in Descendants(m, 0xF004))
-            {
-                if (ReadShape(sp, null, scheme, [], out var isBackground, onMaster: true) is not { } shape) continue;
-                if (isBackground) { if (background == null || followBackground) background = shape.Fill; }
-                else if (followObjects) slide.Shapes.Add(shape);
-            }
+            SlideFill? masterBackground = null;
+            var decorations = new List<SlideShape>();
+            if (Descendants(m, 0xF003).FirstOrDefault() is { Length: > 0 } tree) ReadGroup(tree, null, 0, scheme, [], decorations, ref masterBackground, onMaster: true);
+            if (masterBackground == null)
+                foreach (var sp in Outside(m)) Add(sp, null, scheme, [], [], ref masterBackground, onMaster: true);
+            if (masterBackground != null && (background == null || followBackground)) background = masterBackground;
+            if (followObjects) slide.Shapes.AddRange(decorations);
         }
         slide.Background = background ?? SlideFill.Solid(scheme[0]);
         slide.Shapes.AddRange(shapes);
         return slide;
     }
 
+    /// <summary>A shape or group on its side is stored with the box it takes up that way; this is its box before it was turned.</summary>
+    static Rect Upright(Rect r, double rotation) => Math.Abs(rotation) % 180 is >= 45 and < 135
+        ? new Rect(r.X + r.Width / 2 - r.Height / 2, r.Y + r.Height / 2 - r.Width / 2, r.Height, r.Width)
+        : r;
+
+    /// <summary>Shapes of a drawing that aren't in its shape tree: the background.</summary>
+    IEnumerable<Rec> Outside(Rec slide) => Descendants(slide, 0xF002).Take(1).SelectMany(Children).Where(r => r.Type == 0xF004);
+
     SlideShape? ReadShape(Rec sp, GroupMap? map, Color[] scheme, List<List<Rec>> listTexts, out bool isBackground, bool onMaster = false)
     {
         isBackground = false;
         var fsp = Child(sp, 0xF00A);
-        if (fsp is not { } f) return null;
+        if (fsp is not { Length: >= 8 } f) return null;
         int flags = I32(f.Start + 4);
         if ((flags & (0x1 | 0x4 | 0x8)) != 0) return null; // group headers, the patriarch and deleted shapes draw nothing
         isBackground = (flags & 0x400) != 0;
@@ -450,7 +507,8 @@ internal sealed class PptReader
             shape.Bounds = new Rect(r.X * MasterUnit, r.Y * MasterUnit, r.Width * MasterUnit, r.Height * MasterUnit);
         else if (!isBackground) return null;
 
-        if (props.TryGetValue(0x0004, out var rotation)) shape.Rotation = rotation / 65536.0;
+        if (props.TryGetValue(0x0004, out var rotation)) shape.Rotation = (int)rotation / 65536.0 % 360;
+        shape.Bounds = Upright(shape.Bounds, shape.Rotation);
         shape.Geometry = type switch
         {
             2 => ShapeGeometry.RoundRect, 3 => ShapeGeometry.Ellipse, 4 => ShapeGeometry.Diamond, 5 => ShapeGeometry.Triangle,
@@ -492,14 +550,17 @@ internal sealed class PptReader
             shape.Line = ColorOf(props.TryGetValue(0x01C0, out var line) ? line : 0x08000001, scheme);
             shape.LineWidth = props.TryGetValue(0x01CB, out var width) ? width / 12700.0 : 0.75;
             shape.Dashed = props.GetValueOrDefault(0x01CE) > 0;
-            shape.HeadEnd = props.GetValueOrDefault(0x01D0) > 0 ? ArrowHead.Triangle : ArrowHead.None;
-            shape.TailEnd = props.GetValueOrDefault(0x01D1) > 0 ? ArrowHead.Triangle : ArrowHead.None;
+            shape.HeadEnd = OfficeArt.LineEnd(props.GetValueOrDefault(0x01D0));
+            shape.TailEnd = OfficeArt.LineEnd(props.GetValueOrDefault(0x01D1));
         }
 
         if (props.TryGetValue(0x0104, out var picture) && picture > 0 && Blip((int)picture) is { } image)
         {
             shape.Picture = image;
             shape.Fill = null;
+            // Cropping: 16.16 fixed fractions of the picture, from the top, bottom, left and right.
+            double Crop(int id) => props.TryGetValue(id, out var v) ? (int)v / 65536.0 : 0;
+            shape.Crop = new Thickness(Crop(0x0102), Crop(0x0100), Crop(0x0103), Crop(0x0101));
         }
 
         // Text: in the shape itself, or (for placeholders) in the slide's text list.
@@ -551,20 +612,26 @@ internal sealed class PptReader
 
     DImage? Blip(int index)
     {
-        if (_pictures == null || index < 1 || index > _blips.Count) return null;
-        var (offset, size) = _blips[index - 1];
-        if (offset < 0 || offset >= _pictures.Length) return null;
-        var (data, ext) = WordBinaryReader.Blip(_pictures.AsSpan(offset, Math.Min(size + 8, _pictures.Length - offset)));
-        if (data == null) return null;
-        var (w, h) = DocxReader.ImageSize(data);
-        return new DImage(data, ext!, Math.Max(1, w), Math.Max(1, h));
+        if (!_images.TryGetValue(index, out var image)) _images[index] = image = Read();
+        return image;
+
+        DImage? Read()
+        {
+            if (_pictures == null || index < 1 || index > _blips.Count) return null;
+            var (offset, size) = _blips[index - 1];
+            if (offset < 0 || size <= 0 || offset >= _pictures.Length) return null;
+            var (data, ext) = WordBinaryReader.Blip(_pictures.AsSpan(offset, (int)Math.Min(size + 8L, _pictures.Length - offset)));
+            if (data == null) return null;
+            var (w, h) = DocxReader.ImageSize(data);
+            return new DImage(data, ext!, Math.Max(1, w), Math.Max(1, h));
+        }
     }
 
     // ------------------------------------------------------------------ text
 
     void ReadText(List<Rec> records, SlideShape shape, Color[] scheme)
     {
-        if (records.Count == 0) return;
+        if (records.Count == 0 || records[0].Length < 4) return;
         int textType = I32(records[0].Start);
         string text = "";
         foreach (var r in records)
@@ -601,7 +668,7 @@ internal sealed class PptReader
                     covered += count;
                 }
             }
-            catch (ArgumentOutOfRangeException) { }
+            catch (Exception ex) when (ex is ArgumentException or IndexOutOfRangeException) { } // cut short: keep the formatting read so far
         }
 
         int paraIndex = 0, paraLeft = paraRuns.Count > 0 ? paraRuns[0].length : int.MaxValue;

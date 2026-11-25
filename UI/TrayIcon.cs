@@ -1,5 +1,6 @@
 using System.Drawing;
 using System.Windows.Forms;
+using ConvertWheel.Conversion;
 using ConvertWheel.Input;
 
 namespace ConvertWheel.UI;
@@ -13,7 +14,7 @@ internal sealed class TrayIcon : IDisposable
     readonly Icon _normalIcon = IconFactory.TrayIcon(paused: false);
     readonly Icon _pausedIcon = IconFactory.TrayIcon(paused: true);
 
-    public TrayIcon(AppSettings settings, Action openSettings, Action exit)
+    public TrayIcon(AppSettings settings, ConversionManager conversions, Action openSettings, Action exit)
     {
         _settings = settings;
         var menu = new ContextMenuStrip
@@ -40,6 +41,11 @@ internal sealed class TrayIcon : IDisposable
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(Item("Settings…", openSettings));
         menu.Items.Add(_pause);
+        // Only there while something is running.
+        var cancel = Item("Cancel all conversions", conversions.CancelAll);
+        menu.Items.Add(cancel);
+        menu.Opening += (_, _) => cancel.Visible = conversions.ActiveCount > 0;
+        conversions.ActiveChanged += () => cancel.Enabled = conversions.ActiveCount > 0;
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(Item("Exit", exit));
 

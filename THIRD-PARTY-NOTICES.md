@@ -1,35 +1,54 @@
 # Third-party notices
 
-Convert Wheel bundles the following open-source components. Each remains under its own license; the
-license texts are available at the linked projects.
+Convert Wheel includes the components below. Each stays under its own licence. The full texts are in the `licenses`
+folder next to this file. Some are permissive; FFmpeg and parts of ImageMagick are LGPL, and the .NET runtime
+comes under Microsoft's terms.
 
-| Component | Version | License | Project |
-| --- | --- | --- | --- |
-| .NET desktop runtime (only on PCs without .NET 10; its LICENSE.txt and ThirdPartyNotices.txt sit in `runtime\`) | 10.0 | MIT | https://github.com/dotnet/runtime, https://github.com/dotnet/windowsdesktop |
-| Inno Setup (builds the installer; its uninstaller is part of every install) | 6.7.1 | Inno Setup License (free, including commercial use) | https://jrsoftware.org/isinfo.php |
-| FFmpeg (shared LGPL build by BtbN) | n8.1 | LGPL 2.1 or later | https://ffmpeg.org, builds: https://github.com/BtbN/FFmpeg-Builds |
-| ImageMagick via Magick.NET-Q8-x64 | 15.0.0 | Apache 2.0 (ImageMagick License) | https://github.com/dlemstra/Magick.NET |
-| PDFium via bblanchon.PDFium.Win32 | 158.0.8125 | Apache 2.0 / BSD-3 | https://pdfium.googlesource.com/pdfium, https://github.com/bblanchon/pdfium-binaries |
-| PDFsharp | 6.2.4 | MIT | https://github.com/empira/PDFsharp |
-| SharpCompress | 0.50.7 | MIT | https://github.com/adamhathcock/sharpcompress |
-| AngleSharp | 1.8.6 | MIT | https://github.com/AngleSharp/AngleSharp |
-| Markdig | 1.5.1 | BSD-2-Clause | https://github.com/xoofx/markdig |
-| YamlDotNet | 18.1.0 | MIT | https://github.com/aaubry/YamlDotNet |
-| ExcelDataReader | 3.9.0 | MIT | https://github.com/ExcelDataReader/ExcelDataReader |
-| SkiaSharp | 4.153.1 | MIT | https://github.com/mono/SkiaSharp |
-| NVorbis | 0.10.5 | MIT | https://github.com/NVorbis/NVorbis |
-| OggVorbisEncoder | 1.2.2 | MIT | https://github.com/SteveLillis/.NET-Ogg-Vorbis-Encoder |
-| Concentus / Concentus.OggFile | 2.2.2 / 1.0.7 | BSD-3-Clause / MIT | https://github.com/lostromb/concentus |
+| Component | Version | Licence | Texts in `licenses` | Project |
+| --- | --- | --- | --- | --- |
+| FFmpeg | n8.1.3-27-g8dca1586f4-20261031 | LGPL 3.0 or later | `ffmpeg` | https://ffmpeg.org, built by https://github.com/FFmpeg-Builds/FFmpeg-Builds |
+| Magick.NET and ImageMagick | 15.0.0 | Apache-2.0 and ImageMagick License; contains LGPL and other libraries | `Magick.NET.txt`, `Magick.NET-Notice.txt` | https://github.com/dlemstra/Magick.NET |
+| PDFium | 158.0.8125 | BSD-3-Clause and Apache-2.0; build scripts MIT | `pdfium` | https://pdfium.googlesource.com/pdfium, built by https://github.com/bblanchon/pdfium-binaries |
+| SkiaSharp and Skia | 4.153.1 | MIT; Skia BSD-3-Clause and others | `SkiaSharp.txt`, `SkiaSharp-THIRD-PARTY-NOTICES.txt` | https://github.com/mono/SkiaSharp |
+| PDFsharp | 6.2.4 | MIT | `PDFsharp.txt` | https://github.com/empira/PDFsharp |
+| SharpCompress | 0.50.7 | MIT | `SharpCompress.txt` | https://github.com/adamhathcock/sharpcompress |
+| AngleSharp | 1.8.6 | MIT | `AngleSharp.txt` | https://github.com/AngleSharp/AngleSharp |
+| Markdig | 1.5.1 | BSD-2-Clause | `Markdig.txt` | https://github.com/xoofx/markdig |
+| YamlDotNet | 18.1.0 | MIT | `YamlDotNet.txt` | https://github.com/aaubry/YamlDotNet |
+| ExcelDataReader | 3.9.0 | MIT | `ExcelDataReader.txt` | https://github.com/ExcelDataReader/ExcelDataReader |
+| NVorbis | 0.10.5 | MIT | `NVorbis.txt` | https://github.com/NVorbis/NVorbis |
+| OggVorbisEncoder | 1.2.2 | MIT | `OggVorbisEncoder.txt` | https://github.com/SteveLillis/.NET-Ogg-Vorbis-Encoder |
+| Concentus | 2.2.2 | BSD-3-Clause | `Concentus.txt` | https://github.com/lostromb/concentus |
+| Microsoft.Extensions.Logging.Abstractions | 8.0.3 | MIT | `Microsoft.Extensions.txt`, `Microsoft.Extensions-THIRD-PARTY-NOTICES.txt` | https://github.com/dotnet/runtime |
+| Microsoft.Extensions.DependencyInjection.Abstractions | 8.0.2 | MIT | `Microsoft.Extensions.txt`, `Microsoft.Extensions-THIRD-PARTY-NOTICES.txt` | https://github.com/dotnet/runtime |
+| Microsoft .NET desktop runtime | 10.0 | Microsoft .NET Library license terms; source MIT | `dotnet` | https://github.com/dotnet/runtime, https://github.com/dotnet/windowsdesktop |
+| Inno Setup | 6.7.1 | Inno Setup License | `InnoSetup.txt` | https://jrsoftware.org/isinfo.php |
 
-## FFmpeg (LGPL)
+- The .NET runtime travels in the installer and is only copied (into `runtime`, unchanged) to PCs without .NET 10.
+  `ConvertWheel.exe` also contains .NET's small program starter. Microsoft licenses the binaries under the
+  ".NET Library" terms in `licenses\dotnet\LICENSE.txt`.
+- Inno Setup makes the installer; its uninstaller is part of every install.
 
-The app embeds an unmodified LGPL shared-library build of FFmpeg (`ffmpeg.exe` plus the `av*`/`sw*` DLLs
-and FFmpeg's `LICENSE.txt`). It is unpacked on first use into `%LOCALAPPDATA%\ConvertWheel\tools\ffmpeg-*`
-and run as a separate program, so the libraries there can be replaced with any compatible build.
+## FFmpeg (LGPL 3.0 or later)
 
-- Source code for this FFmpeg version: https://github.com/FFmpeg/FFmpeg/tree/release/8.1
-- Build scripts used to produce the binaries: https://github.com/BtbN/FFmpeg-Builds
-- `tools\pack-ffmpeg.ps1` documents exactly which build is bundled.
+Convert Wheel includes an unmodified shared-library build of FFmpeg (`ffmpeg.exe`, the `av*` and `sw*` DLLs and its
+LICENSE.txt), made with `--enable-version3` and without `--enable-gpl` or `--enable-nonfree`. It is unpacked on first
+use into `%LOCALAPPDATA%\ConvertWheel\tools` and run as a separate program, and its files there can be replaced
+with other builds.
 
-No GPL-only or non-free FFmpeg components (such as x264 or fdk-aac) are included; H.264 video is
-encoded with Windows' own encoder through FFmpeg's Media Foundation wrapper.
+`licenses\ffmpeg\SOURCES.md` names the exact build, its configuration, every library in it with its licence, where the
+corresponding source code of all of them is, and how to replace the files. The LGPL 3.0 and the GPL 3.0 it builds on
+are in the same folder.
+
+## ImageMagick's LGPL parts
+
+`Magick.Native-Q8-x64.dll` (unmodified, from the Magick.NET-Q8-x64 package) contains libheif, libde265, cairo, GLib,
+pango, librsvg, libcroco, gdk-pixbuf, FriBidi, liblqr and LibRaw among others, under LGPL versions or a choice that includes
+one. `Magick.NET-Notice.txt` lists all of them with their versions and texts.
+
+- Sources and build scripts: https://github.com/dlemstra/Magick.Native/tree/2026.1010.1943
+  (commit 4dcdad28530c14c8d35687fdeb1ecc8d39b01e30); ImageMagick itself is
+  https://github.com/ImageMagick/ImageMagick/tree/211e5b975a0019a88dcef5f84c1193f46738d815; the libraries, in the versions
+  `Magick.NET-Notice.txt` gives, come from https://github.com/ImageMagick/Dependencies; the .NET part is https://github.com/dlemstra/Magick.NET/tree/79bb8700d7fe3a564f62926ab299fc2520cb2269.
+- The DLL sits next to `ConvertWheel.exe`. Exit the app and replace it with your own build to use that instead. You may
+  modify it and reverse engineer it for that purpose.

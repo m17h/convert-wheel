@@ -25,6 +25,7 @@ internal static unsafe class Ocr
     static readonly object Gate = new();
     static int _maxDimension;
     static string? _unavailable;
+    const string NoLanguage = "Windows has no text-recognition language installed. Add one in Settings › Time & language › Language.";
 
     /// <summary>Whether Windows has a recognizer installed for at least one language.</summary>
     public static bool Available
@@ -47,7 +48,7 @@ internal static unsafe class Ocr
         lock (Gate)
         {
             var engine = Engine();
-            if (engine == IntPtr.Zero) throw new ConversionException(_unavailable ?? "Windows text recognition isn't available on this PC.");
+            if (engine == IntPtr.Zero) throw new ConversionException(_unavailable ?? NoLanguage);
 
             // A fresh engine per call: conversions run on short-lived threads, and COM objects belong to their apartment.
             IntPtr buffer = 0, bitmap = 0, operation = 0, result = 0, lines = 0;
@@ -156,8 +157,7 @@ internal static unsafe class Ocr
                     }
                     finally { Marshal.Release(languages); }
                 }
-                if (engine == 0) _unavailable = "Windows has no text-recognition language installed. Add one in Settings › Time & language › Language.";
-                result = engine;
+                result = engine; // asked again each time: a language can be added while the app runs
             }
             finally { Marshal.Release(statics); }
         }

@@ -12,10 +12,15 @@ internal sealed class Deck
     public string? Title { get; set; }
     public string Font { get; set; } = "Calibri";
     public List<Slide> Slides { get; } = [];
+
+    /// <summary>The slides to draw: hidden ones are left out, as PowerPoint does, unless that leaves nothing.</summary>
+    public List<Slide> Shown => Slides.Any(s => !s.Hidden) ? Slides.Where(s => !s.Hidden).ToList() : Slides;
 }
 
 internal sealed class Slide
 {
+    /// <summary>Skipped when presenting.</summary>
+    public bool Hidden { get; set; }
     public SlideFill? Background { get; set; }
     /// <summary>Speaker notes, one string per paragraph.</summary>
     public List<string> Notes { get; } = [];
@@ -36,6 +41,8 @@ internal sealed class SlideFill
     public double? Tile { get; set; }
     /// <summary>Picture opacity, 0..1.</summary>
     public double Opacity { get; set; } = 1;
+    /// <summary>Fractions of the picture left outside each side of the shape (negative: room between them).</summary>
+    public Thickness Crop { get; set; }
 
     public static SlideFill Solid(Color c) => new() { Color = c };
 
@@ -56,7 +63,21 @@ internal enum ShapeGeometry
 
 internal enum TextAnchor { Top, Middle, Bottom }
 
-internal enum ArrowHead { None, Triangle }
+internal enum ArrowHead { None, Triangle, Stealth, Open, Diamond, Oval }
+
+/// <summary>One side of a table cell; no colour means no line.</summary>
+internal sealed record CellEdge(double Width, Color? Color);
+
+/// <summary>How a slide's table cell looks where it differs from its table.</summary>
+internal sealed class CellLook
+{
+    public TextAnchor Anchor { get; set; }
+    public Thickness? Padding { get; set; }
+    public CellEdge? Left { get; set; }
+    public CellEdge? Top { get; set; }
+    public CellEdge? Right { get; set; }
+    public CellEdge? Bottom { get; set; }
+}
 
 internal sealed class SlideShape
 {
@@ -79,8 +100,10 @@ internal sealed class SlideShape
     public ArrowHead TailEnd { get; set; }
 
     public DImage? Picture { get; set; }
-    /// <summary>Fractions cropped from each side of the picture.</summary>
+    /// <summary>Fractions cropped from each side of the picture (negative: empty room on that side).</summary>
     public Thickness Crop { get; set; }
+    /// <summary>Picture opacity, 0..1.</summary>
+    public double PictureOpacity { get; set; } = 1;
 
     /// <summary>Text (paragraphs and tables) laid out inside the shape.</summary>
     public List<DBlock> Text { get; } = [];
@@ -89,11 +112,45 @@ internal sealed class SlideShape
     public bool Wrap { get; set; } = true;
     /// <summary>Shrink the text until it fits, as PowerPoint's "shrink text on overflow" does.</summary>
     public bool ShrinkToFit { get; set; }
-    /// <summary>Text rotated a quarter turn ("vert" / "vert270").</summary>
+    /// <summary>Text turned within the shape: a quarter turn ("vert" / "vert270") or upside down (180).</summary>
     public int TextRotation { get; set; }
 
     /// <summary>The role of a placeholder ("title", "body"…), kept so writers can mark titles.</summary>
     public string? Role { get; set; }
 
     public bool HasText => Text.Any(b => b is DTable || b is DParagraph p && p.Inlines.Count > 0);
+
+    /// <summary>Moves the shape by a transform (a group's flip and turn): its place, its own turn and its own flip.</summary>
+    public void Transform(Matrix m)
+    {
+        var own = Matrix.Identity;
+        own.Scale(FlipH ? -1 : 1, FlipV ? -1 : 1);
+        own.Rotate(Rotation);
+        var total = own * m;
+        Vector across = total.Transform(new Vector(1, 0)), down = total.Transform(new Vector(0, 1));
+        var center = m.Transform(new Point(Bounds.X + Bounds.Width / 2, Bounds.Y + Bounds.Height / 2));
+        double w = Bounds.Width * across.Length, h = Bounds.Height * down.Length;
+        // Every combination of flips comes down to a turn, with or without one mirroring.
+        FlipH = total.Determinant < 0;
+        FlipV = false;
+        if (FlipH) across.Negate();
+        Rotation = Math.Round(Math.Atan2(across.Y, across.X) * 180 / Math.PI, 6);
+        if (Path != null && (Math.Abs(across.Length - 1) > 0.001 || Math.Abs(down.Length - 1) > 0.001))
+        {
+            Path = Path.Clone();
+            Path.Transform = new MatrixTransform((Path.Transform?.Value ?? Matrix.Identity) * new Matrix(across.Length, 0, 0, down.Length, 0, 0));
+        }
+        Bounds = new Rect(center.X - w / 2, center.Y - h / 2, w, h);
+    }
+
+    /// <summary>Where the picture goes and which part of it shows, once cropping (inwards or outwards) is worked out.</summary>
+    public static (Rect area, Thickness crop) PictureArea(Rect r, Thickness crop)
+    {
+        double across = 1 - crop.Left - crop.Right, down = 1 - crop.Top - crop.Bottom;
+        if (crop == default || across <= 0.001 || down <= 0.001) return (r, default);
+        double left = Math.Max(0, -crop.Left) / across, right = Math.Max(0, -crop.Right) / across;
+        double top = Math.Max(0, -crop.Top) / down, bottom = Math.Max(0, -crop.Bottom) / down;
+        var area = new Rect(r.X + left * r.Width, r.Y + top * r.Height, Math.Max(0, 1 - left - right) * r.Width, Math.Max(0, 1 - top - bottom) * r.Height);
+        return (area, new Thickness(Math.Max(0, crop.Left), Math.Max(0, crop.Top), Math.Max(0, crop.Right), Math.Max(0, crop.Bottom)));
+    }
 }

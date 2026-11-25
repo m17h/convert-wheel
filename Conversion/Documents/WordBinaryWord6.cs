@@ -42,13 +42,13 @@ internal sealed partial class WordBinaryReader
             _pieces.Add((0, total, fcMin, true));
         }
         int cpnChp = BinaryPrimitives.ReadUInt16LittleEndian(_word.AsSpan(398)), cpnPap = BinaryPrimitives.ReadUInt16LittleEndian(_word.AsSpan(400));
-        ReadFkps(FcLcb(12), chars: true, cpnChp);
-        ReadFkps(FcLcb(13), chars: false, cpnPap);
-        ReadFonts(FcLcb(15));
-        ReadStyles(FcLcb(1));
+        Try("character formatting", () => ReadFkps(FcLcb(12), chars: true, cpnChp));
+        Try("paragraph formatting", () => ReadFkps(FcLcb(13), chars: false, cpnPap));
+        Try("fonts", () => ReadFonts(FcLcb(15)));
+        Try("styles", () => ReadStyles(FcLcb(1)));
 
         var doc = new DDocument { Title = title };
-        ReadPageSetup(FcLcb(6), doc);
+        Try("page setup", () => ReadPageSetup(FcLcb(6), doc));
         if (_styles.Values.FirstOrDefault(s => s.sti == 0) is { chpx: { } normal })
         {
             var baseChars = new CharProps();
@@ -59,10 +59,12 @@ internal sealed partial class WordBinaryReader
         else (doc.Font, doc.FontSize) = (_defaultFont ?? "Times New Roman", 10);
 
         int footnoteStory = _ccpText, headerStory = footnoteStory + _ccpFtn, endnoteStory = headerStory + _ccpHdd + ccpMcr + _ccpAtn;
-        var notes = ReadNotes(FcLcb(2), FcLcb(3), footnoteStory, _ccpFtn, endnote: false);
-        foreach (var (cp, note) in ReadNotes((I32(466), I32(470)), (I32(474), I32(478)), endnoteStory, _ccpEdn, endnote: true)) notes[cp] = note;
-        ReadHeaders(doc, headerStory);
+        var notes = new Dictionary<int, (List<DBlock> blocks, bool endnote)>();
+        Try("footnotes", () => ReadNotes(FcLcb(2), FcLcb(3), footnoteStory, _ccpFtn, endnote: false, notes));
+        Try("endnotes", () => ReadNotes((I32(466), I32(470)), (I32(474), I32(478)), endnoteStory, _ccpEdn, endnote: true, notes));
+        Try("headers", () => ReadHeaders(doc, headerStory));
         ReadStory(0, _ccpText, doc.Blocks, notes);
+        DocumentLimits.Finish(doc);
         doc.NormalizeDefaults();
         return doc;
     }

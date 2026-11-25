@@ -25,6 +25,9 @@ internal static class VideoEngine
             GifToVideo(plan.SourcePath, output, target.Ext, progress, ct);
             return;
         }
+        MediaCheck.EnsureComplete(plan.SourcePath);
+        // Windows guesses the frame rate of Matroska/WebM files, and drops frames when it guesses low.
+        if (MediaCheck.IsMatroska(plan.SourcePath)) throw new NotSupportedException("Matroska and WebM videos are left to FFmpeg.");
         if (target.Ext == "webp")
         {
             VideoToWebP(plan.SourcePath, output, progress, ct);
@@ -184,26 +187,33 @@ internal static class VideoEngine
         return (stream, MF.VideoNV12);
     }
 
-    static (int stream, IAudioSource source)? AddAudioStream(IMFSinkWriter writer, string path, string ext)
+    static (int stream, IAudioSource source, MfAudioSource original)? AddAudioStream(IMFSinkWriter writer, string path, string ext)
     {
-        if (!HasAudio(path)) return null;
+        if (!HasAudio(path))
+        {
+            if (MediaCheck.HasAudio(path) == true) throw new NotSupportedException("Windows can't read this video's audio track.");
+            return null;
+        }
         IAudioSource? source = null;
         try
         {
             string codecExt = ext switch { "wmv" => "wma", "avi" => "mp3", _ => "m4a" };
-            source = AudioEngine.Prepare(new MfAudioSource(path), codecExt, out _);
+            var original = new MfAudioSource(path, keepTiming: true);
+            source = original;
+            source = AudioEngine.Prepare(original, codecExt, out _);
             var output = codecExt switch
             {
                 "wma" => AudioEngine.WmaType(source.Format),
                 "mp3" => Mp3Type(source.Format),
                 _ => AudioEngine.AacType(source.Format),
             };
-            writer.AddStream(output, out int stream);
-            MF.Release(output);
+            int stream;
+            try { writer.AddStream(output, out stream); }
+            finally { MF.Release(output); }
             var input = MfAudioSink.PcmType(source.Format, 16);
-            writer.SetInputMediaType(stream, input, null);
-            MF.Release(input);
-            return (stream, source);
+            try { writer.SetInputMediaType(stream, input, null); }
+            finally { MF.Release(input); }
+            return (stream, source, original);
         }
         catch (Exception ex) when (ex is NotSupportedException or COMException)
         {
@@ -229,6 +239,18 @@ internal static class VideoEngine
         _ => MF.ContainerMPEG4,
     };
 
+    /// <summary>Windows' reader only gives us the first audio track of several; FFmpeg can keep them all.</summary>
+    static void EnsureOneAudioTrack(IMFSourceReader reader, Mp4Info? timing)
+    {
+        int tracks = 0;
+        for (int i = 0; reader.GetNativeMediaType(i, 0, out var t) >= 0; i++)
+        {
+            if (t.GetGuid(MF.MT_MAJOR_TYPE) == MF.MediaTypeAudio) tracks++;
+            MF.Release(t);
+        }
+        if (Math.Max(tracks, timing?.Audio.Count ?? 0) > 1) throw new NotSupportedException("This video has several audio tracks, which needs FFmpeg.");
+    }
+
     internal static void TranscodeTo(string input, string output, string ext, IProgress<double?> progress, CancellationToken ct)
     {
         MF.EnsureStarted();
@@ -237,11 +259,14 @@ internal static class VideoEngine
 
     static void Transcode(string input, string output, string ext, IProgress<double?> progress, CancellationToken ct)
     {
+        var timing = Mp4Info.Read(input);
+        if (timing?.Trimmed == true) throw new NotSupportedException("This video has an edit list, which needs FFmpeg.");
         var reader = OpenVideoReader(input, out var info);
         IMFSinkWriter? writer = null;
-        (int stream, IAudioSource source)? audio = null;
+        (int stream, IAudioSource source, MfAudioSource original)? audio = null;
         try
         {
+            EnsureOneAudioTrack(reader, timing);
             // The reader's video processor scales to square pixels (and applies phone rotation when the
             // decoder allows). Encoders need even dimensions.
             var (width, height) = DecodedSize(info);
@@ -267,6 +292,27 @@ internal static class VideoEngine
 
             long videoTime = 0, audioTime = 0, audioFrames = 0;
             bool videoDone = false, audioDone = audio == null;
+
+            // Start at 0 whichever track comes first, and keep the other exactly as much later as it was.
+            IMFSample? first = null;
+            long firstTime = 0;
+            while (first == null && !videoDone)
+            {
+                ct.ThrowIfCancellationRequested();
+                reader.ReadSample(MF.SourceReaderFirstVideo, 0, out _, out int flags, out firstTime, out first);
+                if ((flags & MF.ReaderError) != 0) throw new InvalidOperationException("Windows couldn't decode this video.");
+                if ((flags & MF.ReaderEndOfStream) != 0) videoDone = first == null;
+            }
+            if (first == null) throw new InvalidOperationException("Windows found no pictures in this video.");
+            double videoStart = timing?.FirstVideo?.Start ?? firstTime / 1e7, start = videoStart;
+            if (audio != null)
+            {
+                double heard = audio.Value.original.FirstTime / 1e7, audioStart = timing?.Audio.FirstOrDefault()?.Start ?? heard;
+                start = Math.Max(0, Math.Min(start, audioStart));
+                audio.Value.original.Shift = audioStart - start - heard;
+            }
+            long videoShift = (long)Math.Round((videoStart - start) * 1e7) - firstTime;
+            long videoEnd = 0;
             var buffer = audio != null ? new float[4096 * audio.Value.source.Format.Channels] : [];
             var pcm = new byte[buffer.Length * 2];
             long duration = info.Duration ?? 0;
@@ -276,11 +322,18 @@ internal static class VideoEngine
                 ct.ThrowIfCancellationRequested();
                 if (!videoDone && (audioDone || videoTime <= audioTime))
                 {
-                    reader.ReadSample(MF.SourceReaderFirstVideo, 0, out _, out int flags, out long ts, out var sample);
-                    if ((flags & MF.ReaderError) != 0) throw new InvalidOperationException("Windows couldn't decode this video.");
+                    int flags = 0;
+                    long ts = firstTime;
+                    var sample = first;
+                    first = null;
+                    if (sample == null) reader.ReadSample(MF.SourceReaderFirstVideo, 0, out _, out flags, out ts, out sample);
+                    if ((flags & MF.ReaderError) != 0) { MF.Release(sample); throw new InvalidOperationException("Windows couldn't decode this video."); }
+                    ts = Math.Max(0, ts + videoShift);
                     if ((flags & MF.ReaderStreamTick) != 0) writer.SendStreamTick(videoStream, ts);
                     if (sample != null)
                     {
+                        sample.SetSampleTime(ts);
+                        videoEnd = Math.Max(videoEnd, ts + (sample.GetSampleDuration(out long frameLength) >= 0 ? frameLength : 0));
                         if (turnPixels != 0)
                         {
                             var frame = MF.Bytes(sample);
@@ -300,7 +353,7 @@ internal static class VideoEngine
                 }
                 else
                 {
-                    var (stream, source) = audio!.Value;
+                    var (stream, source, _) = audio!.Value;
                     int n = source.Read(buffer, buffer.Length);
                     if (n == 0) { audioDone = true; continue; }
                     Pcm.ToInt(buffer.AsSpan(0, n), pcm, 16);
@@ -313,6 +366,10 @@ internal static class VideoEngine
                     audioTime = audioFrames * 10_000_000 / source.Format.SampleRate;
                 }
             }
+            long end = Math.Max(videoEnd, audioTime);
+            if (duration > 0 && audioTime > duration * 1.1 + 20_000_000) throw new InvalidOperationException("Windows decoded this video's audio at the wrong speed.");
+            if (duration > 0 && duration - end > Math.Max(10_000_000, duration / 50))
+                throw new InvalidOperationException($"Only {MediaCheck.Clock(end)} of {MediaCheck.Clock(duration)} could be read.");
             writer.DoFinalize();
         }
         finally
@@ -334,6 +391,7 @@ internal static class VideoEngine
         var types = new List<IMFMediaType>();
         try
         {
+            var timing = Mp4Info.Read(input);
             MF.MFCreateSourceReaderFromURL(input, null, out reader);
             reader.SetStreamSelection(MF.SourceReaderAllStreams, false);
             if (reader.GetNativeMediaType(MF.SourceReaderFirstVideo, 0, out var video) < 0) return false;
@@ -344,9 +402,20 @@ internal static class VideoEngine
             if (reader.GetNativeMediaType(MF.SourceReaderFirstAudio, 0, out var a) >= 0)
             {
                 types.Add(a);
-                if (a.GetGuid(MF.MT_SUBTYPE) != MF.AudioAAC) return false;
+                var codec = a.GetGuid(MF.MT_SUBTYPE);
+                // FFmpeg can copy these too, so there's no need to encode the picture again.
+                if (codec == MF.AudioMP3 || codec == MF.AudioAC3 || codec == MF.AudioEAC3 || codec == MF.AudioALAC || codec == MF.AudioMp4ALAC)
+                    throw new NotSupportedException("This video's tracks can be copied, but not by Windows.");
+                if (codec != MF.AudioAAC) return false;
                 audio = a;
             }
+            else if (MediaCheck.HasAudio(input) == true) throw new NotSupportedException("Windows can't read this video's audio track.");
+
+            // Windows' copy loses edit lists (B-frame and encoder delays, a track that starts late) and further
+            // audio tracks. FFmpeg's keeps them.
+            EnsureOneAudioTrack(reader, timing);
+            if (timing != null && timing.Tracks.Exists(t => t.Trimmed || t.Video && t.Delayed || t.Audio && Math.Abs(t.Start ?? 0) > 0.03))
+                throw new NotSupportedException("This video has an edit list, which needs FFmpeg.");
 
             reader.SetStreamSelection(MF.SourceReaderFirstVideo, true);
             if (reader.SetCurrentMediaType(MF.SourceReaderFirstVideo, IntPtr.Zero, video) < 0) return false;
@@ -378,8 +447,9 @@ internal static class VideoEngine
                 if (major == MF.MediaTypeAudio && readerAudio < 0) readerAudio = i;
             }
 
-            long duration = MF.Duration(reader) ?? 0;
+            long duration = MF.Duration(reader) ?? 0, end = 0;
             int samples = 0;
+            var firsts = new Dictionary<int, long>();
             var ended = new HashSet<int>();
             while (true)
             {
@@ -391,8 +461,11 @@ internal static class VideoEngine
                     if (sample != null)
                     {
                         int target = index == readerVideo ? vs : index == readerAudio ? @as : -1;
+                        if (firsts.TryAdd(target, ts) && firsts.Count == 2 && Math.Abs(firsts.Values.First() - firsts.Values.Last()) > 600_000)
+                            throw new NotSupportedException("This video's tracks start at different times, which needs FFmpeg.");
                         if (target >= 0) writer.WriteSample(target, sample);
                         samples++;
+                        end = Math.Max(end, ts + (sample.GetSampleDuration(out long length) >= 0 ? length : 0));
                         if (duration > 0) progress.Report(Math.Min(0.99, (double)ts / duration));
                     }
                 }
@@ -405,6 +478,8 @@ internal static class VideoEngine
                 }
             }
             if (samples == 0) return Fail("no samples");
+            if (duration > 0 && duration - end > Math.Max(10_000_000, duration / 50))
+                throw new InvalidOperationException($"Only {MediaCheck.Clock(end)} of {MediaCheck.Clock(duration)} could be read.");
             writer.DoFinalize();
             return true;
         }
@@ -458,6 +533,8 @@ internal static class VideoEngine
                 writer ??= new Conversion.WebP.AnimatedWriter(output, w, h, 75);
                 writer.AddFrame(pixels, delayMs);
             }, p => progress.Report(p * 0.99));
+            if (writer == null) throw new ConversionException("This video has no pictures to convert.");
+            writer.Finish();
         }
         finally { writer?.Dispose(); }
     }
@@ -477,6 +554,7 @@ internal static class VideoEngine
             histogram.Add(pixels, step: 3);
         }, p => progress.Report(p * 0.4));
 
+        if (width == 0) throw new ConversionException("This video has no pictures to convert.");
         using var gif = new GifWriter(output, width, height, histogram);
         ReadGifFrames(input, Fps, MaxWidth, ct, (pixels, _, _, delayMs, _) => gif.AddFrame(pixels, delayMs), p => progress.Report(0.4 + p * 0.59));
     }
@@ -509,7 +587,7 @@ internal static class VideoEngine
             var (frameWidth, frameHeight) = FrameRotation.Size(width, height, rotate);
             long step = (long)(10_000_000 / fps), nextTime = 0, total = info.Duration ?? 0;
             byte[]? pending = null;
-            long pendingTime = 0;
+            long pendingTime = 0, end = 0;
             while (true)
             {
                 ct.ThrowIfCancellationRequested();
@@ -517,10 +595,11 @@ internal static class VideoEngine
                 if ((flags & MF.ReaderError) != 0) throw new InvalidOperationException("Windows couldn't decode this video.");
                 if (sample != null)
                 {
+                    end = Math.Max(end, ts + (sample.GetSampleDuration(out long length) >= 0 ? length : 0));
                     if (ts >= nextTime || pending == null)
                     {
                         var pixels = FrameRotation.Bgra(Pixels(sample, width, height, stride), width, height, rotate);
-                        if (pending != null) onFrame(pending, frameWidth, frameHeight, (int)((ts - pendingTime) / 10_000), total);
+                        if (pending != null) onFrame(pending, frameWidth, frameHeight, (int)(ts / 10_000 - pendingTime / 10_000), total);
                         pending = pixels;
                         pendingTime = ts;
                         nextTime = ts + step - step / 4;
@@ -530,7 +609,8 @@ internal static class VideoEngine
                 }
                 if ((flags & MF.ReaderEndOfStream) != 0) break;
             }
-            if (pending != null) onFrame(pending, frameWidth, frameHeight, (int)(step / 10_000), total);
+            // The last picture stays until the video ends.
+            if (pending != null) onFrame(pending, frameWidth, frameHeight, (int)(Math.Max(end - pendingTime, step / 2) / 10_000), total);
         }
         finally { MF.Release(reader); }
     }
@@ -572,7 +652,7 @@ internal static class VideoEngine
     static void GifToVideo(string input, string output, string ext, IProgress<double?> progress, CancellationToken ct)
     {
         var frames = Animation.Read(input);
-        if (frames.Count == 0) throw new ConversionException("This animation has no frames.");
+        if (frames.Delays.Count == 0) throw new ConversionException("This animation has no frames.");
         if (ext == "mkv")
         {
             // Encode to MP4 first, then rewrap.
@@ -589,11 +669,12 @@ internal static class VideoEngine
         if (ext == "mov") MarkAsQuickTime(output);
     }
 
-    internal static void FramesToVideo(List<AnimationFrame> frames, string output, string ext, Action<double> progress, CancellationToken ct)
+    internal static void FramesToVideo(Animation frames, string output, string ext, Action<double> progress, CancellationToken ct)
     {
-        int width = frames[0].Width & ~1, height = frames[0].Height & ~1;
+        int width = frames.Width & ~1, height = frames.Height & ~1;
         if (width < 2 || height < 2) throw new ConversionException("This animation is too small to make a video from.");
-        double averageMs = frames.Average(f => f.DelayMs);
+        if (frames.Delays.Count == 0) throw new ConversionException("This animation has no frames.");
+        double averageMs = frames.Delays.Average();
         int rateNum = (int)Math.Round(1000 * 1000 / averageMs), rateDen = 1000;
 
         var writer = CreateWriter(output, Container(ext));
@@ -603,17 +684,17 @@ internal static class VideoEngine
             writer.BeginWriting();
             long time = 0;
             var nv12 = new byte[width * height * 3 / 2];
-            for (int i = 0; i < frames.Count; i++)
+            int i = 0;
+            foreach (var f in frames)
             {
                 ct.ThrowIfCancellationRequested();
-                var f = frames[i];
                 ToNv12(f.Bgra, f.Width, width, height, nv12);
                 long duration = f.DelayMs * 10_000L;
                 var sample = MF.SampleFrom(nv12, time, duration);
                 writer.WriteSample(stream, sample);
                 MF.Release(sample);
                 time += duration;
-                progress((double)(i + 1) / frames.Count);
+                progress((double)++i / frames.Delays.Count);
             }
             writer.DoFinalize();
         }

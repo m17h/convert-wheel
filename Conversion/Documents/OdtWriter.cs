@@ -65,12 +65,13 @@ internal sealed class OdtWriter
         public readonly string Prefix = prefix;
         public readonly List<XElement> Elements = [];
         public readonly Dictionary<string, string> Text = [], Para = [];
+        public readonly ListPlanner Lists = new();
     }
     readonly StyleSet _contentStyles = new(""), _masterStyles = new("M");
     StyleSet _set;
     readonly List<(string name, byte[] data, string type)> _pictures = [];
     readonly HashSet<string> _fonts = [];
-    int _tables, _frames;
+    int _tables, _frames, _notes;
     /// <summary>Page settings of the sections after the first, in order (each gets its own page style).</summary>
     readonly List<PageSetup> _sections = [];
 
@@ -88,6 +89,7 @@ internal sealed class OdtWriter
         _fonts.Add(_doc.Font);
         var body = new XElement(Office + "text");
         Blocks(_doc.Blocks, body, _doc.ContentWidth);
+        ListStyles(_contentStyles);
 
         var content = new XElement(Office + "document-content", OdfPackage.Namespaces(),
             FontDecls(),
@@ -98,25 +100,103 @@ internal sealed class OdtWriter
 
     void Blocks(List<DBlock> blocks, XElement parent, double available)
     {
+        // The list being written: one element per level that's open.
+        ListPlanner.ListDefinition? list = null;
+        var open = new List<(XElement list, int number)>();
         foreach (var block in blocks)
         {
             _ct.ThrowIfCancellationRequested();
+            if (block is DParagraph { List: not ListKind.None, Heading: 0, Section: null } item && _set.Lists.Next(item) is var (planned, level) && Countable(planned.Levels[level]!)
+                // Outer levels' numbers can only be shown by items inside theirs.
+                && planned.Levels[level]!.Text.Count(c => c == '%') is var shown && (shown < 2 || planned == list && open.Count >= level && open.Take(level).TakeLast(shown - 1).All(o => o.number != int.MinValue)))
+            {
+                if (planned != list) open.Clear();
+                list = planned;
+                ListItem(item, planned, level, open, parent, available);
+                continue;
+            }
+            list = null;
             // A section on its own page settings opens with a paragraph that switches to its page style.
             if (block.Section is { } setup && block is not DParagraph && parent.Name == Office + "text")
                 parent.Add(new XElement(Text + "p", new XAttribute(Text + "style-name", ParagraphStyle(new DParagraph { Section = setup }))));
-            if (block is DParagraph p) parent.Add(Paragraph(p, available));
+            if (block is DParagraph p) parent.Add(Paragraph(p, available, p.ListLabel));
             else if (block is DTable t) parent.Add(TableElement(t, available));
         }
     }
 
-    XElement Paragraph(DParagraph p, double available)
+    /// <summary>Markers OpenDocument can make itself; others are written as text.</summary>
+    static bool Countable(ListPlanner.LevelLook look) => look.Kind == ListKind.Bullet ? look.Text.Length == 1 : look.Format is not ("none" or "decimalZero");
+
+    void ListItem(DParagraph p, ListPlanner.ListDefinition planned, int level, List<(XElement list, int number)> open, XElement parent, double available)
+    {
+        while (open.Count > level + 1) open.RemoveAt(open.Count - 1);
+        while (open.Count < level + 1)
+        {
+            var nested = new XElement(Text + "list");
+            if (open.Count == 0)
+            {
+                nested.Add(new XAttribute(Text + "style-name", ListStyleName(_set, planned)));
+                parent.Add(nested);
+            }
+            else
+            {
+                // Inside the item above; where there is none, in an unnumbered one.
+                var outer = open[^1].list;
+                if (outer.LastNode is not XElement holder) outer.Add(holder = new XElement(Text + "list-header"));
+                holder.Add(nested);
+            }
+            open.Add((nested, int.MinValue));
+        }
+        var item = new XElement(Text + "list-item");
+        if (p.List == ListKind.Number && ListMarker.Parse(p.ListLabel, open[level].number + 1) is { Number: >= 0 } marker)
+        {
+            if (marker.Number != open[level].number + 1) item.Add(new XAttribute(Text + "start-value", marker.Number));
+            open[level] = (open[level].list, marker.Number);
+        }
+        item.Add(Paragraph(p, available, null));
+        open[level].list.Add(item);
+    }
+
+    static string ListStyleName(StyleSet set, ListPlanner.ListDefinition list) => $"{set.Prefix}L{list.Id}";
+
+    static void ListStyles(StyleSet set)
+    {
+        foreach (var list in set.Lists.Definitions)
+        {
+            var style = new XElement(Text + "list-style", new XAttribute(St + "name", ListStyleName(set, list)));
+            for (int i = 0; i < 9; i++)
+            {
+                var look = list.Levels[i];
+                XElement level;
+                if (look is { Kind: ListKind.Number } && Countable(look))
+                {
+                    // "(%1.%2)": what's around the numbers, and how many levels' numbers there are.
+                    int first = look.Text.IndexOf('%'), last = look.Text.LastIndexOf('%');
+                    level = new XElement(Text + "list-level-style-number", new XAttribute(Text + "level", i + 1),
+                        new XAttribute(St + "num-prefix", look.Text[..first]), new XAttribute(St + "num-suffix", look.Text[Math.Min(look.Text.Length, last + 2)..]),
+                        new XAttribute(St + "num-format", look.Format switch { "lowerLetter" => "a", "upperLetter" => "A", "lowerRoman" => "i", "upperRoman" => "I", _ => "1" }));
+                    int shown = look.Text.Count(c => c == '%');
+                    if (shown > 1) level.Add(new XAttribute(Text + "display-levels", shown));
+                }
+                else level = new XElement(Text + "list-level-style-bullet", new XAttribute(Text + "level", i + 1),
+                    new XAttribute(Text + "bullet-char", look is { Kind: ListKind.Bullet, Text.Length: 1 } ? look.Text : i % 3 == 0 ? "•" : i % 3 == 1 ? "◦" : "▪"));
+                level.Add(new XElement(St + "list-level-properties", new XAttribute(Text + "list-level-position-and-space-mode", "label-alignment"),
+                    new XElement(St + "list-level-label-alignment", new XAttribute(Text + "label-followed-by", "listtab"),
+                        new XAttribute(Text + "list-tab-stop-position", OdfPackage.Len(36 + i * 18)), new XAttribute(Fo + "text-indent", "-18pt"), new XAttribute(Fo + "margin-left", OdfPackage.Len(36 + i * 18)))));
+                style.Add(level);
+            }
+            set.Elements.Add(style);
+        }
+    }
+
+    XElement Paragraph(DParagraph p, double available, string? label)
     {
         var el = p.Heading > 0
-            ? new XElement(Text + "h", new XAttribute(Text + "outline-level", p.Heading))
+            ? new XElement(Text + "h", new XAttribute(Text + "outline-level", Math.Clamp(p.Heading, 1, 10)))
             : new XElement(Text + "p");
         el.Add(new XAttribute(Text + "style-name", ParagraphStyle(p)));
 
-        if (p.ListLabel != null) el.Add(p.ListLabel, new XElement(Text + "tab"));
+        if (label != null) el.Add(label, new XElement(Text + "tab"));
         foreach (var inline in p.Inlines)
         {
             switch (inline)
@@ -125,12 +205,16 @@ internal sealed class OdtWriter
                     var nodes = TextNodes(t.Text);
                     XElement? container = null;
                     if (TextStyleName(t.Style, p.Heading > 0) is { } styleName) container = new XElement(Text + "span", new XAttribute(Text + "style-name", styleName), nodes);
-                    if (t.Link != null)
-                        el.Add(new XElement(Text + "a", new XAttribute(XLink + "type", "simple"), new XAttribute(XLink + "href", t.Link), (object?)container ?? nodes));
+                    var target = t.Link is ['#', .. var place] ? "#" + SafeXml.Text(place) : Links.ForDocument(t.Link);
+                    if (target != null)
+                        el.Add(new XElement(Text + "a", new XAttribute(XLink + "type", "simple"), new XAttribute(XLink + "href", target), (object?)container ?? nodes));
                     else el.Add((object?)container ?? nodes);
                     break;
                 case DLineBreak:
                     el.Add(new XElement(Text + "line-break"));
+                    break;
+                case DAnchor a:
+                    el.Add(new XElement(Text + "bookmark", new XAttribute(Text + "name", SafeXml.Text(a.Name))));
                     break;
                 case DImage img:
                     el.Add(Frame(img, available));
@@ -158,7 +242,7 @@ internal sealed class OdtWriter
         Blocks(FlowBridge.WithoutMark(note), body, _doc.ContentWidth);
         if (!body.HasElements) body.Add(new XElement(Text + "p"));
         return new XElement(Text + "note",
-            new XAttribute(Text + "id", $"{(note.Endnote ? "edn" : "ftn")}{note.Number}"),
+            new XAttribute(Text + "id", $"{(note.Endnote ? "edn" : "ftn")}{++_notes}"),
             new XAttribute(Text + "note-class", note.Endnote ? "endnote" : "footnote"),
             new XElement(Text + "note-citation", FlowBridge.NoteMark(note)),
             body);
@@ -193,11 +277,7 @@ internal sealed class OdtWriter
         if (f.VerticalAlign == FloatAlign.None) frame.Add(new XAttribute(Svg + "y", OdfPackage.Len(f.Y)));
         if (f.Image != null)
         {
-            var ext = f.Image.Ext == "jpeg" ? "jpg" : f.Image.Ext;
-            var name = $"Pictures/image{_pictures.Count + 1}.{ext}";
-            _pictures.Add((name, f.Image.Data, f.Image.Ext == "jpeg" ? "image/jpeg" : $"image/{f.Image.Ext}"));
-            frame.Add(new XElement(Draw + "image", new XAttribute(XLink + "href", name), new XAttribute(XLink + "type", "simple"),
-                new XAttribute(XLink + "show", "embed"), new XAttribute(XLink + "actuate", "onLoad")));
+            frame.Add(PictureElements(f.Image));
         }
         else
         {
@@ -273,15 +353,15 @@ internal sealed class OdtWriter
             new XAttribute(Fo + "text-align", p.Align switch
             {
                 TextAlignment.Center => "center",
-                TextAlignment.Right => "end",
                 TextAlignment.Justify => "justify",
-                _ => "start",
+                _ => (p.Align == TextAlignment.Right) == p.RightToLeft ? "start" : "end",
             }));
+        if (p.RightToLeft) props.Add(new XAttribute(St + "writing-mode", "rl-tb"));
         if (Math.Abs(p.LineSpacing - 1) > 0.01)
             props.Add(new XAttribute(Fo + "line-height", (p.LineSpacing * 100).ToString("0", CultureInfo.InvariantCulture) + "%"));
         if (p.PageBreakBefore) props.Add(new XAttribute(Fo + "break-before", "page"));
 
-        var parent = p.Heading > 0 ? $"Heading_20_{p.Heading}" : "Standard";
+        var parent = p.Heading > 0 ? $"Heading_20_{Math.Clamp(p.Heading, 1, 6)}" : "Standard";
         var key = parent + props;
         string? master = null;
         if (p.Section is { } section)
@@ -307,20 +387,22 @@ internal sealed class OdtWriter
     string? TextStyleName(TextStyle s, bool heading)
     {
         var props = new XElement(St + "text-properties");
-        if (s.Bold) props.Add(new XAttribute(Fo + "font-weight", "bold"));
-        else if (heading && s.Size != null) props.Add(new XAttribute(Fo + "font-weight", "normal"));
-        if (s.Italic) props.Add(new XAttribute(Fo + "font-style", "italic"));
+        // OpenDocument keeps the look of Asian and right-to-left text apart from Western text's.
+        void Every(string name, string value) => props.Add(new XAttribute(Fo + name, value), new XAttribute(St + name + "-asian", value), new XAttribute(St + name + "-complex", value));
+        if (s.Bold) Every("font-weight", "bold");
+        else if (heading && s.Size != null) Every("font-weight", "normal");
+        if (s.Italic) Every("font-style", "italic");
         if (s.Underline) props.Add(new XAttribute(St + "text-underline-style", "solid"), new XAttribute(St + "text-underline-width", "auto"), new XAttribute(St + "text-underline-color", "font-color"));
         if (s.Strike) props.Add(new XAttribute(St + "text-line-through-style", "solid"));
-        if (s.Size is double size) props.Add(new XAttribute(Fo + "font-size", OdfPackage.Len(size)));
+        if (s.Size is double size) Every("font-size", OdfPackage.Len(size));
         if (s.Color is { } c) props.Add(new XAttribute(Fo + "color", "#" + Units.Hex(c)));
         if (s.Highlight is { } h) props.Add(new XAttribute(Fo + "background-color", "#" + Units.Hex(h)));
         if (s.Superscript) props.Add(new XAttribute(St + "text-position", "super 58%"));
-        if (s.Subscript) props.Add(new XAttribute(St + "text-position", "sub 58%"));
-        if (s.Font != null)
+        if (s.Subscript && !s.Superscript) props.Add(new XAttribute(St + "text-position", "sub 58%"));
+        if (s.Font is { Length: > 0 })
         {
             _fonts.Add(s.Font);
-            props.Add(new XAttribute(St + "font-name", SafeXml.Text(s.Font)));
+            props.Add(new XAttribute(St + "font-name", SafeXml.Text(s.Font)), new XAttribute(St + "font-name-complex", SafeXml.Text(s.Font)));
         }
         if (!props.HasAttributes) return null;
 
@@ -335,15 +417,29 @@ internal sealed class OdtWriter
     XElement Frame(DImage img, double available)
     {
         double scale = Math.Min(1, available / Math.Max(1, img.Width));
-        var ext = img.Ext == "jpeg" ? "jpg" : img.Ext;
-        var name = $"Pictures/image{_pictures.Count + 1}.{ext}";
-        _pictures.Add((name, img.Data, img.Ext == "jpeg" ? "image/jpeg" : $"image/{img.Ext}"));
         _frames++;
         return new XElement(Draw + "frame",
             new XAttribute(Draw + "name", $"Image{_frames}"), new XAttribute(Text + "anchor-type", "as-char"),
             new XAttribute(Svg + "width", OdfPackage.Len(img.Width * scale)), new XAttribute(Svg + "height", OdfPackage.Len(img.Height * scale)),
-            new XElement(Draw + "image", new XAttribute(XLink + "href", name), new XAttribute(XLink + "type", "simple"),
-                new XAttribute(XLink + "show", "embed"), new XAttribute(XLink + "actuate", "onLoad")));
+            PictureElements(img));
+    }
+
+    readonly Dictionary<byte[], string> _pictureNames = new(ReferenceEqualityComparer.Instance);
+
+    /// <summary>The reference to a picture, which is stored once however often it's shown, and its description.</summary>
+    IEnumerable<XElement> PictureElements(DImage img)
+    {
+        if (!_pictureNames.TryGetValue(img.Data, out var name))
+        {
+            // The type is in the bytes; the name may be out of date.
+            var ext = HtmlReader.ImageExt(img.Data) ?? img.Ext;
+            if (ext == "jpeg") ext = "jpg";
+            _pictureNames[img.Data] = name = $"Pictures/image{_pictures.Count + 1}.{ext}";
+            _pictures.Add((name, img.Data, ext switch { "jpg" => "image/jpeg", "wmf" or "emf" => $"image/x-{ext}", _ => $"image/{ext}" }));
+        }
+        yield return new XElement(Draw + "image", new XAttribute(XLink + "href", name), new XAttribute(XLink + "type", "simple"),
+            new XAttribute(XLink + "show", "embed"), new XAttribute(XLink + "actuate", "onLoad"));
+        if (img.Alt is { Length: > 0 } alt) yield return new XElement(Svg + "desc", alt);
     }
 
     XElement TableElement(DTable t, double available)
@@ -374,14 +470,24 @@ internal sealed class OdtWriter
         }
 
         var shaded = new Dictionary<string, string>();
-        foreach (var row in t.Rows)
+        int rowsLeft = t.Rows.Count;
+        // Header rows are a group of their own at the top.
+        XElement? headerRows = null;
+        bool inHeader = true;
+        foreach (var (row, slots) in t.Slots())
         {
             _ct.ThrowIfCancellationRequested();
             var tr = new XElement(Table + "table-row");
             int col = 0;
-            foreach (var cell in row.Cells)
+            foreach (var (cell, column, span, covered) in slots)
             {
-                int span = Math.Max(1, cell.ColSpan);
+                for (; col < column; col++) tr.Add(new XElement(Table + "table-cell", new XElement(Text + "p")));
+                if (covered)
+                {
+                    for (int s = 0; s < span; s++) tr.Add(new XElement(Table + "covered-table-cell"));
+                    col += span;
+                    continue;
+                }
                 var style = cellStyle;
                 if (cell.Shading is { } shade)
                 {
@@ -397,6 +503,7 @@ internal sealed class OdtWriter
                 }
                 var tc = new XElement(Table + "table-cell", new XAttribute(Table + "style-name", style), new XAttribute(Office + "value-type", "string"));
                 if (span > 1) tc.Add(new XAttribute(Table + "number-columns-spanned", span));
+                if (Math.Min(cell.RowSpan, rowsLeft) is > 1 and var down) tc.Add(new XAttribute(Table + "number-rows-spanned", down));
                 double width = widths.Skip(col).Take(span).Sum();
                 Blocks(cell.Blocks, tc, Math.Max(20, width - 5.4));
                 if (!tc.HasElements) tc.Add(new XElement(Text + "p"));
@@ -405,13 +512,20 @@ internal sealed class OdtWriter
                 col += span;
             }
             for (; col < columns; col++) tr.Add(new XElement(Table + "table-cell", new XElement(Text + "p")));
-            table.Add(row.Header && row == t.Rows[0] ? new XElement(Table + "table-header-rows", tr) : tr);
+            rowsLeft--;
+            inHeader &= row.Header;
+            if (!inHeader) table.Add(tr);
+            else
+            {
+                if (headerRows == null) table.Add(headerRows = new XElement(Table + "table-header-rows"));
+                headerRows.Add(tr);
+            }
         }
         return table;
     }
 
     XElement FontDecls() => new(Office + "font-face-decls",
-        _fonts.Select(f => new XElement(St + "font-face", new XAttribute(St + "name", f), new XAttribute(Svg + "font-family", f))));
+        _fonts.Select(f => SafeXml.Text(f)).Distinct().Select(f => new XElement(St + "font-face", new XAttribute(St + "name", f), new XAttribute(Svg + "font-family", f.Contains(' ') && !f.Contains('\'') ? $"'{f}'" : f))));
 
     XElement Styles()
     {
@@ -426,7 +540,8 @@ internal sealed class OdtWriter
                 new XAttribute(St + "family", "paragraph"), new XAttribute(St + "parent-style-name", "Standard"),
                 new XAttribute(St + "default-outline-level", level), new XAttribute(St + "class", "text"),
                 new XElement(St + "paragraph-properties", new XAttribute(Fo + "keep-with-next", "always")),
-                new XElement(St + "text-properties", new XAttribute(Fo + "font-weight", "bold"), new XAttribute(Fo + "font-size", OdfPackage.Len(sizes[level])))));
+                new XElement(St + "text-properties", new XAttribute(Fo + "font-weight", "bold"), new XAttribute(Fo + "font-size", OdfPackage.Len(sizes[level])),
+                    new XAttribute(St + "font-weight-complex", "bold"), new XAttribute(St + "font-size-complex", OdfPackage.Len(sizes[level])))));
 
         // Headers and footers are written first so their fonts and styles are known below.
         var master = new XElement(St + "master-page", new XAttribute(St + "name", "Standard"), new XAttribute(St + "page-layout-name", "pm1"),
@@ -469,6 +584,7 @@ internal sealed class OdtWriter
             masters.Add(copy);
         }
 
+        ListStyles(_masterStyles);
         var automatic = new XElement(Office + "automatic-styles", layouts, _masterStyles.Elements);
         return new XElement(Office + "document-styles", OdfPackage.Namespaces(),
             FontDecls(),

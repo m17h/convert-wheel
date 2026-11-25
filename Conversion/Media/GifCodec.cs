@@ -1,7 +1,3 @@
-using System.Windows;
-using System.Windows.Media;
-using System.Windows.Media.Imaging;
-
 namespace ConvertWheel.Conversion.Media;
 
 /// <summary>A decoded, fully composited animation frame (BGRA, straight alpha).</summary>
@@ -23,6 +19,7 @@ internal sealed class GifWriter : IDisposable
     readonly bool _hasTransparency;
     byte[]? _previous;
     bool _first = true;
+    long _time, _written; // milliseconds asked for, hundredths written
 
     public GifWriter(string path, int width, int height, ColorHistogram histogram, bool hasTransparency = false)
     {
@@ -95,7 +92,10 @@ internal sealed class GifWriter : IDisposable
         }
 
         // Transparent animations must clear the whole canvas before drawing the next full frame.
-        int delay = Math.Max(2, (int)Math.Round(delayMs / 10.0));
+        // GIF counts in hundredths of a second: carry what rounding leaves over, so long clips don't drift.
+        _time += delayMs;
+        int delay = (int)Math.Clamp((long)Math.Round(_time / 10.0) - _written, 2, ushort.MaxValue);
+        _written += delay;
         int control = _hasTransparency ? 0x09 : 0x04 | (_first ? 0 : 1);
         _out.Write([0x21, 0xF9, 0x04, (byte)control, (byte)delay, (byte)(delay >> 8), Transparent, 0x00]);
         _out.WriteByte(0x2C);
@@ -296,9 +296,22 @@ internal sealed class ColorHistogram
     }
 }
 
-/// <summary>Animated GIF and WebP as plain frame lists.</summary>
-internal static class Animation
+/// <summary>An animated GIF or WebP whose frames are decoded one at a time, as often as needed.</summary>
+internal abstract class Animation : IEnumerable<AnimationFrame>
 {
+    public int Width { get; protected init; }
+    public int Height { get; protected init; }
+    /// <summary>How long each frame shows, in milliseconds.</summary>
+    public IReadOnlyList<int> Delays { get; protected init; } = [];
+
+    public abstract IEnumerator<AnimationFrame> GetEnumerator();
+    System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+
+    protected void CheckSize()
+    {
+        if (Width <= 0 || Height <= 0 || (long)Width * Height > 250_000_000) throw new ConversionException("This animation is too large to convert.");
+    }
+
     public static bool IsAnimated(string path) => Path.GetExtension(path).ToLowerInvariant() switch
     {
         ".gif" => true,
@@ -306,70 +319,202 @@ internal static class Animation
         _ => false,
     };
 
-    public static List<AnimationFrame> Read(string path) =>
-        Path.GetExtension(path).Equals(".webp", StringComparison.OrdinalIgnoreCase) ? MagickImages.ReadAnimatedWebP(path) : GifReader.Read(path);
+    public static Animation Read(string path) =>
+        Path.GetExtension(path).Equals(".webp", StringComparison.OrdinalIgnoreCase) ? new WebP.AnimatedReader(path) : new GifReader(path);
 
-    public static void WriteGif(List<AnimationFrame> frames, string output)
+    public static void WriteGif(Animation frames, string output, CancellationToken ct)
     {
         var histogram = new ColorHistogram();
-        foreach (var f in frames.Where((_, i) => i % Math.Max(1, frames.Count / 30) == 0)) histogram.Add(f.Bgra, step: 3);
-        bool hasTransparency = frames.Any(f =>
+        int every = Math.Max(1, frames.Delays.Count / 30), index = 0;
+        bool hasTransparency = false;
+        foreach (var f in frames)
         {
-            for (int i = 3; i < f.Bgra.Length; i += 4)
-                if (f.Bgra[i] < 128) return true;
-            return false;
-        });
-        using var gif = new GifWriter(output, frames[0].Width, frames[0].Height, histogram, hasTransparency);
-        foreach (var f in frames) gif.AddFrame(f.Bgra, f.DelayMs);
+            ct.ThrowIfCancellationRequested();
+            if (index++ % every == 0) histogram.Add(f.Bgra, step: 3);
+            for (int i = 3; i < f.Bgra.Length && !hasTransparency; i += 4) hasTransparency = f.Bgra[i] < 128;
+        }
+        if (index == 0) throw new ConversionException("This animation has no frames.");
+        using var gif = new GifWriter(output, frames.Width, frames.Height, histogram, hasTransparency);
+        foreach (var f in frames)
+        {
+            ct.ThrowIfCancellationRequested();
+            gif.AddFrame(f.Bgra, f.DelayMs);
+        }
     }
 }
 
-/// <summary>Reads animated GIFs through Windows imaging and composites each frame onto the canvas.</summary>
-internal static class GifReader
+/// <summary>Reads animated GIFs, compositing each frame onto the canvas as it's decoded.</summary>
+internal sealed class GifReader : Animation
 {
-    public static List<AnimationFrame> Read(string path)
+    sealed record Frame(int Left, int Top, int Width, int Height, int Palette, int PaletteSize, bool Interlaced, int Transparent, int Disposal, int Data);
+
+    readonly byte[] _file;
+    readonly List<Frame> _frames = [];
+
+    public GifReader(string path)
     {
-        using var stream = File.OpenRead(path);
-        var decoder = new GifBitmapDecoder(stream, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnLoad);
-        int width = Query<ushort>(decoder.Metadata, "/logscrdesc/Width") ?? decoder.Frames[0].PixelWidth;
-        int height = Query<ushort>(decoder.Metadata, "/logscrdesc/Height") ?? decoder.Frames[0].PixelHeight;
+        _file = File.ReadAllBytes(path);
+        if (_file.Length < 13 || !_file.AsSpan(0, 4).SequenceEqual("GIF8"u8)) throw new InvalidOperationException("This isn't a GIF.");
+        int width = U16(6), height = U16(8), pos = 13;
+        int globalPalette = pos, globalSize = (_file[10] & 0x80) != 0 ? 2 << (_file[10] & 7) : 0;
+        pos += globalSize * 3;
 
-        var canvas = new byte[width * height * 4];
-        var frames = new List<AnimationFrame>();
-        foreach (var frame in decoder.Frames)
+        var delays = new List<int>();
+        int delay = 100, disposal = 0, transparent = -1;
+        while (pos < _file.Length && _file[pos] != 0x3B)
         {
-            var meta = frame.Metadata as BitmapMetadata;
-            int left = Query<ushort>(meta, "/imgdesc/Left") ?? 0, top = Query<ushort>(meta, "/imgdesc/Top") ?? 0;
-            int delay = (Query<ushort>(meta, "/grctlext/Delay") ?? 10) * 10;
-            if (delay < 20) delay = 100; // browsers treat 0-1 cs as 100 ms
-            int disposal = Query<byte>(meta, "/grctlext/Disposal") ?? 0;
-
-            var bgra = new FormatConvertedBitmap(frame, PixelFormats.Bgra32, null, 0);
-            int fw = bgra.PixelWidth, fh = bgra.PixelHeight;
-            var pixels = new byte[fw * fh * 4];
-            bgra.CopyPixels(pixels, fw * 4, 0);
-            var before = disposal == 3 ? (byte[])canvas.Clone() : null;
-
-            for (int y = 0; y < fh && top + y < height; y++)
-                for (int x = 0; x < fw && left + x < width; x++)
+            if (_file[pos] == 0x21 && pos + 1 < _file.Length)
+            {
+                if (_file[pos + 1] == 0xF9 && pos + 7 < _file.Length)
                 {
-                    int s = (y * fw + x) * 4, d = ((top + y) * width + left + x) * 4;
-                    if (pixels[s + 3] == 0) continue;
-                    Buffer.BlockCopy(pixels, s, canvas, d, 4);
+                    int flags = _file[pos + 3];
+                    disposal = flags >> 2 & 7;
+                    delay = U16(pos + 4) * 10;
+                    if (delay < 20) delay = 100; // browsers treat 0-1 cs as 100 ms
+                    transparent = (flags & 1) != 0 ? _file[pos + 6] : -1;
                 }
-            frames.Add(new AnimationFrame((byte[])canvas.Clone(), width, height, delay));
-
-            if (disposal == 2)
-                for (int y = top; y < Math.Min(height, top + fh); y++)
-                    Array.Clear(canvas, (y * width + left) * 4, Math.Min(fw, width - left) * 4);
-            else if (before != null) canvas = before;
+                pos = SkipBlocks(pos + 2);
+            }
+            else if (_file[pos] == 0x2C && pos + 10 < _file.Length)
+            {
+                int flags = _file[pos + 9], localSize = (flags & 0x80) != 0 ? 2 << (flags & 7) : 0;
+                int data = pos + 10 + localSize * 3;
+                int end = SkipBlocks(data + 1);
+                var frame = new Frame(U16(pos + 1), U16(pos + 3), U16(pos + 5), U16(pos + 7), localSize > 0 ? pos + 10 : globalPalette,
+                    localSize > 0 ? localSize : globalSize, (flags & 0x40) != 0, transparent, disposal, data);
+                // The last frame can be cut off; everything before it is still good, but say so rather than lose it quietly.
+                if (end < 0) throw new InvalidOperationException($"This GIF is cut short after {_frames.Count} complete frames.");
+                _frames.Add(frame);
+                delays.Add(delay);
+                (delay, disposal, transparent) = (100, 0, -1);
+                pos = end;
+            }
+            else pos++; // stray bytes between blocks
+            if (pos < 0) break;
         }
-        return frames;
+        if (_frames.Count > 0 && (width == 0 || height == 0)) (width, height) = (_frames[0].Left + _frames[0].Width, _frames[0].Top + _frames[0].Height);
+        Width = width;
+        Height = height;
+        Delays = delays;
     }
 
-    static T? Query<T>(BitmapMetadata? meta, string query) where T : struct
+    int U16(int at) => _file[at] | _file[at + 1] << 8;
+
+    /// <summary>The position after a run of data blocks, or -1 if the file ends first.</summary>
+    int SkipBlocks(int pos)
     {
-        try { return meta?.ContainsQuery(query) == true && meta.GetQuery(query) is T value ? value : null; }
-        catch (Exception ex) when (ex is NotSupportedException or InvalidOperationException or ArgumentException) { return null; }
+        while (pos < _file.Length)
+        {
+            int length = _file[pos++];
+            if (length == 0) return pos;
+            pos += length;
+        }
+        return -1;
+    }
+
+    public override IEnumerator<AnimationFrame> GetEnumerator()
+    {
+        CheckSize();
+        var canvas = new byte[Width * Height * 4];
+        for (int i = 0; i < _frames.Count; i++)
+        {
+            var f = _frames[i];
+            var before = f.Disposal == 3 ? (byte[])canvas.Clone() : null;
+            Draw(f, canvas);
+            yield return new AnimationFrame((byte[])canvas.Clone(), Width, Height, Delays[i]);
+            if (f.Disposal == 2)
+            {
+                int width = Math.Min(f.Width, Width - f.Left);
+                if (width > 0)
+                    for (int y = f.Top; y < Math.Min(Height, f.Top + f.Height); y++)
+                        Array.Clear(canvas, (y * Width + f.Left) * 4, width * 4);
+            }
+            else if (before != null) canvas = before;
+        }
+    }
+
+    void Draw(Frame f, byte[] canvas)
+    {
+        var indices = Lzw(f);
+        int at = 0;
+        // Interlaced frames store every 8th row, then the rows in between.
+        foreach (var (start, step) in f.Interlaced ? [(0, 8), (4, 8), (2, 4), (1, 2)] : new[] { (0, 1) })
+            for (int y = start; y < f.Height; y += step)
+                for (int x = 0; x < f.Width; x++, at++)
+                {
+                    if (at >= indices.Length) return;
+                    int index = indices[at], cx = f.Left + x, cy = f.Top + y;
+                    if (index == f.Transparent || index >= f.PaletteSize || cx >= Width || cy >= Height) continue;
+                    int color = f.Palette + index * 3, d = (cy * Width + cx) * 4;
+                    canvas[d] = _file[color + 2];
+                    canvas[d + 1] = _file[color + 1];
+                    canvas[d + 2] = _file[color];
+                    canvas[d + 3] = 255;
+                }
+    }
+
+    /// <summary>The frame's colour indices. Damaged data gives as many as could be read.</summary>
+    ReadOnlySpan<byte> Lzw(Frame f)
+    {
+        int minSize = _file[f.Data];
+        if (minSize is < 1 or > 11) return [];
+        int clear = 1 << minSize, end = clear + 1, next = end + 1, size = minSize + 1;
+        if ((long)f.Width * f.Height > 250_000_000) throw new ConversionException("This animation is too large to convert.");
+        var output = new byte[f.Width * f.Height];
+        var prefix = new short[4096];
+        var suffix = new byte[4096];
+        var stack = new byte[4097];
+        for (int i = 0; i < clear && i < 256; i++) suffix[i] = (byte)i;
+        int written = 0, bits = 0, bitCount = 0, previous = -1, pos = f.Data + 1, blockLeft = 0;
+        byte first = 0;
+        while (written < output.Length)
+        {
+            while (bitCount < size)
+            {
+                if (blockLeft == 0)
+                {
+                    blockLeft = _file[pos++];
+                    if (blockLeft == 0) return output.AsSpan(0, written);
+                }
+                bits |= _file[pos++] << bitCount;
+                bitCount += 8;
+                blockLeft--;
+            }
+            int code = bits & (1 << size) - 1;
+            bits >>= size;
+            bitCount -= size;
+            if (code == end) break;
+            if (code == clear)
+            {
+                next = end + 1;
+                size = minSize + 1;
+                previous = -1;
+                continue;
+            }
+            if (code > next || code == next && previous < 0 || previous < 0 && code >= clear) break;
+            int depth = 0, walk = code;
+            if (code == next)
+            {
+                stack[depth++] = first;
+                walk = previous;
+            }
+            while (walk >= clear && depth < 4096)
+            {
+                stack[depth++] = suffix[walk];
+                walk = prefix[walk];
+            }
+            first = suffix[walk];
+            stack[depth++] = first;
+            while (depth > 0 && written < output.Length) output[written++] = stack[--depth];
+            if (previous >= 0 && next < 4096)
+            {
+                prefix[next] = (short)previous;
+                suffix[next] = first;
+                next++;
+                if (next == 1 << size && size < 12) size++;
+            }
+            previous = code;
+        }
+        return output.AsSpan(0, written);
     }
 }

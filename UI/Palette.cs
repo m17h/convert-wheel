@@ -28,6 +28,51 @@ internal static class Palette
         _ => Neutral,
     };
 
+    /// <summary>Accents deep enough for white text on them (at least 4.5:1 anywhere in the gradient).</summary>
+    public static (Color, Color) Deep(FormatKind kind) => kind switch
+    {
+        FormatKind.Audio => (Hex("#0E7490"), Hex("#1D4ED8")),
+        FormatKind.Video => (Hex("#9333EA"), Hex("#BE185D")),
+        FormatKind.Image => (Hex("#B45309"), Hex("#C2410C")),
+        FormatKind.Document => (Hex("#2563EB"), Hex("#4F46E5")),
+        FormatKind.Spreadsheet => (Hex("#15803D"), Hex("#047857")),
+        FormatKind.Presentation => (Hex("#C2410C"), Hex("#BE123C")),
+        FormatKind.Archive => (Hex("#78716C"), Hex("#57534E")),
+        FormatKind.Subtitle => (Hex("#BE185D"), Hex("#7E22CE")),
+        FormatKind.Data => (Hex("#0F766E"), Hex("#0E7490")),
+        _ => DeepMore,
+    };
+
+    public static readonly (Color, Color) DeepMore = (Hex("#6B7280"), Hex("#4B5563"));
+
+    /// <summary>Accents light enough to read as text on the dark hub.</summary>
+    public static (Color, Color) Bright(FormatKind kind)
+    {
+        var (a, b) = Accent(kind);
+        return (Mix(a, Colors.White, 0.35), Mix(b, Colors.White, 0.4));
+    }
+
+    static Color Mix(Color a, Color b, double t) => Color.FromRgb(
+        (byte)(a.R + (b.R - a.R) * t), (byte)(a.G + (b.G - a.G) * t), (byte)(a.B + (b.B - a.B) * t));
+
+    /// <summary>WCAG contrast ratio between two opaque colours.</summary>
+    public static double Contrast(Color a, Color b)
+    {
+        double la = Luminance(a), lb = Luminance(b);
+        return (Math.Max(la, lb) + 0.05) / (Math.Min(la, lb) + 0.05);
+    }
+
+    static double Luminance(Color c)
+    {
+        return 0.2126 * Linear(c.R) + 0.7152 * Linear(c.G) + 0.0722 * Linear(c.B);
+
+        static double Linear(byte v)
+        {
+            double s = v / 255.0;
+            return s <= 0.03928 ? s / 12.92 : Math.Pow((s + 0.055) / 1.055, 2.4);
+        }
+    }
+
     public static string KindName(FormatKind kind) => kind switch
     {
         FormatKind.Audio => "Audio",

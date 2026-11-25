@@ -1,60 +1,66 @@
 using System.Windows;
+using System.Windows.Automation;
+using System.Windows.Automation.Peers;
+using System.Windows.Automation.Provider;
 using System.Windows.Controls;
 using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
-using System.Windows.Media.Effects;
 using System.Windows.Media.Imaging;
 using System.Windows.Shapes;
 using ConvertWheel.Conversion;
 using ConvertWheel.Native;
-using Path = System.Windows.Shapes.Path;
+using ConvertWheel.Shell;
 
 namespace ConvertWheel.UI;
 
 /// <summary>
 /// The radial menu. It is a click-through, non-activating, topmost layered window: all input is
 /// read from the global hooks and the cursor position, so it never steals focus from Explorer.
+/// Screen readers see it as a list of slices.
 /// </summary>
 internal sealed class WheelOverlay : Window
 {
-    const double HubR = 58, R1 = 68, R2 = 178, R3 = 190, R4 = 262;
-    const double Extent = R4 + 44;
+    const double Extent = WheelLayout.R4 + 44;
     const double Side = Extent * 2;
-    const double Gap = 5;
-    const double DeadZone = 22;
     static readonly Point C = new(Extent, Extent);
 
     readonly nint _hwnd;
-    readonly Canvas _stage = new() { Width = Side, Height = Side };
+    readonly WheelStage _stage;
     readonly ScaleTransform _stageScale = new(1, 1, Extent, Extent);
+    readonly ScaleTransform _fitScale = new(1, 1, Extent, Extent);
     readonly Canvas _innerLayer = new();
     readonly Canvas _outerLayer = new();
     readonly ScaleTransform _outerScale = new(1, 1, Extent, Extent);
-    readonly Canvas _outerBackdrop;
     readonly ScaleTransform _outerBackdropScale = new(1, 1, Extent, Extent);
+    Canvas _outerBackdrop = new();
 
     readonly Image _thumb = new() { Width = 46, Height = 46, Stretch = Stretch.Uniform };
     readonly Border _badge = new() { Width = 42, Height = 42, CornerRadius = new CornerRadius(11) };
-    readonly TextBlock _badgeText = Text(11.5, FontWeights.Bold, "#FFFFFF");
-    readonly TextBlock _fileName = Text(11, FontWeights.SemiBold, "#F2F2F7");
-    readonly TextBlock _fileMeta = Text(9.5, FontWeights.Normal, "#8C8C9A");
-    readonly TextBlock _hotCaption = Text(9.5, FontWeights.Normal, "#9A9AA8");
-    readonly TextBlock _hotLabel = Text(25, FontWeights.Bold, "#FFFFFF");
-    readonly TextBlock _hotHint = Text(9.5, FontWeights.Normal, "#B4B4C0");
+    readonly TextBlock _badgeText = HubText(11.5, FontWeights.Bold);
+    readonly TextBlock _fileName = HubText(11.5, FontWeights.SemiBold);
+    readonly TextBlock _fileMeta = HubText(11, FontWeights.Normal);
+    readonly TextBlock _hotCaption = HubText(11, FontWeights.Normal);
+    readonly TextBlock _hotLabel = HubText(25, FontWeights.Bold);
+    readonly TextBlock _hotHint = HubText(11, FontWeights.Normal);
+    readonly TextBlock _status = new() { Opacity = 0, IsHitTestVisible = false };
     readonly StackPanel _idlePanel = new() { VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Center };
     readonly StackPanel _hotPanel = new() { VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Center, Opacity = 0 };
 
-    readonly List<Segment> _inner = [];
-    readonly List<Segment> _outer = [];
+    readonly List<WheelSegment> _inner = [];
+    readonly List<WheelSegment> _outer = [];
+    WheelTheme? _theme;
     ConversionPlan? _plan;
+    IReadOnlyList<ConversionPlan> _batch = [];
     string? _notice;
-    Segment? _hot;
-    bool _expanded;
-    double _scale = 1;
-    POINT _center;
-    POINT? _restoreCursor;
+    WheelSegment? _hot;
+    bool _expanded, _placing, _armed;
+    double _scale = 1, _fit = 1;
+    POINT _center, _openCursor;
+    nint _foreground;
+    POINT? _restoreCursor, _keyboardCursor;
     long _moreHoverStart;
+    int _selectedCount;
 
     public event Action<ConversionPlan, FormatInfo>? ConvertRequested;
     public event Action? Dismissed;
@@ -62,11 +68,29 @@ internal sealed class WheelOverlay : Window
 
     public bool IsOpen { get; private set; }
 
-    /// <summary>False while the trigger is held (direction picks, release converts); true once released (click to pick).</summary>
+    /// <summary>False while the trigger is held (direction picks, release converts); true once pinned (click or Enter to pick).</summary>
     public bool IsSticky { get; private set; }
 
+    public bool IsExpanded => _expanded;
+
     public POINT CenterPx => _center;
-    public int HitRadiusPx => (int)Math.Ceiling(((_expanded ? R4 : R2) + 10) * _scale);
+    public int HitRadiusPx => (int)Math.Ceiling(WheelLayout.HitRadius(_expanded) * Unit);
+
+    /// <summary>
+    /// Clicks this close to the middle go through to the file underneath. None do when the wheel had to move
+    /// (and the cursor with it): something else is under it then.
+    /// </summary>
+    public int PassRadiusPx => _restoreCursor == null ? (int)(WheelLayout.PassRadius * Unit) : 0;
+
+    /// <summary>Physical pixels per wheel unit.</summary>
+    double Unit => _scale * _fit;
+
+    /// <summary>Animations follow Windows' "Animation effects" setting.</summary>
+    internal static bool Motion => MotionOverride ?? SystemParameters.ClientAreaAnimation;
+    internal static bool? MotionOverride { get; set; }
+
+    /// <summary>Draws in this theme instead of the one Windows is set to.</summary>
+    internal WheelTheme? ThemeOverride { get; set; }
 
     public WheelOverlay()
     {
@@ -83,29 +107,28 @@ internal sealed class WheelOverlay : Window
         Height = Side;
         FontFamily = Palette.UiFont;
 
-        _stage.RenderTransform = _stageScale;
+        _stage = new WheelStage(this)
+        {
+            Width = Side,
+            Height = Side,
+            RenderTransform = new TransformGroup { Children = { _stageScale, _fitScale } },
+        };
         _outerLayer.RenderTransform = _outerScale;
-        _outerBackdrop = Disc(R4 + 10, "#E6141419", "#DC0D0D11");
-        _outerBackdrop.RenderTransform = _outerBackdropScale;
-
-        _stage.Children.Add(_outerBackdrop);
-        _stage.Children.Add(_outerLayer);
-        _stage.Children.Add(Disc(R2 + 9, "#F21A1A21", "#EB0F0F13"));
-        _stage.Children.Add(_innerLayer);
-        _stage.Children.Add(BuildHub());
+        AutomationProperties.SetLiveSetting(_status, AutomationLiveSetting.Assertive);
+        BuildHubContents();
         Content = _stage;
 
         _hwnd = new WindowInteropHelper(this).EnsureHandle();
         Win32.AddExStyle(_hwnd, Win32.WS_EX_TOOLWINDOW | Win32.WS_EX_NOACTIVATE | Win32.WS_EX_TRANSPARENT);
+        HwndSource.FromHwnd(_hwnd)!.AddHook(OnWindowMessage);
     }
 
     // ------------------------------------------------------------------ building
 
-    static TextBlock Text(double size, FontWeight weight, string color) => new()
+    static TextBlock HubText(double size, FontWeight weight) => new()
     {
         FontSize = size,
         FontWeight = weight,
-        Foreground = Palette.Solid(color),
         HorizontalAlignment = HorizontalAlignment.Center,
         TextAlignment = TextAlignment.Center,
         TextTrimming = TextTrimming.CharacterEllipsis,
@@ -118,128 +141,129 @@ internal sealed class WheelOverlay : Window
         Canvas.SetTop(element, C.Y - radius);
     }
 
-    /// <summary>A dark glass disc with a soft drop shadow (a gradient, far cheaper than a blur effect).</summary>
-    static Canvas Disc(double radius, string inner, string outer)
+    /// <summary>A disc with a soft drop shadow (a gradient, far cheaper than a blur effect).</summary>
+    static Canvas Disc(double radius, Brush fill, Brush edge, bool shadowed)
     {
         var canvas = new Canvas();
-        double shadowR = radius + 36;
-        var shadow = new Ellipse
+        if (shadowed)
         {
-            Fill = Palette.Freeze(new RadialGradientBrush
+            double shadowR = radius + 36;
+            var shadow = new Ellipse
             {
-                GradientStops =
+                Fill = Palette.Freeze(new RadialGradientBrush
                 {
-                    new GradientStop(Color.FromArgb(120, 0, 0, 0), radius / shadowR - 0.05),
-                    new GradientStop(Color.FromArgb(0, 0, 0, 0), 1),
-                },
-            }),
-        };
-        Place(shadow, shadowR);
-        Canvas.SetTop(shadow, C.Y - shadowR + 8);
+                    GradientStops =
+                    {
+                        new GradientStop(Color.FromArgb(120, 0, 0, 0), radius / shadowR - 0.05),
+                        new GradientStop(Color.FromArgb(0, 0, 0, 0), 1),
+                    },
+                }),
+            };
+            Place(shadow, shadowR);
+            Canvas.SetTop(shadow, C.Y - shadowR + 8);
+            canvas.Children.Add(shadow);
+        }
 
-        var disc = new Ellipse
-        {
-            Fill = Palette.Freeze(new RadialGradientBrush(Palette.Hex(inner), Palette.Hex(outer))),
-            Stroke = Palette.Freeze(new LinearGradientBrush(Color.FromArgb(70, 255, 255, 255), Color.FromArgb(14, 255, 255, 255), 90)),
-            StrokeThickness = 1.2,
-        };
+        var disc = new Ellipse { Fill = fill, Stroke = edge, StrokeThickness = shadowed ? 1.2 : 2 };
         Place(disc, radius);
-        canvas.Children.Add(shadow);
         canvas.Children.Add(disc);
         return canvas;
     }
 
-    UIElement BuildHub()
+    void BuildHubContents()
     {
-        var hub = new Grid();
-        Place(hub, HubR);
-        hub.Children.Add(new Ellipse
-        {
-            Fill = Palette.Freeze(new RadialGradientBrush(Palette.Hex("#2E2E39"), Palette.Hex("#1A1A21")) { GradientOrigin = new Point(0.5, 0.25) }),
-            Stroke = Palette.Freeze(new LinearGradientBrush(Color.FromArgb(90, 255, 255, 255), Color.FromArgb(18, 255, 255, 255), 90)),
-            StrokeThickness = 1.2,
-        });
-
         _badge.Child = _badgeText;
         _badgeText.VerticalAlignment = VerticalAlignment.Center;
         _thumb.Clip = new RectangleGeometry(new Rect(0, 0, 46, 46), 9, 9);
-        var image = new Grid { Width = 46, Height = 46, Margin = new Thickness(0, 0, 0, 5) };
+        var image = new Grid { Width = 46, Height = 46, Margin = new Thickness(0, 0, 0, 4) };
         image.Children.Add(_badge);
         image.Children.Add(_thumb);
         RenderOptions.SetBitmapScalingMode(_thumb, BitmapScalingMode.HighQuality);
 
-        _fileName.MaxWidth = 90;
-        _fileMeta.MaxWidth = 92;
+        _fileName.MaxWidth = 92;
+        _fileMeta.MaxWidth = 88;
         _idlePanel.Children.Add(image);
         _idlePanel.Children.Add(_fileName);
         _idlePanel.Children.Add(_fileMeta);
 
         _hotLabel.Margin = new Thickness(0, -2, 0, -1);
         _hotLabel.MaxWidth = 104;
+        _hotCaption.MaxWidth = _hotHint.MaxWidth = 92;
         _hotPanel.Children.Add(_hotCaption);
         _hotPanel.Children.Add(_hotLabel);
         _hotPanel.Children.Add(_hotHint);
+    }
 
+    /// <summary>Everything that depends on the colours but not on the file.</summary>
+    void ApplyTheme(WheelTheme theme)
+    {
+        if (ReferenceEquals(theme, _theme)) return;
+        _theme = theme;
+        bool shadowed = !theme.HighContrast;
+
+        _outerBackdrop = Disc(WheelLayout.OuterRim, theme.OuterDisc, theme.DiscEdge, shadowed);
+        _outerBackdrop.RenderTransform = _outerBackdropScale;
+
+        (_idlePanel.Parent as Panel)?.Children.Clear();
+        var hub = new Grid();
+        Place(hub, WheelLayout.HubR);
+        hub.Children.Add(new Ellipse { Fill = theme.Hub, Stroke = theme.HubEdge, StrokeThickness = shadowed ? 1.2 : 2 });
         hub.Children.Add(_idlePanel);
         hub.Children.Add(_hotPanel);
-        return hub;
+        _badgeText.Foreground = theme.HotText;
+        _fileName.Foreground = theme.Text;
+        _hotCaption.Foreground = _hotHint.Foreground = theme.SubtleText;
+
+        _stage.Children.Clear();
+        _stage.Children.Add(_outerBackdrop);
+        _stage.Children.Add(_outerLayer);
+        _stage.Children.Add(Disc(WheelLayout.InnerRim, theme.InnerDisc, theme.DiscEdge, shadowed));
+        _stage.Children.Add(_innerLayer);
+        _stage.Children.Add(hub);
+        _stage.Children.Add(_status);
     }
 
     void BuildSegments(ConversionPlan plan, bool dimmed)
     {
-        _inner.Clear();
-        _outer.Clear();
-        _innerLayer.Children.Clear();
-        _outerLayer.Children.Clear();
+        Fill(_inner, _innerLayer, WheelRing.Inner, plan.Suggested.Count == 0 ? [] : plan.HasMore ? [.. plan.Suggested, null] : [.. plan.Suggested]);
+        Fill(_outer, _outerLayer, WheelRing.Outer, [.. plan.All]);
 
-        if (plan.Suggested.Count > 0)
+        void Fill(List<WheelSegment> segments, Canvas layer, WheelRing ring, List<FormatInfo?> formats)
         {
-            var items = plan.Suggested.Select(f => (FormatInfo?)f).Append(null).ToList();
-            double span = 360.0 / items.Count;
-            for (int i = 0; i < items.Count; i++)
+            segments.Clear();
+            layer.Children.Clear();
+            for (int i = 0; i < formats.Count; i++)
             {
-                var seg = new Segment(items[i], i * span - span / 2, i * span + span / 2, R1, R2, outer: false,
-                    badge: i < 9 ? i + 1 : null, dimmed: dimmed && items[i] != null, expanded: false);
-                _inner.Add(seg);
-                _innerLayer.Children.Add(seg.Root);
+                var segment = new WheelSegment(this, _theme!, C, formats[i], ring, i, formats.Count, dimmed && formats[i] != null);
+                segments.Add(segment);
+                layer.Children.Add(segment);
             }
-        }
-
-        double outerSpan = 360.0 / Math.Max(plan.All.Count, 2);
-        for (int i = 0; i < plan.All.Count; i++)
-        {
-            var seg = new Segment(plan.All[i], i * outerSpan - outerSpan / 2, i * outerSpan + outerSpan / 2, R3, R4, outer: true,
-                badge: null, dimmed: dimmed, expanded: false);
-            _outer.Add(seg);
-            _outerLayer.Children.Add(seg.Root);
+            if (segments.Count == 0) return;
+            // One size for the whole ring, and all of its hints or none: a patchwork looks broken.
+            // (The middle shows the hint of the slice being pointed at either way.)
+            foreach (var (hint, smallest) in new (double?, double)[] { (11, 15), (10.5, 12), (null, 11) })
+            {
+                var sizes = segments.Where(s => !s.IsMore).Select(s => s.FittingSize(C, hint, smallest)).ToList();
+                if (hint != null && sizes.Any(s => s == null)) continue;
+                foreach (var segment in segments) segment.LayOut(C, hint, sizes.Min(s => s ?? smallest));
+                break;
+            }
         }
     }
 
     // ------------------------------------------------------------------ opening & closing
 
-    public void Open(ConversionPlan plan, POINT cursor, bool startExpanded, string? notice)
+    /// <param name="batch">Every file the pick applies to when several are selected (the hovered one first).</param>
+    /// <param name="selectedCount">How many items are selected along with the hovered file.</param>
+    public void Open(ConversionPlan plan, POINT cursor, bool startExpanded, string? notice,
+        IReadOnlyList<ConversionPlan>? batch = null, int selectedCount = 0)
     {
-        _plan = plan;
-        _notice = notice;
-        _hot = null;
-        _moreHoverStart = 0;
-        IsSticky = false;
-        BuildSegments(plan, dimmed: notice != null);
-
-        var accent = Palette.Accent(plan.SourceKind);
-        _badge.Background = Palette.Gradient(accent);
-        _badge.BeginAnimation(OpacityProperty, null);
-        _badge.Opacity = 1;
-        _badgeText.Text = plan.SourceExt.ToUpperInvariant();
-        _thumb.BeginAnimation(OpacityProperty, null);
-        _thumb.Source = null;
-        _fileName.Text = System.IO.Path.GetFileName(plan.SourcePath);
-        _idlePanel.Opacity = 1;
-        _hotPanel.Opacity = 0;
-        RefreshMeta();
-
-        SetExpanded(startExpanded || _inner.Count == 0, animate: false);
+        Win32.GetCursorPos(out _openCursor);
+        _foreground = Win32.GetForegroundWindow();
+        ShowPlan(plan, startExpanded, notice, batch, selectedCount);
+        _restoreCursor = null;
         Position(cursor);
+        Win32.GetCursorPos(out _openCursor);
 
         _stage.BeginAnimation(OpacityProperty, null);
         _stageScale.BeginAnimation(ScaleTransform.ScaleXProperty, null);
@@ -251,7 +275,7 @@ internal sealed class WheelOverlay : Window
         Win32.SetWindowPos(_hwnd, Win32.HWND_TOPMOST, 0, 0, 0, 0, Win32.SWP_NOMOVE | Win32.SWP_NOSIZE | Win32.SWP_NOACTIVATE);
 
         _stage.BeginAnimation(OpacityProperty, Anim(1, 120));
-        var pop = Anim(1, 260, new BackEase { Amplitude = 0.35, EasingMode = EasingMode.EaseOut });
+        var pop = Anim(1, 260, Motion ? new BackEase { Amplitude = 0.35, EasingMode = EasingMode.EaseOut } : null);
         _stageScale.BeginAnimation(ScaleTransform.ScaleXProperty, pop);
         _stageScale.BeginAnimation(ScaleTransform.ScaleYProperty, pop);
         for (int i = 0; i < _inner.Count; i++) _inner[i].FadeIn(i * 18);
@@ -261,31 +285,89 @@ internal sealed class WheelOverlay : Window
         CompositionTarget.Rendering -= OnFrame;
         CompositionTarget.Rendering += OnFrame;
         GeometryChanged?.Invoke();
+        RefreshPeers();
+        Raise(AutomationEvents.MenuOpened);
+        Announce(_batch.Count > 1
+            ? $"Convert {_batch.Count} files. {_inner.Count} choices. Arrow keys to choose, Enter to convert, Escape to close."
+            : $"Convert {_fileName.Text}. {_inner.Count} choices. Arrow keys to choose, Enter to convert, Escape to close.");
+    }
+
+    /// <summary>Fills the wheel for a file without showing it.</summary>
+    internal void ShowPlan(ConversionPlan plan, bool startExpanded, string? notice, IReadOnlyList<ConversionPlan>? batch = null, int selectedCount = 0)
+    {
+        _plan = plan;
+        _batch = batch is { Count: > 1 } ? batch : [plan];
+        _selectedCount = selectedCount;
+        _notice = notice;
+        _hot = null;
+        _keyboardCursor = null;
+        _armed = false;
+        _moreHoverStart = 0;
+        IsSticky = false;
+        ApplyTheme(ThemeOverride ?? WheelTheme.Current);
+        BuildSegments(plan, dimmed: notice != null);
+
+        _badge.Background = _theme!.HotFill(plan.SourceKind);
+        _badge.BeginAnimation(OpacityProperty, null);
+        _badge.Opacity = 1;
+        _badgeText.Text = plan.SourceExt.ToUpperInvariant();
+        _thumb.BeginAnimation(OpacityProperty, null);
+        _thumb.Source = null;
+        _fileName.Text = _batch.Count > 1 ? $"{_batch.Count} files" : System.IO.Path.GetFileName(plan.SourcePath);
+        _idlePanel.BeginAnimation(OpacityProperty, null);
+        _hotPanel.BeginAnimation(OpacityProperty, null);
+        _idlePanel.Opacity = 1;
+        _hotPanel.Opacity = 0;
+        RefreshMeta();
+        SetExpanded(startExpanded || _inner.Count == 0, animate: false);
     }
 
     void Position(POINT cursor)
     {
         var (work, scale) = Win32.MonitorAt(cursor);
+        double oldUnit = Unit;
+        var oldCenter = IsOpen ? _center : cursor;
         _scale = scale;
-        int size = (int)Math.Round(Side * scale);
-        int reach = (int)Math.Ceiling((R4 + 16) * scale);
-        _center = new POINT(Clamp(cursor.X, work.Left, work.Right, reach), Clamp(cursor.Y, work.Top, work.Bottom, reach));
+        (_center, _fit) = WheelLayout.Place(cursor, work, scale, _expanded);
+        _fitScale.ScaleX = _fitScale.ScaleY = _fit;
 
         // Near a screen edge the wheel shifts to stay fully visible; move the cursor with it so
         // directions still line up, and put it back afterwards.
-        _restoreCursor = null;
-        if (_center.X != cursor.X || _center.Y != cursor.Y)
+        if ((_center.X != oldCenter.X || _center.Y != oldCenter.Y || (IsOpen && Unit != oldUnit)) && Win32.GetCursorPos(out var at))
         {
-            _restoreCursor = cursor;
-            Win32.SetCursorPos(_center.X, _center.Y);
+            _restoreCursor ??= _openCursor;
+            double ratio = IsOpen ? Unit / oldUnit : 1;
+            Win32.SetCursorPos(_center.X + (int)Math.Round((at.X - oldCenter.X) * ratio), _center.Y + (int)Math.Round((at.Y - oldCenter.Y) * ratio));
+            if (_keyboardCursor != null && Win32.GetCursorPos(out var parked)) _keyboardCursor = parked; // that move was ours
         }
 
         // Twice: the first move may cross monitors and trigger a DPI rescale that shifts the window.
+        int size = (int)Math.Round(Side * scale);
+        _placing = true;
         for (int i = 0; i < 2; i++)
             Win32.SetWindowPos(_hwnd, Win32.HWND_TOPMOST, _center.X - size / 2, _center.Y - size / 2, size, size, Win32.SWP_NOACTIVATE);
+        _placing = false;
+    }
 
-        static int Clamp(int value, int lo, int hi, int reach) =>
-            hi - lo < reach * 2 ? (lo + hi) / 2 : Math.Clamp(value, lo + reach, hi - reach);
+    /// <summary>
+    /// True while the window the user was in still has the focus. (Screen readers choosing a slice make Windows
+    /// bring the wheel forward for a moment; that's not the user going elsewhere.)
+    /// </summary>
+    public bool FocusUnchanged => Win32.GetForegroundWindow() is var now && (now == _foreground || (now == _hwnd && now != 0));
+
+    nint OnWindowMessage(nint hwnd, int msg, nint wParam, nint lParam, ref bool handled)
+    {
+        // Hand the focus straight back to Explorer.
+        if (msg == Win32.WM_ACTIVATE && (wParam & 0xFFFF) != 0 && _foreground != 0 && _foreground != _hwnd)
+            Dispatcher.BeginInvoke(() => Win32.SetForegroundWindow(_foreground));
+        return 0;
+    }
+
+    /// <summary>The screen's scale changed under an open wheel: its measurements no longer hold.</summary>
+    protected override void OnDpiChanged(DpiScale oldDpi, DpiScale newDpi)
+    {
+        base.OnDpiChanged(oldDpi, newDpi);
+        if (IsOpen && !_placing && Math.Abs(newDpi.DpiScaleX - _scale) > 0.01) Close(restoreCursor: false);
     }
 
     void Close(bool restoreCursor)
@@ -305,6 +387,8 @@ internal sealed class WheelOverlay : Window
         _stageScale.BeginAnimation(ScaleTransform.ScaleYProperty, shrink);
 
         GeometryChanged?.Invoke();
+        RefreshPeers();
+        Raise(AutomationEvents.MenuClosed);
         Dismissed?.Invoke();
     }
 
@@ -319,31 +403,24 @@ internal sealed class WheelOverlay : Window
 
     // ------------------------------------------------------------------ interaction
 
+    /// <summary>The trigger was let go: convert to the slice aimed at, or (in the middle) keep the wheel up for a click.</summary>
     public void ReleaseTrigger()
     {
         if (!IsOpen || IsSticky) return;
-        if (Win32.GetCursorPos(out var cursor)) SetHot(Directional(cursor));
+        if (Win32.GetCursorPos(out var cursor)) FollowPointer(cursor);
         if (_hot?.Format != null)
         {
             Commit(_hot);
             return;
         }
         if (_hot?.IsMore == true) SetExpanded(true, animate: true);
-        IsSticky = true; // released in the middle: keep the wheel up and let the user click
-        RefreshMeta();
-        GeometryChanged?.Invoke();
+        Pin();
     }
 
     public void ClickAt(POINT pt)
     {
         if (!IsOpen) return;
-        var hit = HitTest(pt);
-        if (hit?.Format != null) Commit(hit);
-        else if (hit?.IsMore == true)
-        {
-            IsSticky = true;
-            SetExpanded(!_expanded, animate: true);
-        }
+        if (At(pt, exactly: true) is { } segment) Choose(segment);
         else Close(restoreCursor: true);
     }
 
@@ -355,9 +432,20 @@ internal sealed class WheelOverlay : Window
 
     public void CommitIndex(int index)
     {
-        if (!IsOpen || index < 0 || index >= _inner.Count) return;
-        if (_inner[index].Format != null) Commit(_inner[index]);
-        else ToggleExpanded();
+        if (IsOpen && index >= 0 && index < _inner.Count) Choose(_inner[index]);
+    }
+
+    /// <summary>Converts to a slice, or opens/closes the outer ring for the "All" slice.</summary>
+    public void Choose(WheelSegment segment)
+    {
+        if (!IsShowing(segment)) return;
+        if (segment.Format != null)
+        {
+            Commit(segment);
+            return;
+        }
+        SetExpanded(!_expanded, animate: true);
+        Pin();
     }
 
     public void ToggleExpanded()
@@ -365,26 +453,69 @@ internal sealed class WheelOverlay : Window
         if (IsOpen && _inner.Count > 0) SetExpanded(!_expanded, animate: true);
     }
 
+    /// <summary>Highlights a slice from the keyboard or a screen reader. From then on only a click or Enter converts.</summary>
+    public void Highlight(WheelSegment segment)
+    {
+        if (!IsShowing(segment)) return;
+        Win32.GetCursorPos(out var cursor);
+        _keyboardCursor = cursor;
+        Pin();
+        SetHot(segment);
+    }
+
+    /// <summary>Arrow keys: to the next or previous slice of the ring.</summary>
+    public void Step(int by)
+    {
+        if (!IsOpen) return;
+        var ring = _hot?.Ring == WheelRing.Outer && _expanded || _inner.Count == 0 ? _outer : _inner;
+        if (ring.Count == 0) return;
+        int at = _hot != null && ring.Contains(_hot) ? (_hot.Index + by + ring.Count) % ring.Count : by > 0 ? 0 : ring.Count - 1;
+        Highlight(ring[at]);
+    }
+
+    /// <summary>Arrow keys: out to every format, or back in to the suggestions.</summary>
+    public void StepRing(bool outwards)
+    {
+        if (!IsOpen) return;
+        if (outwards && !_expanded) SetExpanded(true, animate: true);
+        var (from, to) = outwards ? (_inner, _outer) : (_outer, _inner);
+        if (to.Count == 0) return;
+        if (_hot?.Ring == to[0].Ring) Highlight(_hot);
+        else Highlight(to[_hot == null || from.Count == 0 ? 0 : WheelLayout.Nearest(_hot.Index, from.Count, to.Count)]);
+    }
+
     public void Cancel(bool restoreCursor = true) => Close(restoreCursor);
 
-    void Commit(Segment segment)
+    /// <summary>Keeps the wheel up without the trigger.</summary>
+    void Pin()
     {
-        var plan = _plan!;
+        if (IsSticky) return;
+        IsSticky = true;
+        RefreshMeta();
+        GeometryChanged?.Invoke();
+    }
+
+    void Commit(WheelSegment segment)
+    {
         var format = segment.Format!;
+        var files = Batch.For(_batch, format);
         segment.Pulse();
         Close(restoreCursor: true);
-        ConvertRequested?.Invoke(plan, format);
+        foreach (var plan in files) ConvertRequested?.Invoke(plan, format);
     }
+
+    public int CountIn(WheelRing ring) => (ring == WheelRing.Outer ? _outer : _inner).Count;
+
+    public bool IsShowing(WheelSegment segment) =>
+        IsOpen && (segment.Ring == WheelRing.Outer ? _expanded && _outer.Contains(segment) : _inner.Contains(segment));
 
     void OnFrame(object? sender, EventArgs e)
     {
-        if (!IsOpen) return;
-        Win32.GetCursorPos(out var p);
-        var hit = IsSticky ? HitTest(p) : Directional(p);
-        if (hit != _hot) SetHot(hit);
+        if (!IsOpen || !Win32.GetCursorPos(out var p)) return;
+        FollowPointer(p);
 
         // Resting on "All" while holding opens the full ring without releasing.
-        if (!IsSticky && hit?.IsMore == true && !_expanded)
+        if (!IsSticky && _hot?.IsMore == true && !_expanded)
         {
             if (_moreHoverStart == 0) _moreHoverStart = Environment.TickCount64;
             else if (Environment.TickCount64 - _moreHoverStart > 380) SetExpanded(true, animate: true);
@@ -395,32 +526,31 @@ internal sealed class WheelOverlay : Window
         }
     }
 
-    (double distance, double angle) Polar(POINT p)
+    void FollowPointer(POINT p)
     {
-        double dx = (p.X - _center.X) / _scale, dy = (p.Y - _center.Y) / _scale;
-        return (Math.Sqrt(dx * dx + dy * dy), (Math.Atan2(dx, -dy) * 180 / Math.PI + 360) % 360);
+        // Arrow keys stay in charge until the mouse really moves; and nothing is chosen before it ever has.
+        if (_keyboardCursor is { } parked)
+        {
+            if (Moved(parked, p) < 8 * _scale) return;
+            _keyboardCursor = null;
+        }
+        _armed |= Moved(_openCursor, p) >= 8 * _scale;
+        var hit = _armed ? At(p, exactly: IsSticky) : null;
+        if (hit != _hot) SetHot(hit);
+
+        static double Moved(POINT a, POINT b) => Math.Max(Math.Abs(a.X - b.X), Math.Abs(a.Y - b.Y));
     }
 
-    Segment? Directional(POINT p)
+    WheelSegment? At(POINT p, bool exactly)
     {
-        var (distance, angle) = Polar(p);
-        if (distance < DeadZone) return null;
-        if (_expanded && (distance > R2 + 6 || _inner.Count == 0)) return ByAngle(_outer, angle);
-        return ByAngle(_inner, angle);
+        var (distance, angle) = WheelLayout.Polar(p, _center, Unit);
+        var found = exactly
+            ? WheelLayout.Hit(distance, angle, _inner.Count, _outer.Count, _expanded)
+            : WheelLayout.Flick(distance, angle, _inner.Count, _outer.Count, _expanded);
+        return found is { } f ? (f.Ring == WheelRing.Outer ? _outer : _inner)[f.Index] : null;
     }
 
-    Segment? HitTest(POINT p)
-    {
-        var (distance, angle) = Polar(p);
-        if (distance >= R1 - 3 && distance <= R2 + 4) return ByAngle(_inner, angle);
-        if (_expanded && distance >= R3 - 4 && distance <= R4 + 6) return ByAngle(_outer, angle);
-        return null;
-    }
-
-    static Segment? ByAngle(List<Segment> segments, double angle) =>
-        segments.FirstOrDefault(s => (angle - s.A0 + 360) % 360 < s.A1 - s.A0);
-
-    void SetHot(Segment? segment)
+    internal void SetHot(WheelSegment? segment)
     {
         _hot?.SetHot(false);
         _hot = segment;
@@ -428,49 +558,46 @@ internal sealed class WheelOverlay : Window
 
         if (segment?.Format is { } format)
         {
-            _hotCaption.Text = "Convert to";
+            int files = Batch.For(_batch, format).Count;
+            _hotCaption.Text = _batch.Count == 1 ? "Convert to" : files == _batch.Count ? $"{files} files to" : $"{files} of {_batch.Count} files to";
             _hotLabel.Text = format.Label;
-            _hotLabel.Foreground = Palette.Gradient(Lighten(Palette.Accent(format.Kind)));
+            _hotLabel.FontSize = format.Label.Length > 5 ? 20 : 25;
+            _hotLabel.Foreground = _theme!.HubAccent(format.Kind);
             _hotHint.Text = format.Hint;
         }
-        else if (segment?.IsMore == true)
+        else if (segment != null)
         {
             _hotCaption.Text = _expanded ? "Hide" : "Show";
             _hotLabel.Text = _expanded ? "Less" : "All";
-            _hotLabel.Foreground = Palette.Solid("#F2F2F7");
+            _hotLabel.FontSize = 25;
+            _hotLabel.Foreground = _theme!.Text;
             _hotHint.Text = $"{_plan?.All.Count} formats";
         }
 
         _idlePanel.BeginAnimation(OpacityProperty, Anim(segment == null ? 1 : 0, 110));
         _hotPanel.BeginAnimation(OpacityProperty, Anim(segment == null ? 0 : 1, 110));
+        if (segment == null) return;
+        segment.RaiseSelected();
+        Announce(segment.SpokenName);
     }
-
-    static (Color, Color) Lighten((Color a, Color b) c) =>
-        (Mix(c.a, Colors.White, 0.35), Mix(c.b, Colors.White, 0.2));
-
-    static Color Mix(Color a, Color b, double t) => Color.FromRgb(
-        (byte)(a.R + (b.R - a.R) * t), (byte)(a.G + (b.G - a.G) * t), (byte)(a.B + (b.B - a.B) * t));
 
     void RefreshMeta()
     {
-        if (_plan == null) return;
-        if (_notice != null)
-        {
-            _fileMeta.Text = _notice;
-            _fileMeta.Foreground = Palette.Solid("#FBBF24");
-        }
-        else
-        {
-            _fileMeta.Text = IsSticky ? "Click a format" : $"{_plan.SourceExt.ToUpperInvariant()} · {Palette.KindName(_plan.SourceKind)}";
-            _fileMeta.Foreground = Palette.Solid("#8C8C9A");
-        }
+        if (_plan == null || _theme == null) return;
+        _fileMeta.Foreground = _notice != null ? _theme.Notice : _theme.SubtleText;
+        _fileMeta.Text = _notice
+            ?? (IsSticky ? "Click a format"
+            : _batch.Count > 1 ? $"selected · {Palette.KindName(_plan.SourceKind)}"
+            : _selectedCount > 1 ? $"1 of {_selectedCount} selected"
+            : $"{_plan.SourceExt.ToUpperInvariant()} · {Palette.KindName(_plan.SourceKind)}");
     }
 
     void SetExpanded(bool expanded, bool animate)
     {
+        if (_inner.Count > 0 && _plan is { HasMore: false }) expanded = false; // the outer ring would only repeat the inner one
         bool changed = _expanded != expanded;
         _expanded = expanded;
-        foreach (var s in _inner) s.SetMoreState(expanded);
+        foreach (var s in _inner) s.SetExpanded(expanded);
 
         if (!animate)
         {
@@ -478,208 +605,119 @@ internal sealed class WheelOverlay : Window
             _outerBackdrop.BeginAnimation(OpacityProperty, null);
             _outerLayer.Opacity = _outerBackdrop.Opacity = expanded ? 1 : 0;
             _outerLayer.Visibility = _outerBackdrop.Visibility = expanded ? Visibility.Visible : Visibility.Collapsed;
-            _outerScale.ScaleX = _outerScale.ScaleY = 1;
-            _outerBackdropScale.ScaleX = _outerBackdropScale.ScaleY = 1;
+            foreach (var scale in new[] { _outerScale, _outerBackdropScale })
+            {
+                scale.BeginAnimation(ScaleTransform.ScaleXProperty, null);
+                scale.BeginAnimation(ScaleTransform.ScaleYProperty, null);
+                scale.ScaleX = scale.ScaleY = 1;
+            }
+            return;
         }
-        else if (changed)
+        if (!changed) return;
+
+        double from = WheelLayout.InnerRim / WheelLayout.OuterRim;
+        if (expanded)
         {
-            double from = (R2 + 9) / (R4 + 10);
-            if (expanded)
+            Position(_center); // only now is the room for the outer ring needed
+            _outerLayer.Visibility = _outerBackdrop.Visibility = Visibility.Visible;
+            _outerLayer.BeginAnimation(OpacityProperty, Anim(1, 160));
+            _outerBackdrop.BeginAnimation(OpacityProperty, Anim(1, 120));
+            var grow = new DoubleAnimation(Motion ? 0.88 : 1, 1, Dur(240)) { EasingFunction = new BackEase { Amplitude = 0.3, EasingMode = EasingMode.EaseOut } };
+            _outerScale.BeginAnimation(ScaleTransform.ScaleXProperty, grow);
+            _outerScale.BeginAnimation(ScaleTransform.ScaleYProperty, grow);
+            var disc = new DoubleAnimation(Motion ? from : 1, 1, Dur(220)) { EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut } };
+            _outerBackdropScale.BeginAnimation(ScaleTransform.ScaleXProperty, disc);
+            _outerBackdropScale.BeginAnimation(ScaleTransform.ScaleYProperty, disc);
+            for (int i = 0; i < _outer.Count; i++) _outer[i].FadeIn(i * 10);
+        }
+        else
+        {
+            if (_hot?.Ring == WheelRing.Outer) SetHot(null);
+            var hide = Anim(0, 140);
+            hide.Completed += (_, _) =>
             {
-                _outerLayer.Visibility = _outerBackdrop.Visibility = Visibility.Visible;
-                _outerLayer.BeginAnimation(OpacityProperty, Anim(1, 160));
-                _outerBackdrop.BeginAnimation(OpacityProperty, Anim(1, 120));
-                var grow = new DoubleAnimation(0.88, 1, Dur(240)) { EasingFunction = new BackEase { Amplitude = 0.3, EasingMode = EasingMode.EaseOut } };
-                _outerScale.BeginAnimation(ScaleTransform.ScaleXProperty, grow);
-                _outerScale.BeginAnimation(ScaleTransform.ScaleYProperty, grow);
-                var disc = new DoubleAnimation(from, 1, Dur(220)) { EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut } };
-                _outerBackdropScale.BeginAnimation(ScaleTransform.ScaleXProperty, disc);
-                _outerBackdropScale.BeginAnimation(ScaleTransform.ScaleYProperty, disc);
-                for (int i = 0; i < _outer.Count; i++) _outer[i].FadeIn(i * 10);
-            }
-            else
-            {
-                var hide = Anim(0, 140);
-                hide.Completed += (_, _) =>
-                {
-                    if (_expanded) return;
-                    _outerLayer.Visibility = _outerBackdrop.Visibility = Visibility.Collapsed;
-                };
-                _outerLayer.BeginAnimation(OpacityProperty, hide);
-                _outerBackdrop.BeginAnimation(OpacityProperty, Anim(0, 140));
-                _outerBackdropScale.BeginAnimation(ScaleTransform.ScaleXProperty, Anim(from, 160));
-                _outerBackdropScale.BeginAnimation(ScaleTransform.ScaleYProperty, Anim(from, 160));
-            }
+                if (_expanded) return;
+                _outerLayer.Visibility = _outerBackdrop.Visibility = Visibility.Collapsed;
+            };
+            _outerLayer.BeginAnimation(OpacityProperty, hide);
+            _outerBackdrop.BeginAnimation(OpacityProperty, Anim(0, 140));
+            _outerBackdropScale.BeginAnimation(ScaleTransform.ScaleXProperty, Anim(from, 160));
+            _outerBackdropScale.BeginAnimation(ScaleTransform.ScaleYProperty, Anim(from, 160));
         }
 
         if (_hot?.IsMore == true) SetHot(_hot);
-        if (changed) GeometryChanged?.Invoke();
+        GeometryChanged?.Invoke();
+        RefreshPeers();
     }
 
-    static Duration Dur(int ms) => new(TimeSpan.FromMilliseconds(ms));
+    internal static Duration Dur(int ms) => new(TimeSpan.FromMilliseconds(Motion ? ms : 1));
 
     internal static DoubleAnimation Anim(double to, int ms, IEasingFunction? ease = null) =>
         new(to, Dur(ms)) { EasingFunction = ease ?? new CubicEase { EasingMode = EasingMode.EaseOut } };
 
-    // ------------------------------------------------------------------ segment
+    // ------------------------------------------------------------------ accessibility
 
-    sealed class Segment
+    /// <summary>The visible slices, in reading order.</summary>
+    internal IEnumerable<WheelSegment> ShownSegments => !IsOpen ? [] : _expanded ? _inner.Concat(_outer) : _inner;
+
+    internal WheelSegment? HotSegment => _hot;
+
+    internal TextBlock Status => _status;
+
+    void Announce(string text)
     {
-        static readonly SolidColorBrush NormalFill = Palette.Solid("#2A2A34");
-        static readonly SolidColorBrush LabelNormal = Palette.Solid("#ECECF2");
-        static readonly SolidColorBrush HintNormal = Palette.Solid("#8B8B9A");
-        static readonly SolidColorBrush HintHot = Palette.Solid("#EAFFFFFF");
+        _status.Text = text;
+        AutomationProperties.SetName(_status, text);
+        if (AutomationPeer.ListenerExists(AutomationEvents.LiveRegionChanged))
+            UIElementAutomationPeer.CreatePeerForElement(_status)?.RaiseAutomationEvent(AutomationEvents.LiveRegionChanged);
+    }
 
-        readonly Canvas _tileLayer = new() { Opacity = 0.92 };
-        readonly Path _tile;
-        readonly Path? _strip;
-        readonly TextBlock _label;
-        readonly TextBlock? _hint;
-        readonly TextBlock? _moreGlyph;
-        readonly ScaleTransform _scale = new(1, 1, C.X, C.Y);
-        readonly Brush _hotFill;
-        readonly Color _glow;
-        readonly double _baseOpacity;
-        readonly bool _outer;
+    void Raise(AutomationEvents change)
+    {
+        if (AutomationPeer.ListenerExists(change))
+            UIElementAutomationPeer.CreatePeerForElement(_stage)?.RaiseAutomationEvent(change);
+    }
 
-        public FormatInfo? Format { get; }
-        public bool IsMore => Format == null;
-        public double A0 { get; }
-        public double A1 { get; }
-        public Canvas Root { get; } = new();
+    /// <summary>The list of slices changed.</summary>
+    void RefreshPeers()
+    {
+        if (UIElementAutomationPeer.FromElement(_stage) is not { } peer) return;
+        peer.ResetChildrenCache();
+        peer.InvalidatePeer();
+    }
 
-        public Segment(FormatInfo? format, double a0, double a1, double r1, double r2, bool outer, int? badge, bool dimmed, bool expanded)
+    protected override AutomationPeer OnCreateAutomationPeer() => new WheelPeer(this);
+
+    sealed class WheelPeer(WheelOverlay owner) : WindowAutomationPeer(owner)
+    {
+        protected override string GetNameCore() => "Convert Wheel";
+        protected override List<AutomationPeer> GetChildrenCore()
         {
-            Format = format;
-            A0 = a0;
-            A1 = a1;
-            _outer = outer;
-            var colors = format == null ? Palette.More : Palette.Accent(format.Kind);
-            _hotFill = Palette.Gradient(colors);
-            _glow = colors.Item1;
-
-            _tile = new Path
-            {
-                Data = WheelGeometry.Sector(C, r1 + 3, r2 - 3, a0, a1, Gap + 6),
-                Fill = NormalFill,
-                Stroke = NormalFill,
-                StrokeThickness = 6, // a round-joined stroke in the fill colour gives soft corners
-                StrokeLineJoin = PenLineJoin.Round,
-            };
-            _tileLayer.Children.Add(_tile);
-            if (format != null)
-            {
-                _strip = new Path
-                {
-                    Data = WheelGeometry.Arc(C, r2 - 9, a0, a1, Gap + 22),
-                    Stroke = _hotFill,
-                    StrokeThickness = 2.5,
-                    StrokeStartLineCap = PenLineCap.Round,
-                    StrokeEndLineCap = PenLineCap.Round,
-                    Opacity = 0.85,
-                };
-                _tileLayer.Children.Add(_strip);
-            }
-            Root.Children.Add(_tileLayer);
-
-            double mid = (a0 + a1) / 2;
-            double labelR = r1 + (r2 - r1) * (outer ? 0.5 : 0.53);
-            double arcLength = labelR * (a1 - a0) * Math.PI / 180;
-            var panel = new StackPanel { HorizontalAlignment = HorizontalAlignment.Center };
-
-            if (format == null)
-            {
-                _moreGlyph = new TextBlock
-                {
-                    Text = "",
-                    FontFamily = Palette.IconFont,
-                    FontSize = 16,
-                    Foreground = LabelNormal,
-                    HorizontalAlignment = HorizontalAlignment.Center,
-                };
-                panel.Children.Add(_moreGlyph);
-            }
-
-            _label = new TextBlock
-            {
-                Text = format?.Label ?? "All",
-                FontSize = outer ? (arcLength < 52 ? 11 : 12.5) : 17,
-                FontWeight = FontWeights.SemiBold,
-                Foreground = LabelNormal,
-                HorizontalAlignment = HorizontalAlignment.Center,
-            };
-            panel.Children.Add(_label);
-
-            if (format != null && arcLength >= (outer ? 66 : 50))
-            {
-                _hint = new TextBlock
-                {
-                    Text = format.Hint,
-                    FontSize = outer ? 9 : 10.5,
-                    Foreground = HintNormal,
-                    HorizontalAlignment = HorizontalAlignment.Center,
-                };
-                panel.Children.Add(_hint);
-            }
-
-            panel.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
-            var at = WheelGeometry.Polar(C, labelR, mid);
-            Canvas.SetLeft(panel, at.X - panel.DesiredSize.Width / 2);
-            Canvas.SetTop(panel, at.Y - panel.DesiredSize.Height / 2);
-            Root.Children.Add(panel);
-
-            if (badge is int n)
-            {
-                var number = new TextBlock { Text = n.ToString(), FontSize = 9, Foreground = Palette.Solid("#5E5E6E") };
-                number.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
-                var bp = WheelGeometry.Polar(C, r1 + 14, mid);
-                Canvas.SetLeft(number, bp.X - number.DesiredSize.Width / 2);
-                Canvas.SetTop(number, bp.Y - number.DesiredSize.Height / 2);
-                Root.Children.Add(number);
-            }
-
-            Root.RenderTransform = _scale;
-            _baseOpacity = dimmed ? 0.42 : 1;
-            Root.Opacity = _baseOpacity;
-            SetMoreState(expanded);
+            var wheel = (WheelOverlay)Owner;
+            return [CreatePeerForElement(wheel._stage), CreatePeerForElement(wheel._status)];
         }
+    }
 
-        public void SetMoreState(bool expanded)
+    sealed class WheelStage(WheelOverlay wheel) : Canvas
+    {
+        public WheelOverlay Wheel => wheel;
+        protected override AutomationPeer OnCreateAutomationPeer() => new Peer(this);
+
+        sealed class Peer(WheelStage owner) : FrameworkElementAutomationPeer(owner), ISelectionProvider
         {
-            if (!IsMore) return;
-            _label.Text = expanded ? "Less" : "All";
-            _moreGlyph!.Text = expanded ? "" : "";
-        }
-
-        public void SetHot(bool hot)
-        {
-            _tile.Fill = _tile.Stroke = hot ? _hotFill : NormalFill;
-            _tileLayer.Opacity = hot ? 1 : 0.92;
-            _tileLayer.Effect = hot ? new DropShadowEffect { Color = _glow, BlurRadius = 28, ShadowDepth = 0, Opacity = 0.75 } : null;
-            if (_strip != null) _strip.Visibility = hot ? Visibility.Hidden : Visibility.Visible;
-            _label.Foreground = hot ? Brushes.White : LabelNormal;
-            if (_moreGlyph != null) _moreGlyph.Foreground = _label.Foreground;
-            if (_hint != null) _hint.Foreground = hot ? HintHot : HintNormal;
-
-            double target = hot ? (_outer ? 1.05 : 1.065) : 1;
-            _scale.BeginAnimation(ScaleTransform.ScaleXProperty, Anim(target, 120));
-            _scale.BeginAnimation(ScaleTransform.ScaleYProperty, Anim(target, 120));
-        }
-
-        public void FadeIn(int delayMs)
-        {
-            Root.Opacity = 0;
-            Root.BeginAnimation(OpacityProperty, new DoubleAnimation(0, _baseOpacity, Dur(140))
-            {
-                BeginTime = TimeSpan.FromMilliseconds(delayMs),
-            });
-        }
-
-        public void Pulse()
-        {
-            var pulse = new DoubleAnimation(1.14, Dur(150)) { EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut } };
-            _scale.BeginAnimation(ScaleTransform.ScaleXProperty, pulse);
-            _scale.BeginAnimation(ScaleTransform.ScaleYProperty, pulse);
+            WheelOverlay Wheel => ((WheelStage)Owner).Wheel;
+            protected override AutomationControlType GetAutomationControlTypeCore() => AutomationControlType.List;
+            protected override string GetClassNameCore() => "WheelSlices";
+            protected override string GetNameCore() => "Formats";
+            protected override string GetHelpTextCore() => "Arrow keys or numbers choose a format, Enter converts, Tab shows every format, Escape closes.";
+            protected override bool IsControlElementCore() => true;
+            protected override bool IsContentElementCore() => true;
+            protected override List<AutomationPeer> GetChildrenCore() => Wheel.ShownSegments.Select(CreatePeerForElement).ToList();
+            public override object? GetPattern(PatternInterface pattern) => pattern == PatternInterface.Selection ? this : base.GetPattern(pattern);
+            public IRawElementProviderSimple[] GetSelection() =>
+                Wheel.HotSegment is { } hot && CreatePeerForElement(hot) is { } peer ? [ProviderFromPeer(peer)] : [];
+            public bool CanSelectMultiple => false;
+            public bool IsSelectionRequired => false;
         }
     }
 }

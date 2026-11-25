@@ -12,7 +12,8 @@ public sealed record ConversionPlan(
     IReadOnlyList<FormatInfo> Suggested,
     IReadOnlyList<FormatInfo> All)
 {
-    public bool IsOfficeDocument => SourceKind is FormatKind.Document or FormatKind.Spreadsheet or FormatKind.Presentation;
+    /// <summary>Whether showing every format would add anything to the suggested ones.</summary>
+    public bool HasMore => All.Count > Suggested.Count;
 }
 
 public static class Formats
@@ -170,7 +171,7 @@ public static class Formats
         [FormatKind.Video] = ["mp4", "mkv", "webm", "mov", "avi", "wmv", "mpg", "gif", "webp", .. AudioTargets],
         [FormatKind.Image] = ["png", "jpg", "webp", "avif", "jxl", "gif", "bmp", "tiff", "ico", "tga", "pdf", "txt", "docx"],
         [FormatKind.Document] = ["pdf", "docx", "odt", "rtf", "txt", "html", "md", "epub"],
-        [FormatKind.Spreadsheet] = ["xlsx", "ods", "csv", "tsv", "json", "pdf", "html"],
+        [FormatKind.Spreadsheet] = ["xlsx", "ods", "csv", "tsv", "json", "pdf", "html", "txt", "md"],
         [FormatKind.Presentation] = ["pdf", "pptx", "odp", "png", "jpg"],
         [FormatKind.Archive] = ["zip", "tar", "tgz"],
         [FormatKind.Subtitle] = ["srt", "vtt", "ass", "txt"],
@@ -211,7 +212,8 @@ public static class Formats
     public static FormatKind? KindOf(string path) =>
         Inputs.TryGetValue(Path.GetExtension(path).TrimStart('.').ToLowerInvariant(), out var kind) ? kind : null;
 
-    public static ConversionPlan? Plan(string path)
+    /// <param name="patience">How long reading the file's first bytes may take: the wheel can't wait for a slow network folder.</param>
+    public static ConversionPlan? Plan(string path, int patience = 150)
     {
         var ext = Path.GetExtension(path).TrimStart('.').ToLowerInvariant();
         if (!Inputs.TryGetValue(ext, out var kind)) return null;
@@ -219,16 +221,31 @@ public static class Formats
 
         // A .gz holding a .tar is a tar.gz; compare by what's inside rather than the last extension.
         if (kind == FormatKind.Archive && path.EndsWith(".tar.gz", StringComparison.OrdinalIgnoreCase)) canonical = "tgz";
-        var lookup = canonical == "webp" && MagickImages.IsAnimatedWebP(path) ? "webp-animated" : canonical;
+        var lookup = canonical == "webp" && IsAnimatedWebP(path, patience) ? "webp-animated" : canonical;
 
         var all = (AllByExt.TryGetValue(lookup, out var special) ? special : AllByKind[kind]).ToList();
-        all.Remove(canonical);
+        // A macro-enabled file can be saved as the ordinary kind; anything else is already the format it's called.
+        bool withMacros = ext is "docm" or "xlsm";
+        if (!withMacros) all.Remove(canonical);
         if (canonical == "log") all.Remove("txt");
 
         var smart = SmartByExt.TryGetValue(lookup, out var s) ? s : SmartByKind[kind];
+        if (withMacros) smart = [canonical, .. smart];
         var suggested = smart.Where(all.Contains).Take(MaxSuggestions).ToList();
 
         return new ConversionPlan(path, canonical, kind, suggested.Select(e => Targets[e]).ToList(), all.Select(e => Targets[e]).ToList());
+    }
+
+    static bool IsAnimatedWebP(string path, int patience)
+    {
+        var look = Task.Run(() =>
+        {
+            // A file that's only in the cloud would have to be downloaded first.
+            const int RecallOnOpen = 0x40000, RecallOnDataAccess = 0x400000;
+            return ((int)File.GetAttributes(path) & (RecallOnOpen | RecallOnDataAccess | (int)FileAttributes.Offline)) == 0 && MagickImages.IsAnimatedWebP(path);
+        });
+        try { return look.Wait(patience) && look.Result; }
+        catch (AggregateException) { return false; }
     }
 
     static Dictionary<string, FormatKind> Build(params (FormatKind kind, string exts)[] groups)

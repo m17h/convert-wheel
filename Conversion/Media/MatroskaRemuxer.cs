@@ -16,6 +16,7 @@ internal static class MatroskaRemuxer
 
     public static void Convert(string input, string output, IProgress<double?>? progress, CancellationToken ct)
     {
+        MediaCheck.EnsureComplete(input);
         if (TryWrite(input, output, progress, ct)) return;
 
         var temp = Path.Combine(Path.GetTempPath(), $"cw-{Guid.NewGuid():N}.mp4");
@@ -34,9 +35,13 @@ internal static class MatroskaRemuxer
         public bool Video;
         public string CodecId = "";
         public byte[]? CodecPrivate;
-        public int Width, Height, Channels, SampleRate, Rotation;
-        public double Fps;
+        public int Width, Height, DisplayWidth, DisplayHeight, Channels, SampleRate, Rotation;
         public bool AdtsHeader;
+        public double? Start; // when it should begin, if the file says
+        public long Shift; // 100 ns to add to Windows' times
+        public string Language = "und";
+        public string? Name;
+        public (int matrix, int range, int transfer, int primaries) Colour;
     }
 
     static bool TryWrite(string input, string output, IProgress<double?>? progress, CancellationToken ct)
@@ -45,10 +50,13 @@ internal static class MatroskaRemuxer
         IMFSourceReader? reader = null;
         try
         {
+            var timing = Mp4Info.Read(input);
+            if (timing?.Trimmed == true) throw new NotSupportedException("This video has an edit list, which needs FFmpeg.");
             MF.MFCreateSourceReaderFromURL(input, null, out reader);
             reader.SetStreamSelection(MF.SourceReaderAllStreams, false);
             var tracks = new List<Track>();
-            bool sawVideo = false, sawAudio = false;
+            bool encode = false, otherAudio = false;
+            int videos = 0, audios = 0;
             for (int i = 0; ; i++)
             {
                 if (reader.GetNativeMediaType(i, 0, out var type) < 0) break;
@@ -56,41 +64,53 @@ internal static class MatroskaRemuxer
                 {
                     var major = type.GetGuid(MF.MT_MAJOR_TYPE);
                     var codec = type.GetGuid(MF.MT_SUBTYPE);
-                    if (major == MF.MediaTypeVideo && !sawVideo)
+                    if (major == MF.MediaTypeVideo && videos++ == 0)
                     {
-                        sawVideo = true;
-                        if (codec != MF.VideoH264) return false;
+                        // FFmpeg copies these into MKV as they are, which beats encoding them again.
+                        if (codec == MF.VideoHEVC || codec == MF.VideoAV1 || codec == MF.VideoVP8 || codec == MF.VideoVP9 || codec == MF.VideoMPEG2 || codec == MF.VideoMP4V)
+                            throw new NotSupportedException("This video can be copied, but not by Windows.");
+                        if (codec != MF.VideoH264) { encode = true; continue; }
                         var (w, h) = type.GetSize(MF.MT_FRAME_SIZE) ?? (0, 0);
-                        var (rn, rd) = type.GetSize(MF.MT_FRAME_RATE) ?? (30, 1);
+                        var (pn, pd) = type.GetSize(MF.MT_PIXEL_ASPECT_RATIO) ?? (1, 1);
+                        bool square = pn <= 0 || pd <= 0 || pn == pd;
                         tracks.Add(new Track
                         {
                             ReaderStream = i, Video = true, CodecId = "V_MPEG4/ISO/AVC", Width = w, Height = h,
-                            Fps = rd > 0 ? (double)rn / rd : 30, CodecPrivate = AvcConfig(type.GetBlob(SequenceHeader)),
+                            // Like other muxers: keep the height, stretch the width.
+                            DisplayWidth = square ? 0 : (int)Math.Round(w * (double)pn / pd), DisplayHeight = square ? 0 : h,
+                            CodecPrivate = AvcConfig(type.GetBlob(SequenceHeader)),
                             Rotation = FrameRotation.Normalize(type.GetInt(MF.MT_VIDEO_ROTATION)),
+                            Start = timing?.FirstVideo?.Start,
+                            Colour = Colour(type),
                         });
                     }
-                    else if (major == MF.MediaTypeAudio && !sawAudio)
+                    else if (major == MF.MediaTypeAudio)
                     {
-                        sawAudio = true;
+                        var details = timing?.Audio.ElementAtOrDefault(audios++);
                         int channels = type.GetInt(MF.MT_AUDIO_NUM_CHANNELS) ?? 2, rate = type.GetInt(MF.MT_AUDIO_SAMPLES_PER_SECOND) ?? 48000;
+                        var track = new Track
+                        {
+                            ReaderStream = i, Channels = channels, SampleRate = rate,
+                            Start = details?.Start, Language = details?.Language ?? "und", Name = details?.Name,
+                        };
                         if (codec == MF.AudioAAC)
                         {
                             var user = type.GetBlob(UserData);
-                            tracks.Add(new Track
-                            {
-                                ReaderStream = i, CodecId = "A_AAC", Channels = channels, SampleRate = rate,
-                                CodecPrivate = user is { Length: > 12 } ? user[12..] : AacConfig(rate, channels),
-                                AdtsHeader = (type.GetInt(MF.MT_AAC_PAYLOAD_TYPE) ?? 0) == 1,
-                            });
+                            track.CodecId = "A_AAC";
+                            track.CodecPrivate = user is { Length: > 12 } ? user[12..] : AacConfig(rate, channels);
+                            track.AdtsHeader = (type.GetInt(MF.MT_AAC_PAYLOAD_TYPE) ?? 0) == 1;
                         }
-                        else if (codec == MF.AudioMP3)
-                            tracks.Add(new Track { ReaderStream = i, CodecId = "A_MPEG/L3", Channels = channels, SampleRate = rate });
-                        else return false;
+                        else if (codec == MF.AudioMP3) track.CodecId = "A_MPEG/L3";
+                        else { otherAudio = true; continue; }
+                        tracks.Add(track);
                     }
                 }
                 finally { MF.Release(type); }
             }
-            if (!tracks.Any(t => t.Video)) return false;
+            if (audios == 0 && MediaCheck.HasAudio(input) == true) throw new NotSupportedException("Windows can't read this video's audio track.");
+            if (timing != null && timing.Audio.Count > audios) throw new NotSupportedException("Windows can't read all of this video's audio tracks.");
+            if (!encode && otherAudio) throw new NotSupportedException("This video's audio can be copied, but not by Windows.");
+            if (encode || !tracks.Any(t => t.Video)) return false;
 
             foreach (var t in tracks)
             {
@@ -103,7 +123,13 @@ internal static class MatroskaRemuxer
             tracks.Sort((a, b) => b.Video.CompareTo(a.Video));
             for (int i = 0; i < tracks.Count; i++) tracks[i].Number = i + 1;
 
-            long duration = MF.Duration(reader) ?? 0;
+            long duration = MF.Duration(reader) ?? 0, end = 0;
+            // Windows' times ignore when tracks should start, so work out what to add to them. Matroska can't count
+            // below 0: if a track starts before that (encoder warm-up), everything moves along.
+            foreach (var t in tracks)
+                if (t.Start is double starts && FirstTime(input, t.ReaderStream) is long reported) t.Shift = (long)Math.Round(starts * 1e7) - reported;
+            long ahead = tracks.Max(t => t.Start is double starts && starts < 0 ? (long)Math.Round(-starts * 1e7) : 0);
+            foreach (var t in tracks) t.Shift += ahead;
             using var mkv = new MatroskaWriter(output, tracks);
             var ended = new HashSet<int>();
             while (true)
@@ -123,7 +149,9 @@ internal static class MatroskaRemuxer
                             if (track.Video) data = ToLengthPrefixed(data, track);
                             else if (track.AdtsHeader && data.Length > 7 && data[0] == 0xFF && (data[1] & 0xF0) == 0xF0)
                                 data = data[((data[1] & 1) == 0 ? 9 : 7)..];
-                            mkv.Add(track, ts, data, key);
+                            long length = sample.GetSampleDuration(out long l) >= 0 ? l : 0;
+                            mkv.Add(track, ts + track.Shift, length, data, key);
+                            end = Math.Max(end, ts + length);
                         }
                         if (duration > 0) progress?.Report(Math.Min(0.99, (double)ts / duration));
                     }
@@ -136,6 +164,9 @@ internal static class MatroskaRemuxer
                     reader.SetStreamSelection(index, false);
                 }
             }
+            if (duration > 0 && duration - end > Math.Max(10_000_000, duration / 50))
+                throw new InvalidOperationException($"Only {MediaCheck.Clock(end)} of {MediaCheck.Clock(duration)} could be read.");
+            mkv.Finish();
             return true;
         }
         catch (COMException ex)
@@ -146,7 +177,37 @@ internal static class MatroskaRemuxer
         finally { MF.Release(reader); }
     }
 
+    /// <summary>The earliest time Windows gives a stream's first samples (pictures aren't stored in the order they're shown).</summary>
+    static long? FirstTime(string input, int stream)
+    {
+        IMFSourceReader? reader = null;
+        try
+        {
+            MF.MFCreateSourceReaderFromURL(input, null, out reader);
+            reader.SetStreamSelection(MF.SourceReaderAllStreams, false);
+            reader.SetStreamSelection(stream, true);
+            long? first = null;
+            for (int i = 0; i < 32; i++)
+            {
+                reader.ReadSample(stream, 0, out _, out int flags, out long time, out var sample);
+                if (sample != null) first = Math.Min(first ?? time, time);
+                MF.Release(sample);
+                if ((flags & (MF.ReaderError | MF.ReaderEndOfStream)) != 0) break;
+            }
+            return first;
+        }
+        catch (COMException) { return null; }
+        finally { MF.Release(reader); }
+    }
+
     // ------------------------------------------------------------------ codec details
+
+    /// <summary>Windows' colour attributes as the standard code points Matroska uses (0 where unknown).</summary>
+    static (int matrix, int range, int transfer, int primaries) Colour(IMFMediaType type) => (
+        type.GetInt(MF.MT_YUV_MATRIX) switch { 1 => 1, 2 => 6, 3 => 7, 4 or 5 => 9, _ => 0 },
+        type.GetInt(MF.MT_VIDEO_NOMINAL_RANGE) switch { 1 => 2, 2 => 1, _ => 0 },
+        type.GetInt(MF.MT_TRANSFER_FUNCTION) switch { 1 => 8, 4 => 4, 5 or 11 => 1, 6 => 7, 7 => 13, 8 => 5, 9 => 9, 10 => 10, 12 or 13 => 14, 15 => 16, 16 => 18, _ => 0 },
+        type.GetInt(MF.MT_VIDEO_PRIMARIES) switch { 2 => 1, 3 => 4, 4 => 5, 5 or 8 => 6, 6 => 7, 9 => 9, 10 => 10, 11 => 11, _ => 0 });
 
     static List<byte[]> SplitAnnexB(byte[] data)
     {
@@ -279,13 +340,19 @@ internal static class MatroskaRemuxer
                 var parts = new List<byte[]>
                 {
                     UInt(0xD7, (ulong)t.Number), UInt(0x73C5, (ulong)Random.Shared.NextInt64(1, long.MaxValue)),
-                    UInt(0x83, t.Video ? 1UL : 2UL), Str(0x86, t.CodecId), UInt(0x9C, 0),
+                    UInt(0x83, t.Video ? 1UL : 2UL), Str(0x86, t.CodecId), UInt(0x9C, 0), Str(0x22B59C, t.Language),
                 };
+                if (t.Name != null) parts.Add(Str(0x536E, t.Name));
+                if (!t.Video && _tracks.First(x => !x.Video) != t) parts.Add(UInt(0x88, 0)); // only the first is the default
                 if (t.CodecPrivate != null) parts.Add(Bin(0x63A2, t.CodecPrivate));
                 if (t.Video)
                 {
-                    if (t.Fps > 0) parts.Add(UInt(0x23E383, (ulong)(1e9 / t.Fps)));
                     var video = new List<byte[]> { UInt(0xB0, (ulong)t.Width), UInt(0xBA, (ulong)t.Height) };
+                    if (t.DisplayWidth > 0) video.AddRange([UInt(0x54B0, (ulong)t.DisplayWidth), UInt(0x54BA, (ulong)t.DisplayHeight)]);
+                    var (matrix, range, transfer, primaries) = t.Colour;
+                    if (matrix + range + transfer + primaries > 0)
+                        video.Add(Element(0x55B0, [.. new (uint id, int value)[] { (0x55B1, matrix), (0x55B9, range), (0x55BA, transfer), (0x55BB, primaries) }
+                            .Where(c => c.value > 0).Select(c => UInt(c.id, (ulong)c.value))]));
                     // Phone rotation: Matroska expresses it as the projection's roll angle (counter-clockwise).
                     if (t.Rotation != 0) video.Add(Element(0x7670, UInt(0x7671, 0), Float(0x7675, -t.Rotation)));
                     parts.Add(Element(0xE0, [.. video]));
@@ -297,10 +364,10 @@ internal static class MatroskaRemuxer
             _tracksWritten = true;
         }
 
-        public void Add(Track track, long time100ns, byte[] data, bool keyframe)
+        public void Add(Track track, long time100ns, long duration100ns, byte[] data, bool keyframe)
         {
             if (!_tracksWritten) WriteTracks(); // after the first sample, so H.264 config found in-band is included
-            long ms = time100ns / 10_000;
+            long ms = Math.Max(0, (time100ns + 5000) / 10_000);
             bool videoKey = track.Video && keyframe;
             if (_clusterStart < 0 || ms - _clusterTime > 30_000 || ms - _clusterTime < -30_000 || (videoKey && ms - _clusterTime >= 1000))
                 StartCluster(ms, videoKey);
@@ -314,8 +381,7 @@ internal static class MatroskaRemuxer
             WriteSize(block.Length);
             _file.Write(block);
 
-            double end = ms + (track.Video && track.Fps > 0 ? 1000 / track.Fps : 0);
-            _maxEndMs = Math.Max(_maxEndMs, end);
+            _maxEndMs = Math.Max(_maxEndMs, (time100ns + duration100ns) / 10_000.0);
         }
 
         void StartCluster(long ms, bool cue)
@@ -338,7 +404,10 @@ internal static class MatroskaRemuxer
             _file.Position = end;
         }
 
-        public void Dispose()
+        public void Dispose() => _file.Dispose();
+
+        /// <summary>Writes the index and fills in the sizes left open.</summary>
+        public void Finish()
         {
             if (!_tracksWritten) WriteTracks();
             FinishCluster();
@@ -358,7 +427,6 @@ internal static class MatroskaRemuxer
             var duration = new byte[8];
             BinaryPrimitives.WriteDoubleBigEndian(duration, _maxEndMs);
             _file.Write(duration);
-            _file.Dispose();
         }
 
         void Write(byte[] bytes) => _file.Write(bytes);

@@ -1,7 +1,7 @@
 namespace ConvertWheel.Conversion;
 
-/// <summary>Finds FFmpeg (bundled, or one the user pointed at) and an installed LibreOffice, if any.</summary>
-public sealed class ToolLocator(AppSettings settings)
+/// <summary>Finds FFmpeg (bundled, or one already on this PC) and an installed LibreOffice, if any.</summary>
+public sealed class ToolLocator
 {
     public static string ToolsDir { get; } = Path.Combine(Log.DataDir, "tools");
 
@@ -10,7 +10,6 @@ public sealed class ToolLocator(AppSettings settings)
         var candidates = new List<string?>
         {
             BundledTools.ReadyFfmpeg(),
-            settings.FfmpegPath,
             Path.Combine(AppContext.BaseDirectory, "ffmpeg.exe"),
             Path.Combine(ToolsDir, "ffmpeg.exe"),
         };

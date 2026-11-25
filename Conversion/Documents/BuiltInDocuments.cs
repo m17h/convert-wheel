@@ -6,7 +6,7 @@ internal static class BuiltInDocuments
     static readonly HashSet<string> DocumentInputs = ["docx", "doc", "odt", "fodt", "rtf", "txt", "log", "html", "md", "epub"];
     static readonly HashSet<string> DocumentOutputs = ["pdf", "docx", "odt", "rtf", "txt", "html", "md", "epub"];
     static readonly HashSet<string> SheetInputs = ["csv", "tsv", "xlsx", "xls", "ods"];
-    static readonly HashSet<string> SheetOutputs = ["xlsx", "ods", "csv", "tsv", "json", "pdf", "html"];
+    static readonly HashSet<string> SheetOutputs = ["xlsx", "ods", "csv", "tsv", "json", "pdf", "html", "txt", "md"];
 
     public static bool CanRead(ConversionPlan plan) => plan.SourceKind switch
     {
@@ -29,7 +29,7 @@ internal static class BuiltInDocuments
         var title = Path.GetFileNameWithoutExtension(plan.SourcePath);
         if (plan.SourceKind == FormatKind.Spreadsheet)
         {
-            Spreadsheets.Write(Spreadsheets.Read(plan.SourcePath, ct), output, target.Ext, title, ct);
+            Spreadsheets.Write(Spreadsheets.Read(plan.SourcePath, ct, charts: target.Ext is "pdf" or "html" or "xlsx" or "ods"), output, target.Ext, title, ct);
             return;
         }
         Write(Read(plan.SourcePath, plan.SourceExt), target.Ext, output, ct);

@@ -3,39 +3,32 @@ using ConvertWheel.Conversion;
 using ConvertWheel.Native;
 using ConvertWheel.Shell;
 using ConvertWheel.UI;
+using Microsoft.Win32;
 
 namespace ConvertWheel.Input;
 
 /// <summary>
-/// Hold-to-open state machine. Holding exactly the trigger keys (nothing else) over a file for the
-/// configured delay opens the wheel. Any other key, click or scroll during the hold cancels it until
-/// the trigger is released, so ordinary shortcuts like Ctrl+C and Ctrl+click keep working.
+/// Connects the input hooks, the hold-to-open rules (<see cref="HoldGesture"/>), the file lookup and the wheel.
 /// </summary>
 internal sealed class TriggerController : IDisposable
 {
-    /// <summary>Immutable snapshot read by the hook thread to decide what to swallow.</summary>
-    sealed record HookState(bool WheelVisible, bool MouseInterest, bool MaskArmed, POINT Center, int Radius);
+    /// <summary>Real mouse travel (in DIPs) that starts the hold over.</summary>
+    const int TravelDip = 24;
 
-    enum Phase { Idle, Holding, Open }
-
-    const int StillMs = 90;
+    /// <summary>Windows drops input hooks silently, so quietly renew them this often when nothing is held.</summary>
+    static readonly TimeSpan HookRefreshInterval = TimeSpan.FromSeconds(30);
 
     readonly AppSettings _settings;
     readonly ShellResolver _resolver;
     readonly WheelOverlay _wheel;
+    readonly ConversionManager _conversions;
     readonly Dispatcher _dispatcher;
-    readonly DispatcherTimer _timer;
+    readonly DispatcherTimer _timer, _hookRefresh;
     readonly InputHooks _hooks;
-    readonly HashSet<int> _down = [];
-    volatile HookState _hookState = new(false, false, false, default, 0);
+    readonly HoldGesture _gesture = new(VirtualKeys.IsPhysicallyDown);
 
-    Phase _phase;
-    bool _tainted, _maskArmed, _resolving;
-    long _holdStart, _lastMove;
-    POINT _lastPoint;
-    POINT? _lastTried;
-    int _generation;
-    int[] _trigger;
+    bool _maskArmed, _resolving, _paused, _disposed;
+    int _generation, _travelPx, _unheldTicks;
 
     /// <summary>Set while the settings window is recording a new shortcut.</summary>
     public bool Suspended { get; set; }
@@ -45,193 +38,164 @@ internal sealed class TriggerController : IDisposable
         _settings = settings;
         _resolver = resolver;
         _wheel = wheel;
+        _conversions = conversions;
         _dispatcher = Dispatcher.CurrentDispatcher;
-        _trigger = [.. settings.TriggerKeys];
-
-        settings.Changed += () =>
-        {
-            _trigger = [.. _settings.TriggerKeys];
-            if (_phase == Phase.Holding) EndHolding();
-            if (_settings.Paused) _wheel.Cancel(restoreCursor: false);
-        };
-        wheel.ConvertRequested += conversions.Start;
-        wheel.Dismissed += OnWheelClosed;
-        wheel.GeometryChanged += Publish;
+        _paused = settings.Paused;
+        _gesture.SetTrigger(settings.TriggerKeys);
 
         _timer = new DispatcherTimer(DispatcherPriority.Input, _dispatcher) { Interval = TimeSpan.FromMilliseconds(25) };
         _timer.Tick += (_, _) => Tick();
+        _hookRefresh = new DispatcherTimer(DispatcherPriority.Background, _dispatcher) { Interval = HookRefreshInterval };
+        _hookRefresh.Tick += (_, _) => RefreshIdleHooks();
 
+        settings.Changed += OnSettingsChanged;
+        wheel.ConvertRequested += conversions.Start;
+        wheel.Dismissed += OnWheelClosed;
+        wheel.GeometryChanged += Publish;
+        SystemEvents.SessionSwitch += OnSessionSwitch;
+        SystemEvents.PowerModeChanged += OnPowerModeChanged;
+        SystemEvents.DisplaySettingsChanged += OnDisplayChanged;
+
+        _hooks = new InputHooks(e => _dispatcher.BeginInvoke(() => Handle(e)), enabled: !_paused);
+        _hookRefresh.IsEnabled = !_paused;
         Publish();
-        _hooks = new InputHooks(OnHookThread);
     }
 
-    // ------------------------------------------------------------------ hook thread
-
-    bool OnHookThread(HookEvent e)
+    /// <summary>Tells the hook thread what to hide and whether the mouse matters.</summary>
+    void Publish()
     {
-        var s = _hookState;
-        bool swallow = false;
-        switch (e.Kind)
+        if (_hooks == null) return;
+        _hooks.State = new HookState(_wheel.IsOpen, _maskArmed, _wheel.CenterPx, _wheel.HitRadiusPx, _wheel.PassRadiusPx, [.. _settings.TriggerKeys]);
+        _hooks.WatchMouse = _wheel.IsOpen || _gesture.Phase != HoldPhase.Idle;
+    }
+
+    // ------------------------------------------------------------------ keeping the hooks alive
+
+    void OnSettingsChanged()
+    {
+        _gesture.SetTrigger(_settings.TriggerKeys);
+        if (_settings.Paused != _paused)
         {
-            case HookEventKind.KeyDown:
-                swallow = s.WheelVisible && IsWheelKey(e.Code);
-                break;
-            case HookEventKind.KeyUp:
-                if (s.MaskArmed && VirtualKeys.IsAltOrWin(e.Code))
-                {
-                    InputHooks.InjectMaskedRelease(e.Code);
-                    swallow = true;
-                }
-                break;
-            case HookEventKind.MouseDown:
-                if (!s.MouseInterest) return false;
-                swallow = s.WheelVisible && Inside(e.Point, s);
-                break;
-            case HookEventKind.MouseWheel:
-                if (!s.MouseInterest) return false;
-                swallow = s.WheelVisible;
-                break;
+            _paused = _settings.Paused;
+            StartOver();
+            _hooks.Enabled = !_paused; // switching back on installs fresh hooks
+            _hookRefresh.IsEnabled = !_paused;
         }
-        _dispatcher.BeginInvoke(() => Handle(e, swallow));
-        return swallow;
+        Sync();
     }
 
-    static bool IsWheelKey(int vk) =>
-        vk is VirtualKeys.Escape or VirtualKeys.Enter or VirtualKeys.Tab or (>= 0x31 and <= 0x39) or (>= 0x61 and <= 0x69);
-
-    static bool Inside(POINT p, HookState s)
+    void RefreshIdleHooks()
     {
-        long dx = p.X - s.Center.X, dy = p.Y - s.Center.Y;
-        return dx * dx + dy * dy <= (long)s.Radius * s.Radius;
+        if (_gesture.Phase == HoldPhase.Idle && !_wheel.IsOpen && !_gesture.AnyTriggerDown) _hooks.Refresh();
     }
 
-    void Publish() => _hookState = new HookState(
-        _wheel.IsOpen,
-        _phase != Phase.Idle || _wheel.IsOpen,
-        _maskArmed,
-        _wheel.CenterPx,
-        _wheel.HitRadiusPx);
+    void OnSessionSwitch(object sender, SessionSwitchEventArgs e) => _dispatcher.BeginInvoke(RestartInput);
 
-    // ------------------------------------------------------------------ UI thread
-
-    void Handle(HookEvent e, bool swallowed)
+    void OnPowerModeChanged(object sender, PowerModeChangedEventArgs e)
     {
+        if (e.Mode != PowerModes.StatusChange) _dispatcher.BeginInvoke(RestartInput);
+    }
+
+    void OnDisplayChanged(object? sender, EventArgs e) => _dispatcher.BeginInvoke(() => _wheel.Cancel(restoreCursor: false));
+
+    /// <summary>Sleep, lock and user switching can eat key releases and hooks alike.</summary>
+    void RestartInput()
+    {
+        if (_disposed) return;
+        StartOver();
+        if (!_paused) _hooks.Refresh(forget: true);
+    }
+
+    void StartOver()
+    {
+        _wheel.Cancel(restoreCursor: false);
+        _gesture.Reset();
+        _maskArmed = false;
+        Sync();
+    }
+
+    // ------------------------------------------------------------------ input events (UI thread)
+
+    void Handle(HookEvent e)
+    {
+        if (_disposed) return;
         switch (e.Kind)
         {
-            case HookEventKind.KeyDown: OnKeyDown(e.Code); break;
+            case HookEventKind.KeyDown: OnKeyDown(e.Code, e.Hidden); break;
             case HookEventKind.KeyUp: OnKeyUp(e.Code); break;
-            case HookEventKind.MouseDown: OnMouseDown(e.Code, e.Point, swallowed); break;
+            case HookEventKind.MouseDown: OnMouseDown(e.Code, e.Point, e.Hidden); break;
             case HookEventKind.MouseWheel:
-                if (_phase == Phase.Holding) Taint();
+                if (_gesture.Phase == HoldPhase.Holding) _gesture.Disturb();
+                else if (_gesture.Phase == HoldPhase.Open && !e.Hidden) _wheel.Cancel(restoreCursor: false);
                 break;
         }
+        Sync();
     }
 
-    void OnKeyDown(int vk)
+    void OnKeyDown(int vk, bool hidden)
     {
-        int key = VirtualKeys.Normalize(vk);
-        bool repeat = !_down.Add(key);
+        bool wasOpen = _gesture.Phase == HoldPhase.Open;
+        Win32.GetCursorPos(out var cursor);
+        _gesture.Press(vk, allowed: !Suspended && !_settings.Paused, VirtualKeys.AnyMouseButtonDown(), cursor, Environment.TickCount64);
 
-        if (_phase == Phase.Open)
+        if (!wasOpen)
         {
-            if (repeat) return;
-            switch (vk)
-            {
-                case VirtualKeys.Escape: _wheel.Cancel(); return;
-                case VirtualKeys.Enter: _wheel.CommitHighlighted(); return;
-                case VirtualKeys.Tab: _wheel.ToggleExpanded(); return;
-                case >= 0x31 and <= 0x39: _wheel.CommitIndex(vk - 0x31); return;
-                case >= 0x61 and <= 0x69: _wheel.CommitIndex(vk - 0x61); return;
-            }
-            if (_trigger.Contains(key))
-            {
-                if (_wheel.IsSticky) _wheel.Cancel(); // pressing the shortcut again closes the wheel
-                return;
-            }
-            _wheel.Cancel(restoreCursor: false);
-            _tainted = true;
+            if (_gesture.Phase == HoldPhase.Holding) _travelPx = (int)Math.Round(TravelDip * Win32.MonitorAt(cursor).scale);
             return;
         }
-
-        if (!repeat) Evaluate(justPressed: key);
+        if (_gesture.IsTrigger(vk))
+        {
+            if (_wheel.IsSticky) _wheel.Cancel(); // pressing the shortcut again closes the wheel
+            return;
+        }
+        if (!hidden)
+        {
+            _wheel.Cancel(restoreCursor: false); // some other shortcut: get out of its way
+            return;
+        }
+        switch (vk)
+        {
+            case VirtualKeys.Escape: _wheel.Cancel(); break;
+            case VirtualKeys.Enter: _wheel.CommitHighlighted(); break;
+            case VirtualKeys.Tab: _wheel.ToggleExpanded(); break;
+            case VirtualKeys.ArrowLeft: _wheel.Step(-1); break;
+            case VirtualKeys.ArrowRight: _wheel.Step(1); break;
+            case VirtualKeys.ArrowUp: _wheel.StepRing(outwards: true); break;
+            case VirtualKeys.ArrowDown: _wheel.StepRing(outwards: false); break;
+            case >= 0x31 and <= 0x39: _wheel.CommitIndex(vk - 0x31); break;
+            case >= 0x61 and <= 0x69: _wheel.CommitIndex(vk - 0x61); break;
+        }
     }
 
     void OnKeyUp(int vk)
     {
-        int key = VirtualKeys.Normalize(vk);
-        // Keep e.g. Ctrl down if the other Ctrl is still held. Only ask about the other side: the released
-        // key's own state isn't updated until the hook returns, which may be after this runs.
-        if (VirtualKeys.OtherSide(vk) is not int other || !VirtualKeys.Down(other)) _down.Remove(key);
-        if (_phase == Phase.Open && !_wheel.IsSticky && _trigger.Contains(key) && !_down.Contains(key)) _wheel.ReleaseTrigger();
-        Evaluate(justPressed: null);
+        bool letGo = _gesture.Release(vk);
+        if (letGo && _gesture.Phase == HoldPhase.Open) _wheel.ReleaseTrigger();
+        if (!_gesture.AnyTriggerDown) _maskArmed = false;
     }
 
-    void OnMouseDown(int button, POINT point, bool insideWheel)
+    void OnMouseDown(int button, POINT point, bool hidden)
     {
-        if (_phase == Phase.Holding)
+        if (_gesture.Phase == HoldPhase.Open)
         {
-            Taint(); // e.g. Ctrl+click to multi-select
-            return;
+            if (hidden && button == 0) _wheel.ClickAt(point);
+            else _wheel.Cancel(restoreCursor: hidden); // a click that went through must land where it was aimed
         }
-        if (_phase != Phase.Open) return;
-        if (!insideWheel) _wheel.Cancel(restoreCursor: false);
-        else if (button == 0) _wheel.ClickAt(point);
-        else _wheel.Cancel();
+        else _gesture.Disturb(); // e.g. Ctrl+click to multi-select
     }
 
-    void Evaluate(int? justPressed)
+    // ------------------------------------------------------------------ holding
+
+    /// <summary>The timer, mouse hook and published state follow the phase.</summary>
+    void Sync()
     {
-        // Drop keys whose release we never saw (e.g. the workstation was locked mid-press).
-        _down.RemoveWhere(k => k != justPressed && !VirtualKeys.IsPhysicallyDown(k));
-
-        bool anyTrigger = _trigger.Any(_down.Contains);
-        bool exact = _trigger.All(_down.Contains) && _down.Count == _trigger.Length;
-        bool extra = _down.Any(k => !_trigger.Contains(k));
-
-        if (!anyTrigger)
+        bool active = _gesture.Phase != HoldPhase.Idle;
+        if (active != _timer.IsEnabled)
         {
-            _tainted = false;
-            if (_maskArmed)
-            {
-                _maskArmed = false;
-                Publish();
-            }
+            _timer.IsEnabled = active;
+            _unheldTicks = 0;
         }
-
-        if (_phase == Phase.Holding && !exact)
-        {
-            EndHolding();
-            if (extra && anyTrigger) _tainted = true;
-        }
-        else if (_phase == Phase.Idle)
-        {
-            if (extra && anyTrigger) _tainted = true;
-            if (exact && !_tainted && !Suspended && !_settings.Paused) BeginHolding();
-        }
-    }
-
-    void Taint()
-    {
-        _tainted = true;
-        if (_phase == Phase.Holding) EndHolding();
-    }
-
-    void BeginHolding()
-    {
-        _phase = Phase.Holding;
-        _holdStart = Environment.TickCount64;
-        _lastMove = _holdStart - StillMs;
-        Win32.GetCursorPos(out _lastPoint);
-        _lastTried = null;
-        _timer.Start();
-        Publish();
-    }
-
-    void EndHolding()
-    {
-        _phase = Phase.Idle;
-        _generation++;
-        _timer.Stop();
+        if (!active) _generation++;
         Publish();
     }
 
@@ -239,51 +203,54 @@ internal sealed class TriggerController : IDisposable
     {
         if (Suspended || _settings.Paused)
         {
-            if (_phase == Phase.Holding) EndHolding();
             _wheel.Cancel(restoreCursor: false);
-            return;
+            _gesture.Disturb();
         }
-        bool held = _trigger.All(VirtualKeys.IsPhysicallyDown);
-        if (_phase == Phase.Open)
-        {
-            if (!held && !_wheel.IsSticky) SyncMissedReleases();
-            return;
-        }
-        if (_phase != Phase.Holding) return;
-        if (!held)
-        {
-            SyncMissedReleases();
-            return;
-        }
-
-        long now = Environment.TickCount64;
-        Win32.GetCursorPos(out var point);
-        if (Distance(point, _lastPoint) > 3)
-        {
-            _lastPoint = point;
-            _lastMove = now;
-        }
-
-        if (now - _holdStart < _settings.HoldDelayMs || now - _lastMove < StillMs || _resolving) return;
-        if (_lastTried is { } tried && Distance(tried, point) <= 3) return;
-        _lastTried = point;
-        if (!ShellResolver.IsOverShellView(point)) return;
-
-        _resolving = true;
-        _ = ResolveAndOpen(point, ++_generation);
+        else if (_gesture.Phase == HoldPhase.Open) WatchOpenWheel();
+        else HoldTick();
+        Sync();
     }
 
-    void SyncMissedReleases()
+    void WatchOpenWheel()
     {
-        foreach (var key in _down.Where(k => !VirtualKeys.IsPhysicallyDown(k)).ToList()) OnKeyUp(key);
+        // A window switch, UAC prompt or lock screen: whatever the keys do now isn't meant for the wheel.
+        if (!_wheel.FocusUnchanged)
+        {
+            _wheel.Cancel(restoreCursor: false);
+            _gesture.ForgetMissedReleases();
+            return;
+        }
+        // The release was never reported (an elevated window has the focus, or the hook is gone). That's no
+        // deliberate choice, so close without converting. Two ticks, as the event itself may be on its way.
+        bool unheld = !_wheel.IsSticky && !_gesture.Held;
+        _unheldTicks = unheld ? _unheldTicks + 1 : 0;
+        if (_unheldTicks < 2) return;
+        _wheel.Cancel();
+        _gesture.ForgetMissedReleases();
+        _maskArmed = false;
+        _hooks.Refresh();
+    }
+
+    void HoldTick()
+    {
+        if (!Win32.GetCursorPos(out var cursor)) return;
+        var step = _gesture.Tick(cursor, Environment.TickCount64, VirtualKeys.AnyMouseButtonDown(),
+            ShellResolver.IsOverShellView(cursor), _settings.HoldDelayMs, _travelPx);
+        if (step != HoldStep.Resolve || _resolving) return;
+        _resolving = true;
+        _ = ResolveAndOpen(cursor, ++_generation);
     }
 
     async Task ResolveAndOpen(POINT point, int generation)
     {
-        string? path = null;
+        HoveredFile? hovered = null;
+        ConversionPlan? plan = null;
+        IReadOnlyList<ConversionPlan> batch = [];
         try
         {
-            path = await _resolver.ResolveFileAsync(point);
+            hovered = await _resolver.ResolveAsync(point);
+            // Looking inside files (is this WebP animated?) can be slow on a network drive.
+            if (hovered != null) (plan, batch) = await Task.Run(() => Batch.Plan(hovered));
         }
         catch (Exception ex)
         {
@@ -294,17 +261,13 @@ internal sealed class TriggerController : IDisposable
             _resolving = false;
         }
 
-        if (generation != _generation || _phase != Phase.Holding || path == null) return;
-        if (Suspended || _settings.Paused || !_trigger.All(VirtualKeys.IsPhysicallyDown)) return;
-        if (!Win32.GetCursorPos(out var current) || Distance(current, point) > 3) return;
-        var plan = Formats.Plan(path);
-        if (plan == null) return;
+        if (_disposed || generation != _generation || plan == null || Suspended || _settings.Paused) return;
+        if (!Win32.GetCursorPos(out var cursor) || !_gesture.StillHolding(point, cursor, VirtualKeys.AnyMouseButtonDown())) return;
 
-        _phase = Phase.Open;
-        _maskArmed = _trigger.Any(k => k is VirtualKeys.Alt or VirtualKeys.Win);
-        Win32.GetCursorPos(out var cursor);
-        _wheel.Open(plan, cursor, _settings.AlwaysShowAll, notice: null);
-        Publish();
+        _maskArmed = _settings.TriggerKeys.Any(k => k is VirtualKeys.Alt or VirtualKeys.Win);
+        _gesture.Opened();
+        _wheel.Open(plan, cursor, _settings.AlwaysShowAll, notice: null, batch, hovered!.SelectedCount);
+        Sync();
         LoadThumbnail(plan.SourcePath);
     }
 
@@ -322,22 +285,24 @@ internal sealed class TriggerController : IDisposable
 
     void OnWheelClosed()
     {
-        _phase = Phase.Idle;
-        _generation++;
-        // Still holding the trigger: don't pop the wheel straight back up.
-        if (_trigger.Any(_down.Contains)) _tainted = true;
-        _timer.Stop();
-        Publish();
+        _gesture.Closed();
+        Sync();
     }
-
-    static double Distance(POINT a, POINT b) => Math.Sqrt(Math.Pow(a.X - b.X, 2) + Math.Pow(a.Y - b.Y, 2));
 
     public void Dispose()
     {
-        _generation++;
-        _phase = Phase.Idle;
+        if (_disposed) return;
+        _disposed = true;
+        _settings.Changed -= OnSettingsChanged;
+        SystemEvents.SessionSwitch -= OnSessionSwitch;
+        SystemEvents.PowerModeChanged -= OnPowerModeChanged;
+        SystemEvents.DisplaySettingsChanged -= OnDisplayChanged;
         _wheel.Cancel(restoreCursor: false);
+        _wheel.ConvertRequested -= _conversions.Start;
+        _wheel.Dismissed -= OnWheelClosed;
+        _wheel.GeometryChanged -= Publish;
         _timer.Stop();
+        _hookRefresh.Stop();
         _hooks.Dispose();
     }
 }

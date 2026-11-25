@@ -201,7 +201,7 @@ internal static class MF
     public const int SourceReaderAllStreams = unchecked((int)0xFFFFFFFE);
     public const int SourceReaderAnyStream = unchecked((int)0xFFFFFFFE);
     public const int SourceReaderMediaSource = unchecked((int)0xFFFFFFFF);
-    public const int ReaderError = 0x1, ReaderEndOfStream = 0x2, ReaderStreamTick = 0x100;
+    public const int ReaderError = 0x1, ReaderEndOfStream = 0x2, ReaderTypeChanged = 0x20, ReaderStreamTick = 0x100;
     public const int MF_E_NO_MORE_TYPES = unchecked((int)0xC00D36B9);
     public const int MF_E_INVALIDSTREAMNUMBER = unchecked((int)0xC00D36B3);
 
@@ -214,9 +214,19 @@ internal static class MF
     public static readonly Guid AudioAAC = new("00001610-0000-0010-8000-00aa00389b71");
     public static readonly Guid AudioWMAV8 = new("00000161-0000-0010-8000-00aa00389b71");
     public static readonly Guid AudioWMAV9 = new("00000162-0000-0010-8000-00aa00389b71");
+    public static readonly Guid AudioALAC = new("00006c61-0000-0010-8000-00aa00389b71");
+    public static readonly Guid AudioMp4ALAC = new("616c6163-767a-494d-b478-f29d25dc9037"); // as Windows' MP4 reader names it
+    public static readonly Guid AudioWMALossless = new("00000163-0000-0010-8000-00aa00389b71");
+    public static readonly Guid AudioAC3 = new("e06d802c-db46-11cf-b4d1-00805f6cbbea");
+    public static readonly Guid AudioEAC3 = new("a7fb87af-2d02-42fb-a4d4-05cd93843bdd");
     public static readonly Guid AudioFLAC = new("0000F1AC-0000-0010-8000-00aa00389b71");
     public static readonly Guid VideoH264 = FourCC("H264");
     public static readonly Guid VideoHEVC = FourCC("HEVC");
+    public static readonly Guid VideoAV1 = FourCC("AV01");
+    public static readonly Guid VideoVP8 = FourCC("VP80");
+    public static readonly Guid VideoVP9 = FourCC("VP90");
+    public static readonly Guid VideoMPEG2 = new("e06d8026-db46-11cf-b4d1-00805f6cbbea");
+    public static readonly Guid VideoMP4V = FourCC("MP4V");
     public static readonly Guid VideoWMV3 = FourCC("WMV3");
     public static readonly Guid VideoNV12 = FourCC("NV12");
     public static readonly Guid VideoRGB32 = new("00000016-0000-0010-8000-00AA00389B71");
@@ -227,6 +237,7 @@ internal static class MF
     public static readonly Guid MT_AUDIO_NUM_CHANNELS = new("37e48bf5-645e-4c5b-89de-ada9e29b696a");
     public static readonly Guid MT_AUDIO_SAMPLES_PER_SECOND = new("5faeeae7-0290-4c31-9e8a-c534f68d9dba");
     public static readonly Guid MT_AUDIO_BITS_PER_SAMPLE = new("f2deb57f-40fa-4764-aa33-ed4f2d1ff669");
+    public static readonly Guid MT_AUDIO_CHANNEL_MASK = new("55fb5765-644a-4caf-8479-938983bb1588");
     public static readonly Guid MT_AUDIO_BLOCK_ALIGNMENT = new("322de230-9eeb-43bd-ab7a-ff412251541d");
     public static readonly Guid MT_AUDIO_AVG_BYTES_PER_SECOND = new("1aab75c8-cfef-451c-ab95-ac034b8e1731");
     public static readonly Guid MT_ALL_SAMPLES_INDEPENDENT = new("c9173739-5e56-461c-b713-46fb995cb95f");
@@ -239,6 +250,10 @@ internal static class MF
     public static readonly Guid MT_DEFAULT_STRIDE = new("644b4e48-1e02-4516-b0eb-c01ca9d49ac6");
     public static readonly Guid MT_VIDEO_ROTATION = new("c380465d-2271-428c-9b83-ecea3b4a85c1");
     public static readonly Guid MT_MPEG2_PROFILE = new("ad76a80b-2d5c-4e0b-b375-64e520137036");
+    public static readonly Guid MT_VIDEO_PRIMARIES = new("dbfbe4d7-0740-4ee0-8192-850ab0e21935");
+    public static readonly Guid MT_TRANSFER_FUNCTION = new("5fb0fce9-be5c-4935-a811-ec838f8eed93");
+    public static readonly Guid MT_YUV_MATRIX = new("3e23d450-2c75-4d25-a00e-b91670d12327");
+    public static readonly Guid MT_VIDEO_NOMINAL_RANGE = new("c21b8ee5-b956-4071-8daf-325edf5cab11");
     public static readonly Guid PD_DURATION = new("6c990d33-bb8e-477a-8598-0d5d96fcd88a");
     public static readonly Guid SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING = new("0f81da2c-b537-4672-a8b2-a681b17307a3");
     public static readonly Guid READWRITE_ENABLE_HARDWARE_TRANSFORMS = new("a634a91c-822b-41b9-a494-4de4643612b0");

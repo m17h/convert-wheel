@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Text;
 using ConvertWheel.Native;
 
 namespace ConvertWheel.Conversion;
@@ -11,20 +12,20 @@ namespace ConvertWheel.Conversion;
 /// </summary>
 internal static class OfficeAutomation
 {
-    sealed record OfficeApp(string ProgId, string Process, string Name, HashSet<string> Inputs, Dictionary<string, int> Outputs)
+    sealed record OfficeApp(string ProgId, string Process, string Name, string WindowClass, HashSet<string> Inputs, Dictionary<string, int> Outputs)
     {
         public readonly SemaphoreSlim CreationGate = new(1, 1);
     }
 
-    static readonly OfficeApp Word = new("Word.Application", "WINWORD", "Word",
+    static readonly OfficeApp Word = new("Word.Application", "WINWORD", "Word", "OpusApp",
         ["doc", "docx", "odt", "rtf", "txt"],
-        new() { ["pdf"] = 17, ["docx"] = 16, ["odt"] = 23, ["rtf"] = 6, ["txt"] = 7, ["html"] = 10 });
+        new() { ["pdf"] = 17, ["docx"] = 16, ["odt"] = 23, ["rtf"] = 6, ["txt"] = 7 });
 
-    static readonly OfficeApp Excel = new("Excel.Application", "EXCEL", "Excel",
+    static readonly OfficeApp Excel = new("Excel.Application", "EXCEL", "Excel", "XLMAIN",
         ["xls", "xlsx", "ods", "csv"],
-        new() { ["pdf"] = -1, ["xlsx"] = 51, ["ods"] = 60, ["csv"] = 62, ["html"] = 44 });
+        new() { ["pdf"] = -1, ["xlsx"] = 51, ["ods"] = 60, ["csv"] = 62 });
 
-    static readonly OfficeApp PowerPoint = new("PowerPoint.Application", "POWERPNT", "PowerPoint",
+    static readonly OfficeApp PowerPoint = new("PowerPoint.Application", "POWERPNT", "PowerPoint", "PPTFrameClass",
         ["ppt", "pptx", "odp"],
         new() { ["pdf"] = 32, ["pptx"] = 24, ["odp"] = 35 });
 
@@ -37,8 +38,6 @@ internal static class OfficeAutomation
     static OfficeApp? AppFor(ConversionPlan plan, FormatInfo target) =>
         Apps.FirstOrDefault(a => a.Inputs.Contains(plan.SourceExt) && a.Outputs.ContainsKey(target.Ext) && Installed(a));
 
-    public static bool CanOpen(ConversionPlan plan) => Apps.Any(a => a.Inputs.Contains(plan.SourceExt) && Installed(a));
-
     public static bool CanConvert(ConversionPlan plan, FormatInfo target) => AppFor(plan, target) != null;
 
     public static async Task ConvertAsync(ConversionPlan plan, FormatInfo target, string output, CancellationToken ct)
@@ -47,7 +46,7 @@ internal static class OfficeAutomation
         ct.ThrowIfCancellationRequested();
         using var stop = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var token = stop.Token;
-        var started = new List<Process>();
+        var owned = new OwnedProcess(app);
         var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         // A timed-out caller no longer awaits the STA's eventual COM failure.
         _ = tcs.Task.ContinueWith(t => { _ = t.Exception; }, CancellationToken.None,
@@ -56,7 +55,7 @@ internal static class OfficeAutomation
         {
             try
             {
-                Run(app, plan.SourcePath, output, app.Outputs[target.Ext], started, token);
+                Run(app, plan.SourcePath, output, app.Outputs[target.Ext], owned, token);
                 tcs.TrySetResult();
             }
             catch (Exception ex)
@@ -77,16 +76,10 @@ internal static class OfficeAutomation
         {
             // Hung on an invisible dialog or cancelled: end only the instance we started.
             stop.Cancel();
-            lock (started)
-                foreach (var process in started) Kill(process);
+            owned.Kill();
             ct.ThrowIfCancellationRequested();
             throw new ConversionException($"Microsoft {app.Name} stopped responding.");
         }
-    }
-
-    static void Kill(Process process)
-    {
-        try { process.Kill(); } catch { }
     }
 
     static void Release(object? value)
@@ -103,21 +96,34 @@ internal static class OfficeAutomation
         return ids;
     }
 
-    static int? InstanceProcessId(OfficeApp office, dynamic app)
+    /// <summary>The process behind this very instance, from one of its own windows; null if it has none to ask.</summary>
+    static int? InstanceProcessId(OfficeApp office, dynamic app, bool untouched)
     {
         dynamic? documents = null, window = null;
         try
         {
-            nint hwnd;
             if (office.Name == "Word")
             {
                 documents = app.Documents;
-                if (documents.Count == 0) return null;
-                window = app.ActiveWindow;
-                hwnd = (nint)(int)window.Hwnd;
+                if (documents.Count > 0)
+                {
+                    window = app.ActiveWindow;
+                    return ProcessOf((nint)(int)window.Hwnd);
+                }
+                // Word has no window handle to give without a document, so look for the window by a name only this instance has.
+                if (!untouched) return null;
+                var caption = $"Convert Wheel {Guid.NewGuid():N}";
+                app.Caption = caption;
+                nint found = 0;
+                EnumWindows((hwnd, _) =>
+                {
+                    if (Win32.ClassName(hwnd) != office.WindowClass || !Title(hwnd).Contains(caption)) return true;
+                    found = hwnd;
+                    return false;
+                }, 0);
+                return found != 0 ? ProcessOf(found) : null;
             }
-            else hwnd = office.Name == "Excel" ? (nint)(int)app.Hwnd : (nint)(int)app.HWND;
-            return Win32.GetWindowThreadProcessId(hwnd, out uint id) != 0 ? (int)id : null;
+            return ProcessOf(office.Name == "Excel" ? (nint)(int)app.Hwnd : (nint)(int)app.HWND);
         }
         catch { return null; }
         finally
@@ -127,54 +133,156 @@ internal static class OfficeAutomation
         }
     }
 
-    static void Run(OfficeApp office, string input, string output, int format, List<Process> started, CancellationToken ct)
+    static int? ProcessOf(nint hwnd) => hwnd != 0 && Win32.GetWindowThreadProcessId(hwnd, out uint id) != 0 ? (int)id : null;
+
+    /// <summary>
+    /// Whether nobody is using this instance: created by a program, hidden, with nothing open. A new one always
+    /// is; one the user works in never is. Any doubt counts as "in use".
+    /// </summary>
+    static bool IsUntouched(OfficeApp office, dynamic app)
     {
+        dynamic? documents = null;
+        try
+        {
+            documents = office.Name switch { "Word" => app.Documents, "Excel" => app.Workbooks, _ => app.Presentations };
+            if ((int)documents.Count > 0) return false;
+            if (office.Name == "PowerPoint") return (int)app.Visible == 0; // msoFalse
+            return !(bool)app.UserControl && !(bool)app.Visible;
+        }
+        catch { return false; }
+        finally { Release(documents); }
+    }
+
+    /// <summary>The Office process a conversion started itself, proven by one of its own windows.</summary>
+    sealed class OwnedProcess(OfficeApp office)
+    {
+        readonly object _gate = new();
+        Process? _process;
+        ProcessJob? _job;
+
+        public bool Proven { get { lock (_gate) return _process != null; } }
+
+        /// <summary>Takes ownership if that process didn't exist before we asked for a new instance.</summary>
+        public void Claim(int? id, HashSet<int> before, DateTime asked, CancellationToken ct)
+        {
+            if (id is not { } pid || before.Contains(pid)) return;
+            Process? process = null;
+            try
+            {
+                process = Process.GetProcessById(pid);
+                _ = process.Handle; // Pin the process identity so PID reuse cannot target another app.
+                if (!process.ProcessName.Equals(office.Process, StringComparison.OrdinalIgnoreCase) || process.StartTime < asked.AddSeconds(-2))
+                {
+                    process.Dispose();
+                    return;
+                }
+                lock (_gate)
+                {
+                    _process = process;
+                    _job = new ProcessJob();
+                    _job.Add(process); // it must not outlive a crash of this app
+                }
+                if (ct.IsCancellationRequested) Kill(); // Creation may finish after the caller gave up.
+            }
+            catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception)
+            {
+                process?.Dispose();
+            }
+        }
+
+        /// <summary>Ends it, unless it has a window on screen: the user may have opened something in it meanwhile.</summary>
+        public void Kill()
+        {
+            lock (_gate)
+            {
+                if (_process == null || HasWindow(_process.Id, office.WindowClass)) return;
+                try { _process.Kill(); } catch { }
+            }
+        }
+
+        public void LetGo()
+        {
+            lock (_gate)
+            {
+                _job?.LetGo();
+                _job?.Dispose();
+                _process?.Dispose();
+                _job = null;
+                _process = null;
+            }
+        }
+    }
+
+    static bool HasWindow(int processId, string windowClass)
+    {
+        bool found = false;
+        EnumWindows((hwnd, _) =>
+        {
+            found = IsWindowVisible(hwnd) && ProcessOf(hwnd) == processId && Win32.ClassName(hwnd) == windowClass;
+            return !found;
+        }, 0);
+        return found;
+    }
+
+    static string Title(nint hwnd)
+    {
+        var text = new StringBuilder(512);
+        GetWindowText(hwnd, text, text.Capacity);
+        return text.ToString();
+    }
+
+    delegate bool EnumProc(nint hwnd, nint parameter);
+    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc callback, nint parameter);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(nint hwnd);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(nint hwnd, StringBuilder text, int max);
+
+    static void Run(OfficeApp office, string input, string output, int format, OwnedProcess owned, CancellationToken ct)
+    {
+        // A wrong password makes a protected file fail at once instead of asking on a screen nobody sees;
+        // Office ignores it for files that don't have one.
+        const string NoPassword = "\u0001convert-wheel";
         object m = Type.Missing;
-        bool weStarted = false;
+        bool mayQuit = false;
+        int? macroSetting = null;
         dynamic? app = null, file = null, files = null;
 
         try
         {
             office.CreationGate.Wait(ct);
+            var before = ProcessIds(office);
+            var asked = DateTime.Now;
             try
             {
                 ct.ThrowIfCancellationRequested();
-                var before = ProcessIds(office);
                 app = Activator.CreateInstance(Type.GetTypeFromProgID(office.ProgId)!)!;
-                var after = ProcessIds(office);
-                int? actual = InstanceProcessId(office, app);
-                var added = after.Except(before).ToArray();
-                int? owned = actual.HasValue
-                    ? (!before.Contains(actual.Value) && after.Contains(actual.Value) ? actual : null)
-                    : added.Length == 1 ? added[0] : null;
-                if (owned is { } id)
-                {
-                    weStarted = true;
-                    var process = Process.GetProcessById(id);
-                    try { _ = process.Handle; } // Pin the process identity so PID reuse cannot target another app.
-                    catch { process.Dispose(); throw; }
-                    lock (started)
-                    {
-                        started.Add(process);
-                        if (ct.IsCancellationRequested) Kill(process); // Creation may finish after the caller gave up.
-                    }
-                }
+                bool untouched = IsUntouched(office, app);
+                owned.Claim(InstanceProcessId(office, app, untouched), before, asked, ct);
+                // PowerPoint is a single instance, so it being idle doesn't make it ours.
+                mayQuit = owned.Proven || untouched && office.Name != "PowerPoint";
             }
             finally { office.CreationGate.Release(); }
             ct.ThrowIfCancellationRequested();
             // Word and Excel get hidden and silenced below, which must never happen to the user's own window.
             // PowerPoint is single-instance and opens our file windowless without changing the app, so sharing is fine.
-            if (!weStarted && office.Name != "PowerPoint")
+            if (!mayQuit && office.Name != "PowerPoint")
                 throw new ConversionException($"Microsoft {office.Name} is already in use; using another converter.");
-            try { app.AutomationSecurity = 3; } catch { } // never run macros in the file
+            // Never run macros in the file. The user may share this PowerPoint, so its setting goes back afterwards.
+            try
+            {
+                macroSetting = (int)app.AutomationSecurity;
+                app.AutomationSecurity = 3;
+            }
+            catch { }
             switch (office.Name)
             {
                 case "Word":
                     app.Visible = false;
                     app.DisplayAlerts = 0;
-                    // FileName, ConfirmConversions, ReadOnly, AddToRecentFiles, …, Visible (12th), …, NoEncodingDialog (15th)
                     files = app.Documents;
-                    file = files.Open(input, false, true, false, m, m, m, m, m, m, m, false, m, m, true);
+                    // FileName, ConfirmConversions, ReadOnly, AddToRecentFiles, PasswordDocument, PasswordTemplate, Revert,
+                    // WritePasswordDocument, WritePasswordTemplate, Format, Encoding, Visible (12th), …, NoEncodingDialog (15th)
+                    file = files.Open(input, false, true, false, NoPassword, NoPassword, m, NoPassword, NoPassword, m, m, false, m, m, true);
+                    if (!owned.Proven) owned.Claim(InstanceProcessId(office, app, false), before, asked, ct);
                     ct.ThrowIfCancellationRequested();
                     if (format == 7) file.SaveAs2(output, format, m, m, false, m, m, m, m, m, m, 65001); // UTF-8 text
                     else file.SaveAs2(output, format);
@@ -185,7 +293,8 @@ internal static class OfficeAutomation
                     app.DisplayAlerts = false;
                     try { app.AskToUpdateLinks = false; app.EnableEvents = false; } catch { }
                     files = app.Workbooks;
-                    file = files.Open(input, 0, true);
+                    // Filename, UpdateLinks, ReadOnly, Format, Password, WriteResPassword, IgnoreReadOnlyRecommended
+                    file = files.Open(input, 0, true, m, NoPassword, NoPassword, true);
                     ct.ThrowIfCancellationRequested();
                     if (format == -1) file.ExportAsFixedFormat(0, output);
                     else
@@ -222,20 +331,25 @@ internal static class OfficeAutomation
                 Release(files);
                 if (app != null)
                 {
-                    if (weStarted)
+                    if (macroSetting is { } setting)
+                        try { app.AutomationSecurity = setting; } catch { }
+                    // Windows may have opened one of the user's files in our hidden instance meanwhile: then it's theirs now.
+                    if (mayQuit && IsUntouched(office, app))
                     {
                         try { app.Quit(); } catch { }
+                    }
+                    else if (mayQuit)
+                    {
+                        Log.Write($"Left Microsoft {office.Name} open: something else is using it.");
+                        try { app.Visible = office.Name == "PowerPoint" ? (object)-1 : true; } catch { }
+                        if (office.Name != "PowerPoint") try { app.DisplayAlerts = office.Name == "Word" ? (object)-1 : true; } catch { }
                     }
                     Release(app);
                 }
             }
             finally
             {
-                lock (started)
-                {
-                    foreach (var process in started) process.Dispose();
-                    started.Clear();
-                }
+                owned.LetGo();
             }
             GC.Collect();
             GC.WaitForPendingFinalizers();

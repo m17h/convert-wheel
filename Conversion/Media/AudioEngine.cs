@@ -17,7 +17,10 @@ internal static class AudioEngine
         }
 
         using IAudioSource chain = Prepare(Open(input), ext, out int bits);
-        using (var sink = CreateSink(output, ext, chain.Format, bits, tags))
+        // Windows' encoders swallow sounds shorter than their own start-up time.
+        if (ext is "mp3" or "m4a" or "m4r" or "aac" && chain.TotalFrames is > 0 and var frameCount && frameCount < chain.Format.SampleRate / 10)
+            throw new NotSupportedException("This sound is too short for Windows' encoders.");
+        using (var sink = CreateSink(output, ext, chain, bits, tags))
         {
             var buffer = new float[8192 * chain.Format.Channels];
             long frames = 0, total = chain.TotalFrames ?? 0;
@@ -32,12 +35,27 @@ internal static class AudioEngine
             if (frames == 0) throw new ConversionException("This file has no audio to convert.");
             sink.Finish();
         }
+        EnsurePlayable(output, ext);
         WriteTags(tags, output, ext);
+    }
+
+    /// <summary>An encoder can "succeed" without writing any sound; opening the result shows whether there is some.</summary>
+    static void EnsurePlayable(string output, string ext)
+    {
+        using var check = ext switch
+        {
+            "aiff" => new AiffSource(output),
+            "ogg" => new VorbisSource(output),
+            "opus" => new OpusSource(output),
+            _ => (IAudioSource)new MfAudioSource(output),
+        };
+        if (check.Read(new float[check.Format.Channels], check.Format.Channels) == 0) throw new InvalidOperationException("The result has no sound in it.");
     }
 
     static void WriteTags(MediaTags tags, string output, string ext)
     {
         if (ext is "mp3" or "m4a" or "m4r" or "wma" or "flac") tags.WriteWithWindows(output);
+        if (ext == "flac") tags.WriteFlacPicture(output);
     }
 
     // ------------------------------------------------------------------ sources
@@ -48,24 +66,23 @@ internal static class AudioEngine
         if (ext is "aif" or "aiff" or "aifc") return new AiffSource(path);
         if (ext is "ogg" or "oga" or "opus")
         {
-            var (kind, channels) = SniffOgg(path);
-            if (kind == "opus") return new OpusSource(path, channels);
+            var kind = SniffOgg(path);
+            if (kind == "opus") return new OpusSource(path);
             if (kind == "vorbis") return new VorbisSource(path);
         }
         return new MfAudioSource(path);
     }
 
     /// <summary>Ogg is a container: the first page says whether it holds Vorbis, Opus or something else.</summary>
-    static (string? kind, int channels) SniffOgg(string path)
+    static string? SniffOgg(string path)
     {
         var head = new byte[512];
         int n;
         using (var f = File.OpenRead(path)) n = f.Read(head, 0, head.Length);
         var span = head.AsSpan(0, n);
-        int opus = span.IndexOf("OpusHead"u8);
-        if (opus >= 0 && opus + 9 < n) return ("opus", head[opus + 9]);
-        if (span.IndexOf("\u0001vorbis"u8) >= 0) return ("vorbis", 0);
-        return (null, 0);
+        if (span.IndexOf("OpusHead"u8) >= 0) return "opus";
+        if (span.IndexOf("\u0001vorbis"u8) >= 0) return "vorbis";
+        return null;
     }
 
     static MediaTags ReadTags(string path)
@@ -75,13 +92,12 @@ internal static class AudioEngine
             var ext = Path.GetExtension(path).TrimStart('.').ToLowerInvariant();
             if (ext is "ogg" or "oga" or "opus")
             {
-                using var source = Open(path);
-                if (source is VorbisSource v)
-                    return MediaTags.FromVorbisComments(v.Reader.Tags.All.SelectMany(kv => kv.Value.Select(value => new KeyValuePair<string, string>(kv.Key, value))));
-                if (source is OpusSource o && o.Tags != null)
-                    return MediaTags.FromVorbisComments(o.Tags.Fields);
+                var comments = Ogg.ReadComments(path);
+                if (comments.Count > 0) return MediaTags.FromVorbisComments(comments);
             }
-            return MediaTags.ReadWithWindows(path);
+            var tags = MediaTags.ReadWithWindows(path);
+            if (Formats.KindOf(path) == FormatKind.Video) tags.Cover = null; // that's a frame of the video, not cover art
+            return tags;
         }
         catch (Exception ex)
         {
@@ -104,6 +120,7 @@ internal static class AudioEngine
         {
             "mp3" => [32000, 44100, 48000],
             "m4a" or "m4r" or "aac" => [44100, 48000],
+            "opus" => [48000],
             "wma" => [44100], // Windows' WMA encoder only offers 44.1 kHz at good bitrates
             _ => null,
         };
@@ -118,17 +135,27 @@ internal static class AudioEngine
 
     // ------------------------------------------------------------------ sinks
 
-    static IAudioSink CreateSink(string path, string ext, AudioFormat format, int bits, MediaTags tags) => ext switch
+    static IAudioSink CreateSink(string path, string ext, IAudioSource chain, int bits, MediaTags tags)
     {
-        "wav" => new WavSink(path, format, bits),
+        var format = chain.Format;
+        int mask = format.Channels > 2 ? chain.ChannelMask : 0;
+        // FLAC ties each channel count to one layout (and Windows writes no note of any other).
+        if (ext == "flac" && mask != 0 && mask != Speakers.Default(format.Channels) && !(format.Channels == 6 && mask == 0x60F))
+            throw new NotSupportedException("This speaker layout needs FFmpeg.");
+        return CreateSink(path, ext, format, mask, bits, tags);
+    }
+
+    static IAudioSink CreateSink(string path, string ext, AudioFormat format, int mask, int bits, MediaTags tags) => ext switch
+    {
+        "wav" => new WavSink(path, format, bits, mask),
         "aiff" => new AiffSink(path, format, bits),
         "ogg" => new VorbisSink(path, format, tags),
-        "opus" => new OpusSink(path, format, tags),
+        "opus" => new OpusSink(path, format, format.SampleRate, tags),
         "mp3" => new MfAudioSink(path, MF.ContainerMP3, Mp3Type(format), format, 16),
         "m4a" or "m4r" => new MfAudioSink(path, MF.ContainerMPEG4, AacType(format), format, 16), // M4R is an iPhone ringtone: AAC in MP4
         "aac" => new MfAudioSink(path, MF.ContainerADTS, AacType(format), format, 16),
-        "wma" => new MfAudioSink(path, MF.ContainerASF, WmaType(format), format, 16),
-        "flac" => new MfAudioSink(path, MF.ContainerFLAC, FlacType(format, bits), format, bits),
+        "wma" => new MfAudioSink(path, MF.ContainerASF, WmaType(format), format, 16, tail: 2048),
+        "flac" => new MfAudioSink(path, MF.ContainerFLAC, FlacType(format, bits), format, bits, mask),
         _ => throw new NotSupportedException($"No built-in {ext} encoder."),
     };
 
@@ -215,6 +242,7 @@ internal static class AudioEngine
         try
         {
             MF.EnsureStarted();
+            MediaCheck.EnsureComplete(input);
             MF.MFCreateSourceReaderFromURL(input, null, out reader);
             reader.SetStreamSelection(MF.SourceReaderAllStreams, false);
             reader.SetStreamSelection(MF.SourceReaderFirstAudio, true);

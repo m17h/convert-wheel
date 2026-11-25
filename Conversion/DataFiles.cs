@@ -1,56 +1,80 @@
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
-using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using System.Xml;
 using System.Xml.Linq;
 using ConvertWheel.Conversion.Documents;
-using YamlDotNet.RepresentationModel;
-using YamlDotNet.Serialization;
+using YamlDotNet.Core;
+using YamlDotNet.Core.Events;
 
 namespace ConvertWheel.Conversion;
 
 /// <summary>
 /// Structured data: JSON, YAML and XML convert into each other, and a list of records becomes a
 /// spreadsheet (CSV, XLSX). Values are held as a neutral tree: ordered maps, lists and scalars.
+/// Numbers keep the digits they were written with, so long IDs and exact decimals survive.
 /// </summary>
-internal static class DataFiles
+internal static partial class DataFiles
 {
+    /// <summary>Far deeper than real data, and shallow enough that a hostile file can't exhaust the stack.</summary>
+    const int MaxDepth = 256;
+
     sealed class Map : List<KeyValuePair<string, object?>>
     {
-        public object? this[string key]
+        HashSet<string>? _keys;
+
+        /// <summary>Adds an entry; a repeated name gets a number ("name_2") so neither value is lost.</summary>
+        public void AddUnique(string key, object? value)
         {
-            get => this.FirstOrDefault(kv => kv.Key == key).Value;
-            set
-            {
-                int i = FindIndex(kv => kv.Key == key);
-                if (i >= 0) this[i] = new(key, value); else Add(new(key, value));
-            }
+            _keys ??= [.. this.Select(kv => kv.Key)];
+            var name = key;
+            for (int i = 2; !_keys.Add(name); i++) name = $"{key}_{i}";
+            Add(new(name, value));
         }
-        public bool Has(string key) => this.Any(kv => kv.Key == key);
     }
+
+    /// <summary>A number, as its JSON text.</summary>
+    sealed record Number(string Text);
 
     public static void Convert(string input, string output, string ext)
     {
-        var tree = Read(input);
-        Write(tree, output, ext, Path.GetFileNameWithoutExtension(input));
+        try
+        {
+            var tree = Read(input);
+            Write(tree, output, ext, Path.GetFileNameWithoutExtension(input));
+        }
+        catch (InsufficientExecutionStackException) { throw TooDeep(); }
+    }
+
+    static ConversionException TooDeep() => new("This file is nested too deeply.");
+
+    static void CheckDepth(int depth)
+    {
+        if (depth > MaxDepth) throw TooDeep();
+        RuntimeHelpers.EnsureSufficientExecutionStack();
     }
 
     static object? Read(string path)
     {
-        var text = TextDecoding.Decode(File.ReadAllBytes(path));
+        var ext = Path.GetExtension(path).ToLowerInvariant();
+        var bytes = File.ReadAllBytes(path);
         try
         {
-            return Path.GetExtension(path).ToLowerInvariant() switch
+            switch (ext)
             {
-                ".yaml" or ".yml" => FromYaml(text),
-                ".xml" => FromXml(XDocument.Parse(text)),
-                _ => FromJson(JsonNode.Parse(text, documentOptions: new JsonDocumentOptions { AllowTrailingCommas = true, CommentHandling = JsonCommentHandling.Skip })),
-            };
+                case ".yaml" or ".yml": return FromYaml(TextDecoding.Decode(bytes));
+                case ".xml": return FromXml(LoadXml(bytes));
+                default:
+                    var options = new JsonDocumentOptions { AllowTrailingCommas = true, CommentHandling = JsonCommentHandling.Skip, MaxDepth = MaxDepth };
+                    using (var json = JsonDocument.Parse(TextDecoding.Decode(bytes), options)) return FromJson(json.RootElement, 0);
+            }
         }
-        catch (Exception ex) when (ex is JsonException or XmlException or YamlDotNet.Core.YamlException)
+        catch (JsonException ex) when (ex.Message.Contains("maximum configured depth")) { throw TooDeep(); }
+        catch (Exception ex) when (ex is JsonException or XmlException or YamlException)
         {
-            throw new ConversionException($"This file isn't valid {Path.GetExtension(path).TrimStart('.').ToUpperInvariant()}: {ex.Message.Split('\n')[0]}");
+            throw new ConversionException($"This file isn't valid {ext.TrimStart('.').ToUpperInvariant()}: {ex.Message.Split('\n')[0]}");
         }
     }
 
@@ -59,18 +83,21 @@ internal static class DataFiles
         switch (ext)
         {
             case "json":
-                File.WriteAllText(output, ToJson(tree)?.ToJsonString(new JsonSerializerOptions { WriteIndented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping }) ?? "null", new UTF8Encoding(false));
+                using (var file = File.Create(output))
+                using (var writer = JsonWriter(file, indented: true))
+                    ToJson(writer, tree, 0);
                 break;
             case "yaml":
-                var yaml = new SerializerBuilder().WithQuotingNecessaryStrings().Build().Serialize(ToPlain(tree));
-                File.WriteAllText(output, yaml, new UTF8Encoding(false));
+                using (var text = new StreamWriter(output, false, new UTF8Encoding(false)))
+                    ToYaml(tree, text);
                 break;
             case "xml":
-                var root = tree is Map { Count: 1 } single && single[0].Value is not List<object?> ? ToXml(single[0].Key, single[0].Value) : ToXml("root", tree);
+                bool named = tree is Map { Count: 1 } one && one[0].Value is not List<object?> && one[0].Key != "#text" && !one[0].Key.StartsWith('@');
+                var root = named ? ToXml(((Map)tree!)[0].Key, ((Map)tree)[0].Value, 0) : ToXml("root", tree, 0);
                 new XDocument(new XDeclaration("1.0", "utf-8", null), root).Save(output);
                 break;
             case "csv" or "xlsx" or "tsv" or "ods":
-                Spreadsheets.Write([ToSheet(tree, title)], output, ext, title);
+                Spreadsheets.Write([ToSheet(tree, title, asText: ext is "csv" or "tsv")], output, ext, title);
                 break;
             default:
                 throw new ConversionException($"Data can't be saved as {ext.ToUpperInvariant()}.");
@@ -79,137 +106,390 @@ internal static class DataFiles
 
     // ------------------------------------------------------------------ JSON
 
-    static object? FromJson(JsonNode? node) => node switch
+    static object? FromJson(JsonElement e, int depth)
     {
-        null => null,
-        JsonObject o => Collect(o.Select(kv => new KeyValuePair<string, object?>(kv.Key, FromJson(kv.Value)))),
-        JsonArray a => a.Select(FromJson).ToList(),
-        JsonValue v when v.TryGetValue<bool>(out var b) => b,
-        JsonValue v when v.TryGetValue<long>(out var l) => l,
-        JsonValue v when v.TryGetValue<double>(out var d) => d,
-        _ => node.ToString(),
-    };
-
-    static Map Collect(IEnumerable<KeyValuePair<string, object?>> items)
-    {
-        var map = new Map();
-        map.AddRange(items);
-        return map;
+        CheckDepth(depth);
+        switch (e.ValueKind)
+        {
+            case JsonValueKind.Object:
+                var map = new Map();
+                foreach (var p in e.EnumerateObject()) map.AddUnique(JsonName(p), FromJson(p.Value, depth + 1));
+                return map;
+            case JsonValueKind.Array:
+                var list = new List<object?>(e.GetArrayLength());
+                foreach (var item in e.EnumerateArray()) list.Add(FromJson(item, depth + 1));
+                return list;
+            case JsonValueKind.String:
+                try { return e.GetString(); }
+                catch (InvalidOperationException) { return Unescape(e.GetRawText()); }
+            case JsonValueKind.Number: return new Number(e.GetRawText());
+            case JsonValueKind.True: return true;
+            case JsonValueKind.False: return false;
+            default: return null;
+        }
     }
 
-    static JsonNode? ToJson(object? value) => value switch
+    static string JsonName(JsonProperty p)
     {
-        null => null,
-        Map m => new JsonObject(m.Select(kv => new KeyValuePair<string, JsonNode?>(kv.Key, ToJson(kv.Value)))),
-        List<object?> l => new JsonArray(l.Select(ToJson).ToArray()),
-        bool b => JsonValue.Create(b),
-        long l => JsonValue.Create(l),
-        double d => JsonValue.Create(d),
-        DateTime dt => JsonValue.Create(dt.ToString("s", CultureInfo.InvariantCulture)),
-        _ => JsonValue.Create(System.Convert.ToString(value, CultureInfo.InvariantCulture)),
-    };
+        try { return p.Name; }
+        catch (InvalidOperationException) { return Unescape(p.ToString().Split("\":")[0] + "\""); }
+    }
+
+    /// <summary>A JSON string with a broken surrogate escape: the bad character becomes U+FFFD, the rest stays.</summary>
+    static string Unescape(string raw)
+    {
+        var sb = new StringBuilder();
+        for (int i = 1; i < raw.Length - 1; i++)
+        {
+            if (raw[i] != '\\' || i + 1 >= raw.Length - 1) { sb.Append(raw[i]); continue; }
+            char c = raw[++i];
+            if (c == 'u' && i + 4 < raw.Length) { sb.Append((char)int.Parse(raw.AsSpan(i + 1, 4), NumberStyles.HexNumber)); i += 4; }
+            else sb.Append(c switch { 'n' => '\n', 'r' => '\r', 't' => '\t', 'b' => '\b', 'f' => '\f', _ => c });
+        }
+        // Going through UTF-8 replaces unpaired surrogates.
+        return Encoding.UTF8.GetString(Encoding.UTF8.GetBytes(sb.ToString()));
+    }
+
+    static Utf8JsonWriter JsonWriter(Stream stream, bool indented) => new(stream, new JsonWriterOptions
+    {
+        Indented = indented, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping, MaxDepth = MaxDepth * 2,
+    });
+
+    static void ToJson(Utf8JsonWriter w, object? value, int depth)
+    {
+        CheckDepth(depth);
+        switch (value)
+        {
+            case null: w.WriteNullValue(); break;
+            case Map m:
+                w.WriteStartObject();
+                foreach (var (key, child) in m)
+                {
+                    w.WritePropertyName(key);
+                    ToJson(w, child, depth + 1);
+                }
+                w.WriteEndObject();
+                break;
+            case List<object?> l:
+                w.WriteStartArray();
+                foreach (var item in l) ToJson(w, item, depth + 1);
+                w.WriteEndArray();
+                break;
+            case bool b: w.WriteBooleanValue(b); break;
+            case Number n: w.WriteRawValue(n.Text); break;
+            default: w.WriteStringValue(AsText(value)); break;
+        }
+    }
+
+    static string JsonText(object? value)
+    {
+        using var ms = new MemoryStream();
+        using (var w = JsonWriter(ms, indented: false)) ToJson(w, value, 0);
+        return Encoding.UTF8.GetString(ms.ToArray());
+    }
+
+    [GeneratedRegex(@"^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][-+]?[0-9]+)?\z")]
+    private static partial Regex JsonNumber();
 
     // ------------------------------------------------------------------ YAML
 
+    /// <summary>
+    /// Reads YAML events directly: anchors are shared rather than copied, so a file can't blow up in memory,
+    /// and the size it would expand to when written out is limited.
+    /// </summary>
+    sealed class YamlReader(string text)
+    {
+        const long MaxExpansion = 5_000_000;
+        static readonly object Unfinished = new();
+
+        readonly Parser _parser = new(new StringReader(text));
+        readonly Dictionary<AnchorName, (object? value, long size)> _anchors = [];
+        long _aliased;
+
+        public List<object?> Documents()
+        {
+            var docs = new List<object?>();
+            while (_parser.MoveNext())
+            {
+                if (_parser.Current is not DocumentStart) continue;
+                _anchors.Clear();
+                _parser.MoveNext();
+                docs.Add(Node(0, out _)); // ends on the DocumentEnd
+            }
+            return docs;
+        }
+
+        /// <summary>The node at the current event, leaving the parser on the event after it.</summary>
+        object? Node(int depth, out long size)
+        {
+            CheckDepth(depth);
+            size = 1;
+            switch (_parser.Current)
+            {
+                case AnchorAlias alias:
+                    if (!_anchors.TryGetValue(alias.Value, out var target)) throw new YamlException($"Line {alias.Start.Line}: unknown anchor '{alias.Value}'.");
+                    if (ReferenceEquals(target.value, Unfinished)) throw new ConversionException("This YAML refers back to itself, so it can't be converted.");
+                    size = target.size;
+                    if ((_aliased += size) > MaxExpansion) throw new ConversionException("This YAML repeats its anchors so often that it would expand to an enormous file.");
+                    _parser.MoveNext();
+                    return target.value;
+
+                case Scalar s:
+                    size += s.Value.Length / 16;
+                    var value = Resolve(s);
+                    Remember(s.Anchor, value, size);
+                    _parser.MoveNext();
+                    return value;
+
+                case SequenceStart start:
+                    Remember(start.Anchor, Unfinished, 0);
+                    _parser.MoveNext();
+                    var list = new List<object?>();
+                    while (_parser.Current is not SequenceEnd)
+                    {
+                        list.Add(Node(depth + 1, out long item));
+                        size += item;
+                    }
+                    _parser.MoveNext();
+                    Remember(start.Anchor, list, size);
+                    return list;
+
+                case MappingStart start:
+                    Remember(start.Anchor, Unfinished, 0);
+                    _parser.MoveNext();
+                    var map = new Map();
+                    var keys = new HashSet<string>();
+                    var merged = new List<object?>();
+                    while (_parser.Current is not MappingEnd)
+                    {
+                        var keyEvent = _parser.Current!;
+                        bool merge = keyEvent is Scalar { Value: "<<", Style: ScalarStyle.Plain };
+                        var keyNode = Node(depth + 1, out _);
+                        if (keyNode is Map or List<object?>) throw new ConversionException("YAML table keys must be simple values.");
+                        var key = keyEvent is Scalar name ? name.Value : AsText(keyNode); // as written: 1, true and 0x1F stay that way
+                        var child = Node(depth + 1, out long item);
+                        size += item + 1;
+                        if (merge && (child is Map || child is List<object?> l && l.All(i => i is Map))) merged.Add(child);
+                        else if (!keys.Add(key)) throw new YamlException($"Line {keyEvent.Start.Line}: the key '{key}' appears twice.");
+                        else map.Add(new(key, child));
+                    }
+                    _parser.MoveNext();
+                    // "<<: *base" pulls in the base's entries, except those given here (YAML's merge key).
+                    foreach (var source in merged.SelectMany(m => m is List<object?> many ? many : [m]))
+                        foreach (var entry in (Map)source!)
+                            if (keys.Add(entry.Key)) map.Add(entry);
+                    Remember(start.Anchor, map, size);
+                    return map;
+
+                default:
+                    throw new YamlException("The file ends unexpectedly.");
+            }
+        }
+
+        void Remember(AnchorName anchor, object? value, long size)
+        {
+            if (!anchor.IsEmpty) _anchors[anchor] = (value, size);
+        }
+
+        static object? Resolve(Scalar s)
+        {
+            if (!s.Tag.IsEmpty)
+            {
+                // An explicit type wins over how the text looks: "!!str 00123" is text, "!!int '5'" is a number.
+                return s.Tag.Value switch
+                {
+                    "tag:yaml.org,2002:null" => null,
+                    "tag:yaml.org,2002:bool" or "tag:yaml.org,2002:int" or "tag:yaml.org,2002:float" => Infer(s.Value),
+                    _ => s.Value,
+                };
+            }
+            return s.Style is ScalarStyle.Plain ? Infer(s.Value) : s.Value;
+        }
+    }
+
     static object? FromYaml(string text)
     {
-        var stream = new YamlStream();
-        stream.Load(new StringReader(text));
-        var docs = stream.Documents.Select(d => FromYaml(d.RootNode)).ToList();
+        var docs = new YamlReader(text).Documents();
         return docs.Count switch { 0 => null, 1 => docs[0], _ => docs };
     }
 
-    static object? FromYaml(YamlNode node) => FromYaml(node, new HashSet<YamlNode>(ReferenceEqualityComparer.Instance));
-
-    static object? FromYaml(YamlNode node, HashSet<YamlNode> ancestors)
+    /// <summary>
+    /// Unquoted YAML: numbers, true/false and null become typed values. Text that would lose something as a
+    /// number stays text: leading zeros, a plus sign, hex/octal, dates, infinity and NaN.
+    /// </summary>
+    static object? Infer(string value)
     {
-        if (ancestors.Count >= 128 || !ancestors.Add(node))
-            throw new ConversionException("This YAML contains a cycle or is nested too deeply.");
-        try
+        switch (value)
         {
-            return node switch
-            {
-                YamlMappingNode m => Collect(m.Children.Select(kv => new KeyValuePair<string, object?>(
-                    kv.Key is YamlScalarNode key ? key.Value ?? "" : throw new ConversionException("YAML table keys must be scalar values."), FromYaml(kv.Value, ancestors)))),
-                YamlSequenceNode s => s.Children.Select(n => FromYaml(n, ancestors)).ToList(),
-                YamlScalarNode s when s.Style is YamlDotNet.Core.ScalarStyle.Plain => Infer(s.Value),
-                YamlScalarNode s => s.Value,
-                _ => null,
-            };
+            case "" or "~" or "null" or "Null" or "NULL": return null;
+            case "true" or "True" or "TRUE": return true;
+            case "false" or "False" or "FALSE": return false;
         }
-        finally { ancestors.Remove(node); }
+        if (JsonNumber().IsMatch(value)) return new Number(value);
+        // ".5" and "5." are YAML numbers that JSON spells differently.
+        var m = LooseFloat().Match(value);
+        if (!m.Success) return value;
+        string Part(string group) => m.Groups[group].Length > 0 ? m.Groups[group].Value : "0";
+        return new Number($"{m.Groups["sign"].Value}{Part("int")}.{Part("frac")}{m.Groups["exp"].Value}");
     }
 
-    /// <summary>Unquoted scalars: numbers, booleans and null become typed values.</summary>
-    static object? Infer(string? value)
+    [GeneratedRegex(@"^(?<sign>-?)(?:(?<int>0|[1-9][0-9]*)\.|\.(?<frac>[0-9]+))(?<exp>([eE][-+]?[0-9]+)?)\z")]
+    private static partial Regex LooseFloat();
+
+    /// <summary>Text that some YAML reader (1.1 or 1.2) would take for another type unless it's quoted.</summary>
+    [GeneratedRegex(@"^(|~|null|y|n|yes|no|on|off|true|false|=|<<|---.*|\.\.\..*|[-+]?\.(inf|nan)|[-+]?(0x[0-9a-f_]*|0o[0-7_]*|0b[01_]*)|[-+]?[0-9][0-9_,]*(:[0-9_]+)*(\.[0-9_]*)?(e[-+]?[0-9]*)?|[-+]?\.[0-9_]+(e[-+]?[0-9]*)?|[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}.*)\z", RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.CultureInvariant)]
+    private static partial Regex AmbiguousInYaml();
+
+    /// <summary>Text with no YAML punctuation in a place where it could mean something.</summary>
+    [GeneratedRegex(@"^[\p{L}\p{N}_/.($](?:[\p{L}\p{N}\p{M} _/.,;()$%+=<>~^!?@'|-]|(?<=\S):(?=[\p{L}\p{N}/]))*(?<! )\z")]
+    private static partial Regex PlainInYaml();
+
+    static void ToYaml(object? tree, TextWriter output)
     {
-        if (value is null or "" or "~" or "null" or "Null" or "NULL") return null;
-        if (value is "true" or "True" or "TRUE") return true;
-        if (value is "false" or "False" or "FALSE") return false;
-        if (long.TryParse(value, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out var l) && !(value.Length > 1 && value.TrimStart('-')[0] == '0')) return l;
-        if (double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var d) && value.Any(char.IsDigit)) return d;
-        return value;
+        var emitter = new Emitter(output);
+        emitter.Emit(new StreamStart());
+        emitter.Emit(new DocumentStart(null, null, true));
+        ToYaml(emitter, tree, 0);
+        emitter.Emit(new DocumentEnd(true));
+        emitter.Emit(new StreamEnd());
     }
 
-    /// <summary>Plain .NET collections for the YAML serializer.</summary>
-    static object? ToPlain(object? value) => value switch
+    static void ToYaml(Emitter emitter, object? value, int depth)
     {
-        Map m => m.ToDictionary(kv => kv.Key, kv => ToPlain(kv.Value)),
-        List<object?> l => l.Select(ToPlain).ToList(),
-        _ => value,
-    };
+        CheckDepth(depth);
+        switch (value)
+        {
+            case Map m:
+                emitter.Emit(new MappingStart(AnchorName.Empty, TagName.Empty, true, m.Count == 0 ? MappingStyle.Flow : MappingStyle.Block));
+                foreach (var (key, child) in m)
+                {
+                    EmitText(emitter, key, isKey: true);
+                    ToYaml(emitter, child, depth + 1);
+                }
+                emitter.Emit(new MappingEnd());
+                break;
+            case List<object?> l:
+                emitter.Emit(new SequenceStart(AnchorName.Empty, TagName.Empty, true, l.Count == 0 ? SequenceStyle.Flow : SequenceStyle.Block));
+                foreach (var item in l) ToYaml(emitter, item, depth + 1);
+                emitter.Emit(new SequenceEnd());
+                break;
+            case null or bool or Number:
+                emitter.Emit(new Scalar(AnchorName.Empty, TagName.Empty, value is null ? "null" : AsText(value), ScalarStyle.Plain, true, false));
+                break;
+            default:
+                EmitText(emitter, AsText(value), isKey: false);
+                break;
+        }
+    }
+
+    static void EmitText(Emitter emitter, string text, bool isKey)
+    {
+        ScalarStyle style;
+        // Anything a block scalar or plain text can't hold exactly goes in double quotes, with escapes.
+        if (text.Any(c => c != '\n' && (char.IsControl(c) || char.IsSurrogate(c) || (int)c is 0xFEFF or 0x2028 or 0x2029 or 0xFFFE or 0xFFFF)))
+            style = ScalarStyle.DoubleQuoted;
+        else if (text.Contains('\n'))
+            style = isKey || text[0] is '\n' or ' ' || text.Split('\n').Any(l => l.EndsWith(' ')) ? ScalarStyle.DoubleQuoted : ScalarStyle.Literal;
+        else
+            style = PlainInYaml().IsMatch(text) && !AmbiguousInYaml().IsMatch(text) ? ScalarStyle.Plain : ScalarStyle.SingleQuoted;
+        emitter.Emit(new Scalar(AnchorName.Empty, TagName.Empty, text, style, true, true));
+    }
 
     // ------------------------------------------------------------------ XML
 
-    /// <summary>Elements become maps; attributes become "@name"; repeated child names become lists.</summary>
-    static object? FromXml(XDocument doc) => doc.Root == null ? null : Collect([new(doc.Root.Name.LocalName, FromXml(doc.Root))]);
-
-    static object? FromXml(XElement e)
+    /// <summary>Follows the encoding the file declares. Entities only come from the file itself, within limits.</summary>
+    static XDocument LoadXml(byte[] bytes)
     {
-        bool hasChildren = e.Elements().Any();
-        if (!e.HasAttributes && !hasChildren) return Infer(e.Value);
+        TextDecoding.EnsureRegistered();
+        var settings = new XmlReaderSettings { DtdProcessing = DtdProcessing.Parse, XmlResolver = null, MaxCharactersFromEntities = 10_000_000, IgnoreWhitespace = true };
+        try { return Load(() => XmlReader.Create(new MemoryStream(bytes), settings)); }
+        catch (XmlException)
+        {
+            // The declared encoding can be wrong (a UTF-16 label on a UTF-8 file): go by the bytes.
+            var text = TextDecoding.Decode(bytes);
+            return Load(() => XmlReader.Create(new StringReader(text), settings));
+        }
+
+        static XDocument Load(Func<XmlReader> open)
+        {
+            // Building the tree gets very slow for absurd nesting, so look before loading.
+            using (var scan = open())
+                while (scan.Read()) CheckDepth(scan.Depth);
+            using var reader = open();
+            return XDocument.Load(reader);
+        }
+    }
+
+    /// <summary>Elements become maps; attributes become "@name"; repeated child names become lists.</summary>
+    static object? FromXml(XDocument doc) => doc.Root == null ? null : new Map { new(doc.Root.Name.LocalName, FromXml(doc.Root, 0)) };
+
+    static object? FromXml(XElement e, int depth)
+    {
+        CheckDepth(depth);
+        var attributes = e.Attributes().Where(a => !a.IsNamespaceDeclaration).ToList();
+        if (attributes.Count == 0 && !e.HasElements) return InferXml(e.Value);
         var map = new Map();
-        foreach (var a in e.Attributes().Where(a => !a.IsNamespaceDeclaration)) map.Add(new("@" + a.Name.LocalName, Infer(a.Value)));
+        foreach (var a in attributes) map.AddUnique("@" + a.Name.LocalName, InferXml(a.Value) ?? "");
         foreach (var group in e.Elements().GroupBy(c => c.Name.LocalName))
         {
-            var items = group.Select(FromXml).ToList();
-            map.Add(new(group.Key, items.Count == 1 ? items[0] : items));
+            var items = group.Select(c => FromXml(c, depth + 1)).ToList();
+            map.AddUnique(group.Key, items.Count == 1 ? items[0] : items);
         }
         var text = string.Concat(e.Nodes().OfType<XText>().Select(t => t.Value)).Trim();
-        if (text.Length > 0) map.Add(new("#text", Infer(text)));
+        if (text.Length > 0) map.AddUnique("#text", InferXml(text));
         return map;
     }
 
-    static XElement ToXml(string name, object? value)
+    /// <summary>
+    /// XML has no types, so only what's clearly a number or true/false becomes one. Anything over 15 digits is
+    /// an ID rather than a quantity, and stays text.
+    /// </summary>
+    static object? InferXml(string value) => value switch
     {
+        "" => null,
+        "true" => true,
+        "false" => false,
+        _ => XmlNumber().IsMatch(value) ? new Number(value) : value,
+    };
+
+    [GeneratedRegex(@"^-?(0|[1-9][0-9]{0,14})(\.[0-9]+)?([eE][-+][0-9]{1,2})?\z")]
+    private static partial Regex XmlNumber();
+
+    static XElement ToXml(string name, object? value, int depth)
+    {
+        CheckDepth(depth);
         var element = new XElement(XmlName(name));
         switch (value)
         {
             case Map m:
                 foreach (var (key, child) in m)
                 {
-                    if (key.StartsWith('@') && child is not (Map or List<object?>)) element.SetAttributeValue(XmlName(key[1..]), Scalar(child));
-                    else if (key == "#text") element.Add(Scalar(child));
-                    else if (child is List<object?> list) foreach (var item in list) element.Add(ToXml(key, item));
-                    else element.Add(ToXml(key, child));
+                    bool simple = child is not (Map or List<object?>);
+                    if (simple && key.Length > 1 && key[0] == '@' && XmlName(key[1..]) is var attribute && attribute != "xmlns" && element.Attribute(attribute) == null)
+                        element.SetAttributeValue(attribute, SafeXml.Text(AsText(child)));
+                    else if (simple && key == "#text") element.Add(SafeXml.Text(AsText(child)));
+                    else if (child is List<object?> { Count: > 0 } list) foreach (var item in list) element.Add(ToXml(key, item, depth + 1));
+                    else element.Add(ToXml(key, child, depth + 1));
                 }
                 break;
             case List<object?> l:
-                foreach (var item in l) element.Add(ToXml("item", item));
+                foreach (var item in l) element.Add(ToXml("item", item, depth + 1));
                 break;
             case null:
                 break;
             default:
-                element.Value = Scalar(value);
+                element.Value = SafeXml.Text(AsText(value));
                 break;
         }
         return element;
     }
 
-    static string Scalar(object? v) => v switch
+    static string AsText(object? v) => v switch
     {
         null => "",
         bool b => b ? "true" : "false",
+        Number n => n.Text,
+        DateTime dt => dt.ToString(dt.TimeOfDay == TimeSpan.Zero ? "yyyy-MM-dd" : "s", CultureInfo.InvariantCulture),
         IFormattable f => f.ToString(null, CultureInfo.InvariantCulture),
         _ => v.ToString() ?? "",
     };
@@ -217,56 +497,92 @@ internal static class DataFiles
     static string XmlName(string name)
     {
         var sb = new StringBuilder();
-        foreach (var c in name) sb.Append(char.IsLetterOrDigit(c) || c is '_' or '-' or '.' ? c : '_');
-        if (sb.Length == 0 || !(char.IsLetter(sb[0]) || sb[0] == '_')) sb.Insert(0, '_');
+        foreach (var c in name) sb.Append(XmlConvert.IsNCNameChar(c) ? c : '_');
+        if (sb.Length == 0 || !XmlConvert.IsStartNCNameChar(sb[0])) sb.Insert(0, '_');
         return sb.ToString();
     }
 
     // ------------------------------------------------------------------ tables
 
     /// <summary>The first list of records in the data, flattened into columns ("address.city").</summary>
-    static Sheet ToSheet(object? tree, string title)
+    /// <param name="asText">Plain-text tables keep every number exactly as written.</param>
+    static Sheet ToSheet(object? tree, string title, bool asText)
     {
-        var records = FindRecords(tree) ?? throw new ConversionException("This data has no list of records to turn into a table.");
-        var rows = records.Select(r => Flatten(r)).ToList();
-        var columns = rows.SelectMany(r => r.Select(kv => kv.Key)).Distinct().ToList();
-        var table = new List<object?[]> { columns.Cast<object?>().ToArray() };
+        var records = FindRecords(tree, 0) ?? FindValues(tree, 0) ?? (tree is Map { Count: > 0 } ? new List<object?> { tree } : null)
+            ?? throw new ConversionException("This data has no list of records to turn into a table.");
+        var rows = new List<Map>();
+        var columns = new Dictionary<string, int>();
+        foreach (var record in records)
+        {
+            var row = new Map();
+            Flatten(row, record, "", 0);
+            rows.Add(row);
+            foreach (var (key, _) in row) columns.TryAdd(key, columns.Count);
+        }
+        var table = new List<object?[]> { columns.Keys.Cast<object?>().ToArray() };
         foreach (var row in rows)
-            table.Add(columns.Select(c => row.FirstOrDefault(kv => kv.Key == c).Value).ToArray());
+        {
+            var cells = new object?[columns.Count];
+            foreach (var (key, value) in row) cells[columns[key]] = value is Number n ? (asText ? n.Text : Cell(n)) : value;
+            table.Add(cells);
+        }
         return new Sheet(title, table);
     }
 
-    static List<object?>? FindRecords(object? node) => node switch
+    /// <summary>Spreadsheets hold 15 digits: numbers that would be rounded (long IDs, exact decimals) go in as text.</summary>
+    static object Cell(Number n)
     {
-        List<object?> l when l.Count > 0 && l.All(i => i is Map or null) => l,
-        List<object?> l when l.Count > 0 && l.All(i => i is not (Map or List<object?>)) => l.Select(i => (object?)Collect([new("value", i)])).ToList(),
-        Map m => m.Select(kv => FindRecords(kv.Value)).FirstOrDefault(r => r != null) ?? (m.Count > 0 ? [m] : null),
-        _ => null,
-    };
-
-    static List<KeyValuePair<string, object?>> Flatten(object? value, string prefix = "")
-    {
-        var result = new List<KeyValuePair<string, object?>>();
-        if (value is Map m)
-            foreach (var (key, child) in m) result.AddRange(Flatten(child, prefix.Length > 0 ? $"{prefix}.{key}" : key));
-        else if (value is List<object?> l)
-            result.Add(new(prefix, string.Join("; ", l.Select(i => i is Map or List<object?> ? ToJson(i)?.ToJsonString() : Scalar(i)))));
-        else
-            result.Add(new(prefix.Length > 0 ? prefix : "value", value is long n ? (double)n : value));
-        return result;
+        if (!double.TryParse(n.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out var d) || !double.IsFinite(d)) return n.Text;
+        var (digits, exponent) = Digits(n.Text);
+        if (digits.Length == 0) return d;
+        if (digits.Length > 15 && exponent >= 0) return n.Text;
+        return (digits, exponent) == Digits(d.ToString("R", CultureInfo.InvariantCulture)) ? d : n.Text;
     }
 
-    /// <summary>Spreadsheet to JSON: the first row names the fields; several sheets become an object of tables.</summary>
-    public static void FromSheets(List<Sheet> sheets, string output)
+    /// <summary>The significant digits and power of ten of a number's text, so different spellings can be compared.</summary>
+    static (string digits, long exponent) Digits(string text)
     {
-        object? Records(Sheet sheet)
+        int e = text.IndexOfAny(['e', 'E']);
+        long exponent = e < 0 ? 0 : long.TryParse(text.AsSpan(e + 1), NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out var x) ? x : int.MaxValue;
+        var mantissa = (e < 0 ? text : text[..e]).TrimStart('-', '+');
+        int dot = mantissa.IndexOf('.');
+        if (dot >= 0) exponent -= mantissa.Length - dot - 1;
+        var digits = mantissa.Replace(".", "").TrimStart('0');
+        var trimmed = digits.TrimEnd('0');
+        return (trimmed, exponent + digits.Length - trimmed.Length);
+    }
+
+    static List<object?>? FindRecords(object? node, int depth)
+    {
+        CheckDepth(depth);
+        return node switch
         {
-            if (sheet.Rows.Count == 0) return new List<object?>();
-            var headers = sheet.Rows[0].Select((h, i) => h?.ToString() is { Length: > 0 } s ? s : $"column{i + 1}").ToArray();
-            return sheet.Rows.Skip(1).Select(row => (object?)Collect(headers.Select((h, i) =>
-                new KeyValuePair<string, object?>(h, i < row.Length ? row[i] is double d && d == Math.Floor(d) && Math.Abs(d) < 1e15 ? (long)d : row[i] : null)))).ToList();
-        }
-        object? tree = sheets.Count == 1 ? Records(sheets[0]) : Collect(sheets.Select(s => new KeyValuePair<string, object?>(s.Name, Records(s))));
-        Write(tree, output, "json", "");
+            List<object?> { Count: > 0 } l when l.All(i => i is Map or null) => l,
+            Map m => m.Select(kv => FindRecords(kv.Value, depth + 1)).FirstOrDefault(r => r != null),
+            _ => null,
+        };
+    }
+
+    /// <summary>Data that's just one list of plain values becomes a single column.</summary>
+    static List<object?>? FindValues(object? node, int depth)
+    {
+        CheckDepth(depth);
+        return node switch
+        {
+            List<object?> { Count: > 0 } l when l.All(i => i is not (Map or List<object?>)) => l.Select(i => (object?)new Map { new("value", i) }).ToList(),
+            Map { Count: 1 } m => FindValues(m[0].Value, depth + 1),
+            _ => null,
+        };
+    }
+
+    static void Flatten(Map row, object? value, string prefix, int depth)
+    {
+        CheckDepth(depth);
+        if (value is Map { Count: > 0 } m)
+            foreach (var (key, child) in m) Flatten(row, child, prefix.Length > 0 ? $"{prefix}.{key}" : key, depth + 1);
+        else if (value is List<object?> l)
+            row.AddUnique(prefix, string.Join("; ", l.Select(i => i is Map or List<object?> ? JsonText(i) : AsText(i))));
+        else if (prefix.Length > 0) row.AddUnique(prefix, value is Map ? null : value);
+        else if (value is not (null or Map)) row.AddUnique("value", value);
     }
 }

@@ -52,15 +52,11 @@ internal sealed partial class WordBinaryReader
 
     WordBinaryReader(byte[] word, byte[] table, byte[] data, CompoundFile? file = null) => (_word, _table, _data, _file) = (word, table, data, file);
 
-    public static DDocument Read(string path)
+    public static DDocument Read(string path) => DocumentFiles.Open(path, DocumentShape.WordOld, () => ReadDoc(path));
+
+    internal static DDocument ReadDoc(string path)
     {
         var bytes = File.ReadAllBytes(path);
-        // Plenty of ".doc" files are really RTF, HTML or DOCX saved under the old name.
-        var head = Encoding.ASCII.GetString(bytes, 0, Math.Min(bytes.Length, 512)).TrimStart('﻿', ' ', '\r', '\n', '\t');
-        if (head.StartsWith(@"{\rtf")) return RichText.Read(path);
-        if (bytes.Length > 4 && bytes[0] == 'P' && bytes[1] == 'K') return DocxReader.Read(path);
-        if (head.StartsWith("<", StringComparison.Ordinal) && head.Contains("html", StringComparison.OrdinalIgnoreCase)) return HtmlReader.ReadHtml(path);
-
         var cfb = new CompoundFile(bytes);
         var word = cfb.Stream("WordDocument") ?? throw new ConversionException("This isn't a Word document.");
         if (word.Length < 0x200 || BinaryPrimitives.ReadUInt16LittleEndian(word) is not (0xA5EC or 0xA5DC)) throw new ConversionException("This isn't a Word document.");
@@ -74,7 +70,7 @@ internal sealed partial class WordBinaryReader
             {
                 return new WordBinaryReader(word, word, word, cfb) { _word6 = true }.Build(Path.GetFileNameWithoutExtension(path));
             }
-            catch (Exception ex) when (ex is IndexOutOfRangeException or ArgumentOutOfRangeException or ArgumentException or ConversionException)
+            catch (Exception ex) when (ex is IndexOutOfRangeException or ArgumentException or OverflowException or ConversionException)
             {
                 Log.Write($"Word 6 reader fell back to plain text: {ex.Message}");
                 return ReadWord6(word, Path.GetFileNameWithoutExtension(path));
@@ -86,8 +82,9 @@ internal sealed partial class WordBinaryReader
         {
             return new WordBinaryReader(word, table, data, cfb).Build(Path.GetFileNameWithoutExtension(path));
         }
-        catch (Exception ex) when (ex is IndexOutOfRangeException or ArgumentOutOfRangeException or ArgumentException)
+        catch (Exception ex) when (ex is IndexOutOfRangeException or ArgumentException or OverflowException)
         {
+            Log.Write(ex);
             throw new ConversionException("This Word document is damaged or uses features that can't be read.");
         }
     }
@@ -159,14 +156,15 @@ internal sealed partial class WordBinaryReader
         _fcLcbOffset = rgLw + cslw * 4 + 2;
 
         ReadPieces();
-        ReadFkps(FcLcb(12), chars: true);
-        ReadFkps(FcLcb(13), chars: false);
-        ReadFonts(FcLcb(15));
-        ReadStyles(FcLcb(1));
-        ReadLists(FcLcb(73), FcLcb(74));
+        // Only the text has to be intact; formatting that's damaged is left out.
+        Try("character formatting", () => ReadFkps(FcLcb(12), chars: true));
+        Try("paragraph formatting", () => ReadFkps(FcLcb(13), chars: false));
+        Try("fonts", () => ReadFonts(FcLcb(15)));
+        Try("styles", () => ReadStyles(FcLcb(1)));
+        Try("lists", () => ReadLists(FcLcb(73), FcLcb(74)));
 
         var doc = new DDocument { Title = title };
-        ReadPageSetup(FcLcb(6), doc);
+        Try("page setup", () => ReadPageSetup(FcLcb(6), doc));
         if (_styles.Values.FirstOrDefault(s => s.sti == 0) is { chpx: { } normal })
         {
             var baseChars = new CharProps();
@@ -180,12 +178,23 @@ internal sealed partial class WordBinaryReader
         int footnoteStory = _ccpText, headerStory = footnoteStory + _ccpFtn, endnoteStory = headerStory + _ccpHdd + _ccpAtn;
         _textboxStory = endnoteStory + _ccpEdn;
         ReadDrawings();
-        var notes = ReadNotes(FcLcb(2), FcLcb(3), footnoteStory, _ccpFtn, endnote: false);
-        foreach (var (cp, note) in ReadNotes(FcLcb(46), FcLcb(47), endnoteStory, _ccpEdn, endnote: true)) notes[cp] = note;
-        ReadHeaders(doc, headerStory);
+        var notes = new Dictionary<int, (List<DBlock> blocks, bool endnote)>();
+        Try("footnotes", () => ReadNotes(FcLcb(2), FcLcb(3), footnoteStory, _ccpFtn, endnote: false, notes));
+        Try("endnotes", () => ReadNotes(FcLcb(46), FcLcb(47), endnoteStory, _ccpEdn, endnote: true, notes));
+        Try("headers", () => ReadHeaders(doc, headerStory));
         ReadStory(0, _ccpText, doc.Blocks, notes);
+        DocumentLimits.Finish(doc);
         doc.NormalizeDefaults();
         return doc;
+    }
+
+    static void Try(string what, Action read)
+    {
+        try { read(); }
+        catch (Exception ex) when (ex is IndexOutOfRangeException or ArgumentException or OverflowException or ConversionException)
+        {
+            Log.Write($"Skipped the {what} of a Word document: {ex.Message}");
+        }
     }
 
     int _ccpHdd, _ccpAtn, _ccpEdn, _textboxStory;
@@ -349,16 +358,24 @@ internal sealed partial class WordBinaryReader
         }
     }
 
+    int _styleDepth;
+
     void ApplyChar(CharProps c, byte[] grpprl)
     {
         foreach (var (sprm, at, size) in Sprms(grpprl))
         {
+            if (size == 0) continue;
             byte b = grpprl[at];
             bool Toggle(bool current) => b switch { 0 => false, 1 => true, 0x81 => !current, _ => current };
             switch (sprm)
             {
                 case 0x4A41: c.Lid = BinaryPrimitives.ReadUInt16LittleEndian(grpprl.AsSpan(at)); break;
-                case 0x4A30: StyleChars(BinaryPrimitives.ReadUInt16LittleEndian(grpprl.AsSpan(at)), c); break; // a character style
+                case 0x4A30: // a character style (which, in a damaged file, could name itself)
+                    if (_styleDepth >= 4) break;
+                    _styleDepth++;
+                    StyleChars(BinaryPrimitives.ReadUInt16LittleEndian(grpprl.AsSpan(at)), c);
+                    _styleDepth--;
+                    break;
                 case 0x0835: c.Bold = Toggle(c.Bold); break;
                 case 0x0836: c.Italic = Toggle(c.Italic); break;
                 case 0x0837 or 0x2A53: c.Strike = Toggle(c.Strike); break;
@@ -382,6 +399,7 @@ internal sealed partial class WordBinaryReader
     {
         foreach (var (sprm, at, size) in Sprms(grpprl))
         {
+            if (size == 0) continue;
             short S16() => BinaryPrimitives.ReadInt16LittleEndian(grpprl.AsSpan(at));
             switch (sprm)
             {
@@ -681,10 +699,9 @@ internal sealed partial class WordBinaryReader
     }
 
     /// <summary>Footnote or endnote texts keyed by the position of their reference mark in the body.</summary>
-    Dictionary<int, (List<DBlock> blocks, bool endnote)> ReadNotes((int fc, int lcb) refs, (int fc, int lcb) texts, int story, int storyLength, bool endnote)
+    void ReadNotes((int fc, int lcb) refs, (int fc, int lcb) texts, int story, int storyLength, bool endnote, Dictionary<int, (List<DBlock> blocks, bool endnote)> notes)
     {
-        var notes = new Dictionary<int, (List<DBlock>, bool)>();
-        if (refs.lcb < 4 || texts.lcb < 8 || storyLength <= 0) return notes;
+        if (refs.lcb < 4 || texts.lcb < 8 || storyLength <= 0) return;
         int n = (refs.lcb - 4) / 6;
         for (int k = 0; k < n; k++)
         {
@@ -694,14 +711,13 @@ internal sealed partial class WordBinaryReader
             var blocks = new List<DBlock>();
             // The note's text opens with its own reference character: print the number there, in its own style.
             _noteMark = endnote ? ListLabels.Format(k + 1, "lowerRoman") : (k + 1).ToString(System.Globalization.CultureInfo.InvariantCulture);
-            ReadStory(story + start, story + Math.Min(end, storyLength), blocks, []);
-            _noteMark = null;
+            try { ReadStory(story + start, story + Math.Min(end, storyLength), blocks, []); }
+            finally { _noteMark = null; }
             // The note's own copy of its number is dropped; the reference mark carries it.
             if (blocks.FirstOrDefault() is DParagraph first && first.Inlines.FirstOrDefault() is DText { Text: var t } mark && t.Trim().Length == 0)
                 first.Inlines.Remove(mark);
             notes[refCp] = (blocks, endnote);
         }
-        return notes;
     }
 
     /// <summary>
@@ -756,7 +772,17 @@ internal sealed partial class WordBinaryReader
 
     // ------------------------------------------------------------------ the story
 
+    /// <summary>The stories being read: a text box anchored in its own text would otherwise go round for ever.</summary>
+    readonly HashSet<(int start, int end)> _reading = [];
+
     void ReadStory(int cpStart, int cpEnd, List<DBlock> into, Dictionary<int, (List<DBlock> blocks, bool endnote)> notes)
+    {
+        if (_reading.Count > 16 || !DocumentLimits.CanGoDeeper(0) || !_reading.Add((cpStart, cpEnd))) return;
+        try { Story(cpStart, cpEnd, into, notes); }
+        finally { _reading.Remove((cpStart, cpEnd)); }
+    }
+
+    void Story(int cpStart, int cpEnd, List<DBlock> into, Dictionary<int, (List<DBlock> blocks, bool endnote)> notes)
     {
         if (cpStart < 0 || cpEnd < cpStart || cpEnd > _pieces.Select(p => p.cpEnd).DefaultIfEmpty(0).Max())
             throw new ConversionException("This Word document has an invalid text range.");
@@ -817,7 +843,7 @@ internal sealed partial class WordBinaryReader
                     }
                     var r = new DRow();
                     r.Cells.AddRange(row);
-                    if (r.Cells.Count > 0) table.Rows.Add(r);
+                    if (r.Cells.Count > 0 && table.Rows.Count < DocumentLimits.Rows) table.Rows.Add(r);
                     row = [];
                     cell = new DCell();
                 }
@@ -889,7 +915,9 @@ internal sealed partial class WordBinaryReader
                     if (code.StartsWith("HYPERLINK", StringComparison.OrdinalIgnoreCase))
                     {
                         var quoted = System.Text.RegularExpressions.Regex.Match(code, "\"([^\"]+)\"");
-                        if (quoted.Success && Uri.TryCreate(quoted.Groups[1].Value, UriKind.Absolute, out _)) link = quoted.Groups[1].Value;
+                        var place = System.Text.RegularExpressions.Regex.Match(code, "\\\\l\\s+\"([^\"]+)\"");
+                        if (place.Success && place.Index < quoted.Index) link = "#" + place.Groups[1].Value;
+                        else if (quoted.Success && Uri.TryCreate(quoted.Groups[1].Value, UriKind.Absolute, out _)) link = quoted.Groups[1].Value;
                     }
                     // Page numbers are live fields; their saved result is replaced when laid out.
                     var word = code.Split(' ', 2)[0].ToUpperInvariant();
@@ -997,7 +1025,7 @@ internal sealed partial class WordBinaryReader
             if (_file.Stream([.. folder, "\u0003META"]) is { Length: > 0 } meta)
             {
                 var (mw, mh) = DocxReader.ImageSize(meta);
-                return new DImage(meta, "wmf", Math.Max(1, mw), Math.Max(1, mh));
+                if (Usable(meta, mw, mh) is { } preview) return preview;
             }
             if (_file.Stream([.. folder, "\u0003PIC"]) is { Length: > 68 } pic)
             {
@@ -1005,8 +1033,8 @@ internal sealed partial class WordBinaryReader
                 short P(int o) => BinaryPrimitives.ReadInt16LittleEndian(pic.AsSpan(o));
                 double pw = (P(28) - P(36) - P(40)) * BinaryPrimitives.ReadUInt16LittleEndian(pic.AsSpan(32)) / 1000.0 / 20;
                 double ph = (P(30) - P(38) - P(42)) * BinaryPrimitives.ReadUInt16LittleEndian(pic.AsSpan(34)) / 1000.0 / 20;
-                if (header > 0 && header < pic.Length)
-                    return new DImage(pic[header..], "wmf", pw > 1 ? pw : 144, ph > 1 ? ph : 72);
+                if (header > 0 && header < pic.Length && Usable(pic[header..], pw > 1 ? pw : 144, ph > 1 ? ph : 72) is { } drawn)
+                    return drawn;
             }
         }
         if (location is not int start || start < 0 || start + 44 > _data.Length) return null;
@@ -1034,8 +1062,19 @@ internal sealed partial class WordBinaryReader
         if (data == null) return null;
         var (w, h) = DocxReader.ImageSize(data);
         if (width > 1 && height > 1) (w, h) = (width, height);
-        return w > 0 && h > 0 ? new DImage(data, ext!, w, h) : null;
+        return Usable(data, w, h);
     }
+
+    readonly Dictionary<byte[], (byte[] data, string ext)?> _usable = new(ReferenceEqualityComparer.Instance);
+
+    /// <summary>A picture every output can hold: metafiles become PNG.</summary>
+    DImage? Usable(byte[] data, double w, double h)
+    {
+        if (!_usable.TryGetValue(data, out var picture)) _usable[data] = picture = DocumentPictures.Embeddable(data);
+        return picture is { } p ? new DImage(p.data, p.ext, Math.Max(1, w), Math.Max(1, h)) : null;
+    }
+
+    const long MetafileLimit = 64L * 1024 * 1024;
 
     /// <summary>Finds the first OfficeArt picture record (BLIP) in a block and returns its image file.</summary>
     internal static (byte[]? data, string? ext) Blip(ReadOnlySpan<byte> block)
@@ -1062,24 +1101,33 @@ internal sealed partial class WordBinaryReader
                         {
                             using var z = new System.IO.Compression.ZLibStream(new MemoryStream(payload), System.IO.Compression.CompressionMode.Decompress);
                             using var ms = new MemoryStream();
-                            z.CopyTo(ms);
+                            // A few bytes can inflate to gigabytes; no real metafile is anywhere near this big.
+                            var buffer = new byte[81920];
+                            for (int read; (read = z.Read(buffer)) > 0 && ms.Length <= MetafileLimit;) ms.Write(buffer, 0, read);
+                            if (ms.Length > MetafileLimit) continue;
                             payload = ms.ToArray();
                         }
                         catch (InvalidDataException) { continue; }
+
                     }
                     return (payload, type == 0xF01A ? "emf" : "wmf");
                 case 0xF01D or 0xF02A:
+                    if (body.Length <= uids + 1) continue;
                     return (body[(uids + 1)..].ToArray(), "jpg");
                 case 0xF01E:
+                    if (body.Length <= uids + 1) continue;
                     return (body[(uids + 1)..].ToArray(), "png");
                 case 0xF029:
+                    if (body.Length <= uids + 1) continue;
                     return (body[(uids + 1)..].ToArray(), "tiff");
                 case 0xF01F: // a bare device-independent bitmap: give it a .bmp file header
+                    if (body.Length <= uids + 1) continue;
                     var dib = body[(uids + 1)..];
                     if (dib.Length < 40) continue;
                     int headerSize = BinaryPrimitives.ReadInt32LittleEndian(dib);
                     int bits = BinaryPrimitives.ReadUInt16LittleEndian(dib[14..]);
                     int colors = BinaryPrimitives.ReadInt32LittleEndian(dib[32..]);
+                    if (headerSize is < 12 or > 1024 || colors is < 0 or > 256 || bits > 32) continue;
                     int palette = (colors == 0 && bits <= 8 ? 1 << bits : colors) * 4;
                     var bmp = new byte[14 + dib.Length];
                     bmp[0] = (byte)'B'; bmp[1] = (byte)'M';

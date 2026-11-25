@@ -7,25 +7,28 @@ wheel pops up over everything so you can convert the file to another format.
 
 - **Hold Ctrl** over a file. After a short hold the wheel opens around the cursor.
 - **Flick toward a format and let go** to convert. You can also release first and then **click** a slice.
+  Clicking in the middle cancels, and that click goes to the file as usual.
 - The inner ring holds **smart suggestions** for that file type (an `.ogg` offers MP3, WAV, FLAC…).
   Rest on (or pick) **All** to open the outer ring with every format the file can become.
-- Keys while the wheel is open: `1`–`8` pick a slice, `Tab` shows all formats, `Enter` converts the
+- With up to 20 files of one kind selected, hold over one of them to convert them all. The middle shows how many.
+- Keys while the wheel is open: `1`–`8` pick a slice, the arrow keys move around, `Tab` shows all formats, `Enter` converts the
   highlighted slice, `Esc` closes.
-- Shortcuts still work: pressing another key, clicking or scrolling while holding Ctrl cancels the wheel,
+- Shortcuts still work: pressing another key, clicking, dragging or scrolling while holding Ctrl cancels the wheel,
   so Ctrl+C and Ctrl+click behave normally.
 
 The tray icon (in the taskbar's hidden icons) opens **Settings** and can pause or exit the app.
 
 ## Settings
 
-- The hold key or combination (any key, e.g. `Ctrl`, `Alt`, `Ctrl + Shift`, `Caps Lock`) and the hold time.
+- The hold key or combination (e.g. `Ctrl`, `Alt`, `Ctrl + Shift`, `Caps Lock`) and the hold time (500 ms to start with).
 - Keep the original and save a copy, or **replace the original**. Replaced originals go to the Recycle Bin.
 - Save next to the original or into a chosen folder.
 - Always show every format, start with Windows, completion notifications.
 
 ## Converters
 
-Everything is converted by code that ships inside the app. Nothing needs to be installed or downloaded.
+Everything is converted on this PC by code that ships with the app or is part of Windows. Files are never uploaded, and
+nothing needs to be installed or downloaded.
 Microsoft Office is used when it happens to be installed, because it's the most faithful for its own formats.
 
 | Files | Engine |
@@ -53,6 +56,11 @@ Lossless shortcuts: H.264/AAC video moves between MP4, MOV and MKV without re-en
 audio becomes M4A/AAC instantly. Song details (title, artist, album, track, year, genre) carry across audio
 conversions. Phone videos keep their rotation. Pages and slides that become pictures go into a folder
 named after the file when there is more than one.
+
+"Replace the original" only happens where the new file can stand in for it. Conversions that take something out of a
+file (a video's sound, a picture's text, a document's pages as pictures) keep the original. A replaced original goes
+to the Recycle Bin, or is kept when it can't go there. A workbook with several sheets becomes a CSV or TSV with only
+its first visible sheet that has something in it.
 
 ### How documents are converted
 
@@ -93,32 +101,42 @@ transitions and animations don't apply to PDF or pictures and aren't carried bet
 
 ### Third-party libraries
 
-All permissively licensed and bundled into the exe. See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) lists every component with its licence, and the [licenses](licenses) folder
+has the full texts; both are installed next to the app. Most libraries are permissively licensed, but not everything is:
+FFmpeg and some libraries inside ImageMagick are LGPL, and the .NET runtime in the installer comes under Microsoft's terms.
 
 - **PDFsharp 6.2.4** (MIT). Pinned on purpose: 6.3 and later are AGPL, which would force this app to be AGPL too.
 - **PDFium** (Apache 2.0 / BSD, via bblanchon.PDFium) to read and render PDFs.
-- **Magick.NET / ImageMagick** (Apache 2.0) for HEIC, AVIF, JPEG XL, PSD, SVG, RAW and other images.
-- **FFmpeg** (LGPL 2.1+, shared-library build from BtbN) for the video and audio formats Windows lacks.
+- **Magick.NET / ImageMagick** (Apache 2.0, with LGPL libraries inside) for HEIC, AVIF, JPEG XL, PSD, SVG, RAW and other
+  images. Its DLL stays a separate file next to the exe, so it can be replaced.
+- **FFmpeg** (LGPL 3.0+, unmodified shared-library build) for the video and audio formats Windows lacks. Its exact build,
+  sources and how to replace it: [licenses/ffmpeg/SOURCES.md](licenses/ffmpeg/SOURCES.md).
 - **SharpCompress** (MIT) for archives; **AngleSharp** (MIT) for HTML; **Markdig** (BSD-2) for Markdown;
   **YamlDotNet** (MIT) for YAML.
 - **ExcelDataReader** (MIT) for reading `.xlsx` and `.xls`.
 - **SkiaSharp** (MIT) for WebP encoding and decoding.
 - **NVorbis** (MIT) and **OggVorbisEncoder** (MIT) for Ogg Vorbis. The encoder drops the first half-block of
   audio and misbehaves above quality 0.5, so the app pads the start and uses 0.5 (~160 kbps).
-- **Concentus** and **Concentus.OggFile** (BSD / MIT) for Opus.
+- **Concentus** (BSD) for Opus.
 
 ## Installing
 
-Users run `ConvertWheel-Setup-<version>.exe`. It needs nothing else and no administrator rights:
+Users run `ConvertWheel-Setup-<version>.exe` on 64-bit Windows 10 (1809 or later) or 11; on Arm PCs, Windows 11. It needs
+nothing else, no internet and no administrator rights:
 
 - Installs for the current user into `%LOCALAPPDATA%\Programs\Convert Wheel`, with a Start menu shortcut
   and (optional, on by default) a "start with Windows" entry.
 - The .NET runtime travels inside the installer, but is only copied when the PC doesn't already have .NET 10
   for desktop apps. Then it goes into the app's own `runtime` folder (nothing system-wide changes); the app
   looks there first, then for the system's .NET. The Ready page says which case applies.
-- A running copy is closed first (politely via `ConvertWheel.exe --exit`, forcefully if it doesn't respond).
-- The last page offers to open the app and to delete the installer file; both are ticked by default.
-- Uninstalling (Settings › Apps) also removes the settings, log, unpacked video tools and startup entry.
+- The .NET it looks for is a stable x64 .NET 10 (on Arm64 PCs too, where it sits in `dotnet\x64`).
+- A running copy is asked to stop its conversions and exit first, and has 20 seconds. If it hasn't by then, setup asks
+  before ending it (silent setups just do), and only ends copies running from the install folder.
+- The last page offers to open the app (ticked) and to delete the installer file (not ticked).
+- Updating keeps the settings and the startup choice; going back to an older version asks first. Installing the same
+  version again repairs it.
+- Uninstalling (Settings › Apps) removes the app, its log, unpacked video tools and startup entry. It asks whether to remove
+  the settings too, and keeps them otherwise (silent uninstalls always keep them).
 - Silent installs work as usual: `ConvertWheel-Setup-1.0.0.exe /VERYSILENT [/TASKS="startup,desktopicon"]`.
 
 ## Build & run
@@ -130,14 +148,21 @@ dotnet run -c Release                      # run from source
 powershell -ExecutionPolicy Bypass -File tools\build-installer.ps1   # dist\ConvertWheel-Setup-<version>.exe
 ```
 
-`build-installer.ps1` publishes the app, copies the .NET 10 desktop runtime from this machine's .NET install,
-fetches [Inno Setup](https://jrsoftware.org/isinfo.php) from NuGet into `tools\.innosetup` (nothing is installed)
-and compiles `installer\ConvertWheel.iss`. Compiling that script with `/DForceRuntime` makes an installer that
-always includes the runtime, for testing the "no .NET" path on a PC that has it.
+`build-installer.ps1` checks FFmpeg and the third-party notices, publishes the app, copies the .NET 10 desktop runtime from this
+machine's .NET install (checking Microsoft's signatures), fetches [Inno Setup](https://jrsoftware.org/isinfo.php) from NuGet into
+`tools\.innosetup` (nothing is installed) and compiles `installer\ConvertWheel.iss`. It prints the SHA-256 of what it made.
+`-ForceRuntime` makes an installer that always includes the runtime, for testing the "no .NET" path on a PC that has it.
+`-SignThumbprint` and `-TimestampUrl` sign the app and the installer with a certificate from your store (off by default).
+The version and other details are in `ConvertWheel.csproj` only. A `LICENSE` file in the project folder, if there is one,
+is shown by the installer.
 
-The first build fetches the LGPL FFmpeg build and packs it into `tools\ffmpeg.tar.xz` (see `tools\pack-ffmpeg.ps1`;
-the file isn't committed), which is then embedded into the exe. Offline, or with `-p:SkipFfmpegPack=true`, the app
-still builds; the FFmpeg-only formats then use an `ffmpeg.exe` found next to the app or on `PATH`.
+The first build fetches the FFmpeg build pinned in `tools\ffmpeg.json` (by SHA-256) and packs it into `tools\ffmpeg.tar.xz` (see
+`tools\pack-ffmpeg.ps1`; the file isn't committed), which is then embedded into the exe. After the pin changes, run that script
+again. Offline, or with `-p:SkipFfmpegPack=true`, the app still builds; the FFmpeg-only formats then use an `ffmpeg.exe`
+found next to the app or on `PATH`.
+
+`tools\check-notices.ps1` fails when something the app ships isn't covered by the notices and licence texts. After changing a
+package, update its row in THIRD-PARTY-NOTICES.md, its texts in `licenses` and `tools\notices.json`.
 
 Command-line extras:
 

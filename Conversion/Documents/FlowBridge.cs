@@ -20,6 +20,9 @@ internal static class FlowBridge
     /// <summary>A float the PDF renderer paints itself (behind or in front of the text) once pages are laid out.</summary>
     internal sealed record Overlay(DFloat Float, TextElement Anchor);
 
+    /// <summary>On a text brush: the address its text links to. Page drawings keep the brush but not the Hyperlink around it.</summary>
+    internal static readonly DependencyProperty LinkProperty = DependencyProperty.RegisterAttached("Link", typeof(string), typeof(FlowBridge), new PropertyMetadata(null));
+
     /// <summary>State for one conversion to a FlowDocument.</summary>
     internal sealed class FlowContext(DDocument doc)
     {
@@ -49,7 +52,11 @@ internal static class FlowBridge
     {
         var doc = ctx.Doc;
         var flow = NewFlow(doc, doc.PageWidth, doc.PageHeight, doc.Margins);
-        foreach (var block in doc.Blocks) flow.Blocks.Add(ToBlock(block, ctx, doc.ContentWidth));
+        foreach (var block in doc.Blocks)
+        {
+            if (block is DTable { Rows.Count: > LongTable } table && !ctx.ForRtf) flow.Blocks.AddRange(InPieces(table, ctx, doc.ContentWidth));
+            else flow.Blocks.Add(ToBlock(block, ctx, doc.ContentWidth));
+        }
         if (doc.Columns > 1)
         {
             // Newspaper columns: WPF fits as many columns of this width as the page holds.
@@ -110,6 +117,12 @@ internal static class FlowBridge
             // Line breaks and empty lines take the size of the paragraph's text, not the document default.
             FontSize = Units.ToDip(baseSize),
         };
+        if (p.RightToLeft && !ctx.ForRtf)
+        {
+            // WPF turns "left" and "right" around inside right-to-left text.
+            para.FlowDirection = FlowDirection.RightToLeft;
+            para.TextAlignment = p.Align switch { TextAlignment.Left => TextAlignment.Right, TextAlignment.Right => TextAlignment.Left, var a => a };
+        }
         // A fixed line height would clip pictures, so lines with images keep their natural height.
         if (Math.Abs(p.LineSpacing - 1) > 0.01 && !p.Inlines.OfType<DImage>().Any())
         {
@@ -145,6 +158,9 @@ internal static class FlowBridge
             }
         }
 
+        // The indent is on the side the text starts from.
+        if (p.RightToLeft && !ctx.ForRtf) para.Margin = new Thickness(0, para.Margin.Top, para.Margin.Left, para.Margin.Bottom);
+
         var heading = HeadingSize(p);
         foreach (var inline in p.Inlines)
         {
@@ -152,11 +168,12 @@ internal static class FlowBridge
             {
                 case DText t:
                     var run = Styled(new Run(t.Text), t.Style, heading);
-                    if (t.Style.Size == null && heading == null) run.FontSize = Units.ToDip(doc.FontSize);
+                    if (t.Style.Size == null && heading == null) run.FontSize = Units.ToDip(doc.FontSize) * (t.Style.Superscript || t.Style.Subscript ? 0.65 : 1);
                     if (t.Link != null && Uri.TryCreate(t.Link, UriKind.Absolute, out var uri))
                     {
                         var link = new Hyperlink(run) { NavigateUri = uri, Foreground = run.Foreground };
                         if (t.Style.Color == null) link.Foreground = new SolidColorBrush(Color.FromRgb(0x05, 0x63, 0xC1));
+                        if (uri.Scheme is "http" or "https" or "mailto" && link.Foreground is SolidColorBrush { IsFrozen: false } marked) marked.SetValue(LinkProperty, uri.AbsoluteUri);
                         para.Inlines.Add(link);
                     }
                     else para.Inlines.Add(run);
@@ -394,10 +411,25 @@ internal static class FlowBridge
         return run;
     }
 
-    static Table ToTable(DTable t, FlowContext ctx, double available)
+    const int LongTable = 300, TablePiece = 100;
+
+    /// <summary>WPF's layout time grows with the square of a table's rows, so a long one is laid out as a stack of tables that touch.</summary>
+    static IEnumerable<Table> InPieces(DTable t, FlowContext ctx, double available)
+    {
+        int columns = t.ColumnCount;
+        int left = t.Rows.Count;
+        foreach (var piece in t.Pieces(TablePiece))
+        {
+            var table = ToTable(piece, ctx, available, columns);
+            if ((left -= piece.Rows.Count) > 0) table.Margin = new Thickness(0);
+            yield return table;
+        }
+    }
+
+    static Table ToTable(DTable t, FlowContext ctx, double available, int columns = 0)
     {
         var table = new Table { CellSpacing = 0, Margin = new Thickness(0, 0, 0, Units.ToDip(6)) };
-        int columns = Math.Max(1, t.ColumnCount);
+        columns = Math.Max(Math.Max(1, columns), t.ColumnCount);
         var widths = t.ColumnWidths != null && t.ColumnWidths.Count >= columns ? t.ColumnWidths.Take(columns).ToList() : null;
         if (widths != null)
         {
@@ -412,19 +444,19 @@ internal static class FlowBridge
         var padding = t.CellPadding is { } pad
             ? new Thickness(Units.ToDip(pad.Left), Units.ToDip(pad.Top), Units.ToDip(pad.Right), Units.ToDip(pad.Bottom))
             : new Thickness(Units.ToDip(5.4), Units.ToDip(1), Units.ToDip(5.4), Units.ToDip(1));
-        foreach (var r in t.Rows)
+        int rowsLeft = t.Rows.Count;
+        foreach (var (r, slots) in t.Slots())
         {
             ctx.Cancellation.ThrowIfCancellationRequested();
             var row = new TableRow();
-            int col = 0;
-            foreach (var c in r.Cells)
+            foreach (var (c, col, span, covered) in slots)
             {
-                int span = Math.Max(1, c.ColSpan);
+                if (covered) continue;
                 double cellWidth = widths != null ? widths.Skip(col).Take(span).Sum() : available / columns * span;
-                col += span;
                 var cell = new TableCell
                 {
                     ColumnSpan = span,
+                    RowSpan = Math.Clamp(c.RowSpan, 1, rowsLeft),
                     Padding = padding,
                     BorderBrush = border,
                     BorderThickness = t.Borders ? new Thickness(0.67) : new Thickness(0),
@@ -435,6 +467,7 @@ internal static class FlowBridge
                 if (r.Header) foreach (var p in cell.Blocks.OfType<Paragraph>()) p.FontWeight = FontWeights.Bold;
                 row.Cells.Add(cell);
             }
+            rowsLeft--;
             group.Rows.Add(row);
         }
         table.RowGroups.Add(group);
@@ -527,7 +560,7 @@ internal static class FlowBridge
                         var row = new DRow();
                         foreach (var c in r.Cells)
                         {
-                            var cell = new DCell { ColSpan = c.ColumnSpan, Shading = (c.Background as SolidColorBrush)?.Color };
+                            var cell = new DCell { ColSpan = c.ColumnSpan, RowSpan = c.RowSpan, Shading = (c.Background as SolidColorBrush)?.Color };
                             if (c.BorderThickness.Left > 0 || c.BorderThickness.Bottom > 0) table.Borders = true;
                             foreach (var b in c.Blocks) FromBlock(b, cell.Blocks, 0);
                             row.Cells.Add(cell);
@@ -557,7 +590,10 @@ internal static class FlowBridge
             IndentFirst = Units.ToPoints(Safe(p.TextIndent)),
             PageBreakBefore = p.BreakPageBefore,
             MarkSize = Units.ToPoints(p.FontSize),
+            RightToLeft = p.FlowDirection == FlowDirection.RightToLeft,
         };
+        // (Inside right-to-left text WPF's "left" and "right" are the other way round.)
+        if (para.RightToLeft) para.Align = para.Align switch { TextAlignment.Left => TextAlignment.Right, TextAlignment.Right => TextAlignment.Left, var a => a };
         FromInlines(p.Inlines, para, null);
         return para;
     }

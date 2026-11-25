@@ -31,7 +31,7 @@ internal sealed class DText(string text, TextStyle style, string? link = null) :
 {
     public string Text { get; set; } = text;
     public TextStyle Style { get; set; } = style;
-    public string? Link { get; } = link;
+    public string? Link { get; set; } = link;
 }
 
 internal sealed class DLineBreak : DInline;
@@ -43,6 +43,14 @@ internal sealed class DImage(byte[] data, string ext, double width, double heigh
     public string Ext { get; } = ext;
     public double Width { get; set; } = width;
     public double Height { get; set; } = height;
+    /// <summary>What the picture shows, for people who can't see it.</summary>
+    public string? Alt { get; set; }
+}
+
+/// <summary>A place other text links to as "#name".</summary>
+internal sealed class DAnchor(string name) : DInline
+{
+    public string Name { get; } = name;
 }
 
 internal enum FieldKind { Page, NumPages }
@@ -132,6 +140,8 @@ internal sealed class DParagraph : DBlock
     public bool PageBreakBefore { get; set; }
     /// <summary>Font size of an empty paragraph's line.</summary>
     public double? MarkSize { get; set; }
+    /// <summary>Runs right to left (Arabic, Hebrew); <see cref="Align"/> still names the side it's on.</summary>
+    public bool RightToLeft { get; set; }
 
     public string PlainText()
     {
@@ -142,7 +152,7 @@ internal sealed class DParagraph : DBlock
             else if (inline is DLineBreak) sb.Append('\n');
             else if (inline is DNote n) sb.Append('[').Append(n.Endnote ? ListLabels.Format(n.Number, "lowerRoman") : n.Number.ToString()).Append(']');
             else if (inline is DFloat { Blocks.Count: > 0 } f)
-                sb.Append(' ').Append(string.Join(" ", f.Blocks.OfType<DParagraph>().Select(p => p.PlainText()).Where(s => s.Length > 0))).Append(' ');
+                sb.Append(' ').Append(string.Join(" ", DDocument.Paragraphs(f.Blocks).Select(p => p.PlainText()).Where(s => s.Length > 0))).Append(' ');
         }
         return sb.ToString();
     }
@@ -162,28 +172,117 @@ internal sealed class DTable : DBlock
         get
         {
             int columns = 0;
-            foreach (var row in Rows)
-            {
-                long count = row.Cells.Sum(c => (long)Math.Max(1, c.ColSpan));
-                if (count > 16384) throw new ConversionException("This table has too many columns.");
-                columns = Math.Max(columns, (int)count);
-            }
+            foreach (var (_, slots) in Slots())
+                if (slots.Count > 0) columns = Math.Max(columns, slots[^1].Column + slots[^1].Span);
             return columns;
         }
     }
+
+    /// <summary>
+    /// Every row's cells with the grid column each starts in, including (as <see cref="DSlot.Covered"/>) the
+    /// places taken by a cell that reaches down from a row above, which the row itself doesn't list.
+    /// </summary>
+    public IEnumerable<(DRow row, List<DSlot> slots)> Slots()
+    {
+        // Cells still reaching down: the column they start in, the cell, and how many more rows they cover.
+        var reaching = new SortedDictionary<int, (DCell cell, int rows)>();
+        foreach (var row in Rows)
+        {
+            var slots = new List<DSlot>();
+            var started = new List<(int column, DCell cell)>();
+            int column = 0;
+            var above = reaching.ToList();
+            int next = 0;
+            void Covered(bool all)
+            {
+                for (; next < above.Count && (all || above[next].Key <= column); next++)
+                {
+                    var (start, (cell, _)) = above[next];
+                    if (start < column) continue; // damaged: cells on top of each other
+                    slots.Add(new DSlot(cell, start, Math.Max(1, cell.ColSpan), true));
+                    column = start + Math.Max(1, cell.ColSpan);
+                }
+            }
+            foreach (var cell in row.Cells)
+            {
+                Covered(all: false);
+                int span = Math.Max(1, cell.ColSpan);
+                if (span > 16384 - column) throw new ConversionException("This table has too many columns.");
+                slots.Add(new DSlot(cell, column, span, false));
+                if (cell.RowSpan > 1) started.Add((column, cell));
+                column += span;
+            }
+            Covered(all: true);
+            foreach (var (start, (cell, rows)) in above)
+            {
+                if (rows <= 1) reaching.Remove(start);
+                else reaching[start] = (cell, rows - 1);
+            }
+            foreach (var (start, cell) in started) reaching[start] = (cell, cell.RowSpan - 1);
+            yield return (row, slots);
+        }
+    }
+
+    /// <summary>The table's rows in tables of at most <paramref name="size"/> rows. A cell that reaches into the next one goes on there, empty.</summary>
+    public IEnumerable<DTable> Pieces(int size)
+    {
+        DTable? piece = null;
+        var continued = new Dictionary<DCell, DCell>(ReferenceEqualityComparer.Instance);
+        int index = 0;
+        var startRow = new Dictionary<DCell, int>(ReferenceEqualityComparer.Instance);
+        foreach (var (row, slots) in Slots())
+        {
+            if (piece == null || piece.Rows.Count >= size)
+            {
+                if (piece != null) yield return piece;
+                piece = new DTable { Borders = Borders, ColumnWidths = ColumnWidths, BorderColor = BorderColor, CellPadding = CellPadding };
+                continued.Clear();
+            }
+            int first = index - piece.Rows.Count;
+            foreach (var slot in slots)
+                if (!slot.Covered && slot.Cell.RowSpan > 1) startRow[slot.Cell] = index;
+            if (!slots.Any(s => s.Covered && startRow.GetValueOrDefault(s.Cell) < first)) piece.Rows.Add(row);
+            else
+            {
+                var copy = new DRow { Header = row.Header };
+                foreach (var slot in slots)
+                {
+                    if (!slot.Covered) copy.Cells.Add(slot.Cell);
+                    else if (startRow.GetValueOrDefault(slot.Cell) < first && !continued.ContainsKey(slot.Cell))
+                    {
+                        var rest = new DCell { ColSpan = slot.Span, RowSpan = startRow[slot.Cell] + slot.Cell.RowSpan - index, Shading = slot.Cell.Shading };
+                        copy.Cells.Add(continued[slot.Cell] = rest);
+                    }
+                }
+                piece.Rows.Add(copy);
+            }
+            index++;
+        }
+        if (piece != null) yield return piece;
+    }
 }
+
+/// <summary>Where a cell sits in its table's grid.</summary>
+/// <param name="Covered">The cell started in a row above and reaches into this one.</param>
+internal readonly record struct DSlot(DCell Cell, int Column, int Span, bool Covered);
 
 internal sealed class DRow
 {
     public List<DCell> Cells { get; } = [];
     public bool Header { get; set; }
+    /// <summary>The least height, in points, when the source sets one (slides).</summary>
+    public double? Height { get; set; }
 }
 
 internal sealed class DCell
 {
     public List<DBlock> Blocks { get; } = [];
     public int ColSpan { get; set; } = 1;
+    /// <summary>Rows the cell covers; the rows below don't list the cells it covers.</summary>
+    public int RowSpan { get; set; } = 1;
     public Color? Shading { get; set; }
+    /// <summary>A slide table cell's own anchor, padding and edges.</summary>
+    public Presentations.CellLook? Look { get; set; }
 }
 
 internal sealed class DDocument
@@ -220,7 +319,10 @@ internal sealed class DDocument
         return (Header, Footer);
     }
 
-    public IEnumerable<DNote> Notes() => AllParagraphs().SelectMany(p => p.Inlines.OfType<DNote>());
+    public IEnumerable<DNote> Notes() => NotesIn(Blocks);
+
+    static IEnumerable<DNote> NotesIn(IEnumerable<DBlock> blocks) => Paragraphs(blocks)
+        .SelectMany(p => p.Inlines).SelectMany(i => i is DNote n ? [n] : i is DFloat f ? NotesIn(f.Blocks) : []);
 
     public double ContentWidth => PageWidth - Margins.Left - Margins.Right;
 
@@ -233,24 +335,27 @@ internal sealed class DDocument
     public IEnumerable<DParagraph> EveryParagraph()
     {
         var parts = new[] { Header, Footer, FirstHeader, FirstFooter, EvenHeader, EvenFooter }.Where(h => h != null).SelectMany(h => h!.Blocks);
-        foreach (var p in Paragraphs(Blocks.Concat(parts)))
-        {
-            yield return p;
-            foreach (var inner in p.Inlines.SelectMany(i => i is DNote n ? Paragraphs(n.Blocks) : i is DFloat f ? Paragraphs(f.Blocks) : []))
-                yield return inner;
-        }
+        return Paragraphs(Blocks.Concat(parts), boxes: true);
     }
 
-    static IEnumerable<DParagraph> Paragraphs(IEnumerable<DBlock> blocks)
+    /// <summary>The paragraphs of some blocks and of the tables in them, in reading order.</summary>
+    /// <param name="boxes">Also those inside notes and text boxes.</param>
+    internal static IEnumerable<DParagraph> Paragraphs(IEnumerable<DBlock> blocks, bool boxes = false)
     {
-        foreach (var block in blocks)
+        // A stack of what's left rather than recursion: however deep the tables go, this stays cheap.
+        var pending = new Stack<IEnumerator<DBlock>>();
+        pending.Push(blocks.GetEnumerator());
+        while (pending.Count > 0)
         {
-            if (block is DParagraph p) yield return p;
-            else if (block is DTable t)
-                foreach (var row in t.Rows)
-                    foreach (var cell in row.Cells)
-                        foreach (var inner in Paragraphs(cell.Blocks))
-                            yield return inner;
+            if (!pending.Peek().MoveNext()) { pending.Pop().Dispose(); continue; }
+            var block = pending.Peek().Current;
+            if (block is DTable t) pending.Push(t.Rows.SelectMany(r => r.Cells).SelectMany(c => c.Blocks).GetEnumerator());
+            else if (block is DParagraph p)
+            {
+                yield return p;
+                if (boxes && p.Inlines.Any(i => i is DNote or DFloat))
+                    pending.Push(p.Inlines.SelectMany(i => i is DNote n ? n.Blocks : i is DFloat f ? f.Blocks : Enumerable.Empty<DBlock>()).ToList().GetEnumerator());
+            }
         }
     }
 
@@ -306,7 +411,7 @@ internal static class Units
         value = value.Trim();
         int i = 0;
         while (i < value.Length && (char.IsDigit(value[i]) || value[i] is '.' or '-' or '+')) i++;
-        if (!double.TryParse(value[..i], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var n))
+        if (!double.TryParse(value[..i], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var n) || Math.Abs(n) > 1e6)
             return null;
         return value[i..].Trim().ToLowerInvariant() switch
         {
@@ -324,7 +429,7 @@ internal static class Units
     {
         if (string.IsNullOrEmpty(hex)) return null;
         hex = hex.TrimStart('#');
-        if (hex.Length != 6 || !int.TryParse(hex, System.Globalization.NumberStyles.HexNumber, null, out var v)) return null;
+        if (hex.Length != 6 || !int.TryParse(hex, System.Globalization.NumberStyles.AllowHexSpecifier, null, out var v)) return null;
         return Color.FromRgb((byte)(v >> 16), (byte)(v >> 8), (byte)v);
     }
 
@@ -341,6 +446,7 @@ internal static class SafeXml
 {
     public static string Text(string text)
     {
+        if (IsFine(text)) return text;
         var sb = new StringBuilder(text.Length);
         foreach (var rune in text.EnumerateRunes())
             if (rune.Value is 9 or 10 or 13 || rune.Value >= 0x20 && rune.Value is not (0xFFFE or 0xFFFF))
@@ -350,8 +456,22 @@ internal static class SafeXml
 
     public static void Clean(XElement root)
     {
-        foreach (var text in root.DescendantNodes().OfType<XText>()) text.Value = Text(text.Value);
-        foreach (var attribute in root.DescendantsAndSelf().Attributes()) attribute.Value = Text(attribute.Value);
+        foreach (var text in root.DescendantNodes().OfType<XText>())
+            if (!IsFine(text.Value)) text.Value = Text(text.Value);
+        foreach (var attribute in root.DescendantsAndSelf().Attributes())
+            if (!IsFine(attribute.Value)) attribute.Value = Text(attribute.Value);
+    }
+
+    static bool IsFine(string text)
+    {
+        for (int i = 0; i < text.Length; i++)
+        {
+            char c = text[i];
+            if (c < 0x20 ? c is '\t' or '\n' or '\r' : c < 0xD800 || !char.IsSurrogate(c) && c < 0xFFFE) continue;
+            if (!char.IsHighSurrogate(c) || i + 1 == text.Length || !char.IsLowSurrogate(text[i + 1])) return false;
+            i++;
+        }
+        return true;
     }
 }
 

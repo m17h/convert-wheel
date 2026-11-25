@@ -82,7 +82,7 @@ internal sealed partial class WordBinaryReader
                 i = dg.End;
             }
         }
-        catch (Exception ex) when (ex is ArgumentOutOfRangeException or IndexOutOfRangeException)
+        catch (Exception ex) when (ex is ArgumentException or IndexOutOfRangeException or OverflowException)
         {
             Log.Write($"Skipped the drawings of a Word document: {ex.Message}");
         }
@@ -96,17 +96,26 @@ internal sealed partial class WordBinaryReader
         return BinaryPrimitives.ReadInt32LittleEndian(_table.AsSpan(fsp.Start));
     }
 
+    readonly Dictionary<int, DImage?> _blips = [];
+
     DImage? BlipAt(int index)
     {
         if (index < 1 || index > _bstore.Count) return null;
+        // The same picture can be used by any number of shapes.
+        if (!_blips.TryGetValue(index, out var known)) _blips[index] = known = ReadBlip(index);
+        return known == null ? null : new DImage(known.Data, known.Ext, known.Width, known.Height);
+    }
+
+    DImage? ReadBlip(int index)
+    {
         var (offset, size, embedded) = _bstore[index - 1];
         byte[]? data; string? ext;
         if (embedded is { } e) (data, ext) = Blip(_table.AsSpan(e.Start - 8, e.Length + 8));
-        else if (offset >= 0 && offset < _word.Length) (data, ext) = Blip(_word.AsSpan(offset, Math.Min(size, _word.Length - offset)));
+        else if (offset >= 0 && offset < _word.Length && size > 0) (data, ext) = Blip(_word.AsSpan(offset, Math.Min(size, _word.Length - offset)));
         else return null;
         if (data == null) return null;
         var (w, h) = DocxReader.ImageSize(data);
-        return new DImage(data, ext!, Math.Max(1, w), Math.Max(1, h));
+        return Usable(data, w, h);
     }
 
     /// <summary>The floating drawing anchored at a character, as a positioned picture and/or text box.</summary>
@@ -114,7 +123,7 @@ internal sealed partial class WordBinaryReader
     {
         if (!_spas.TryGetValue(cp, out var spa) || !_drawings.TryGetValue(spa.Spid, out var item)) return null;
         double width = spa.Twips.Width / 20, height = spa.Twips.Height / 20;
-        if (width < 1 || height < 1) return null;
+        if (width < 1 || height < 1 || width > 4000 || height > 4000) return null;
         var f = new DFloat { Width = width, Height = height, X = spa.Twips.X / 20, Y = spa.Twips.Y / 20 };
 
         // Placement: relative to the margin, page or paragraph, wrapped, behind or in front of the text.
@@ -134,7 +143,11 @@ internal sealed partial class WordBinaryReader
         }
 
         var shapes = new List<SlideShape>();
-        Collect(item, new Rect(0, 0, width, height), null, shapes, f.Blocks);
+        try { Collect(item, new Rect(0, 0, width, height), shapes, f.Blocks, 0); }
+        catch (Exception ex) when (ex is ArgumentException or IndexOutOfRangeException or OverflowException)
+        {
+            Log.Write($"Skipped part of a drawing in a Word document: {ex.Message}");
+        }
         if (shapes.Count == 1 && shapes[0] is { Picture: { } picture, Line: null, Rotation: 0, FlipH: false, FlipV: false })
             f.Image = new DImage(picture.Data, picture.Ext, width, height); // a plain picture keeps its own pixels
         else if (shapes.Any(s => s.Picture != null || s.Fill != null || s.Line != null))
@@ -143,8 +156,9 @@ internal sealed partial class WordBinaryReader
     }
 
     /// <summary>Gathers the shapes of a drawing (recursing into groups), and the text of its text boxes and WordArt.</summary>
-    void Collect(Rec item, Rect bounds, Rect? childSpace, List<SlideShape> shapes, List<DBlock> text)
+    void Collect(Rec item, Rect bounds, List<SlideShape> shapes, List<DBlock> text, int depth)
     {
+        if (!DocumentLimits.CanGoDeeper(depth, 32) || shapes.Count >= 4000) return;
         if (item.Type == 0xF003)
         {
             // A group: its first shape defines the coordinate space its children are placed in.
@@ -166,13 +180,13 @@ internal sealed partial class WordBinaryReader
                     double sx = bounds.Width / space.Width, sy = bounds.Height / space.Height;
                     place = new Rect(bounds.X + (I(0) - space.X) * sx, bounds.Y + (I(4) - space.Y) * sy, Math.Max(0, (I(8) - I(0)) * sx), Math.Max(0, (I(12) - I(4)) * sy));
                 }
-                Collect(child, place, space, shapes, text);
+                Collect(child, place, shapes, text, depth + 1);
             }
             return;
         }
         if (item.Type != 0xF004) return;
         var shape = OfficeArt.Shape(_table, item, bounds, BlipAt, out var wordArt, out _, out var wordArtFont);
-        shapes.Add(shape);
+        if (double.IsFinite(bounds.Width + bounds.Height + bounds.X + bounds.Y)) shapes.Add(shape);
         if (Spid(item) is int spid && _textboxes.TryGetValue(spid, out var box) && box.end > box.start)
             ReadStory(_textboxStory + box.start, _textboxStory + box.end, text, []);
         if (!string.IsNullOrWhiteSpace(wordArt)) WordArt(shape, wordArt, wordArtFont, bounds);
@@ -228,7 +242,7 @@ internal sealed partial class WordBinaryReader
             var (data, ext) = Blip(_data.AsSpan(fbse.Start, fbse.Length));
             if (data == null) return null;
             var (w, h) = DocxReader.ImageSize(data);
-            return new DImage(data, ext!, Math.Max(1, w), Math.Max(1, h));
+            return Usable(data, w, h);
         }
         var bounds = new Rect(0, 0, width, height);
         bool wantsPicture = false;

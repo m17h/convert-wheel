@@ -51,6 +51,9 @@ internal interface IShellView
     [PreserveSig] int GetWindow(out nint hwnd);
 }
 
+[StructLayout(LayoutKind.Sequential)]
+internal struct PROPERTYKEY { public Guid fmtid; public uint pid; }
+
 [ComImport, Guid("1AF3A467-214F-4298-908E-06B03E0B39F9"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
 internal interface IFolderView2
 {
@@ -71,7 +74,7 @@ internal interface IFolderView2
     [PreserveSig] int SelectAndPositionItems(uint count, nint pidls, nint pts, uint flags);
     // IFolderView2
     [PreserveSig] int SetGroupBy(nint key, int ascending);
-    [PreserveSig] int GetGroupBy(nint key, nint ascending);
+    [PreserveSig] int GetGroupBy(out PROPERTYKEY key, out int ascending);
     [PreserveSig] int SetViewProperty(nint pidl, nint key, nint value);
     [PreserveSig] int GetViewProperty(nint pidl, nint key, nint value);
     [PreserveSig] int SetTileViewProperties(nint pidl, nint list);
@@ -83,6 +86,9 @@ internal interface IFolderView2
     [PreserveSig] int SetSortColumns(nint columns, int count);
     [PreserveSig] int GetSortColumns(nint columns, int count);
     [PreserveSig] int GetItem(int index, ref Guid riid, [MarshalAs(UnmanagedType.Interface)] out object ppv);
+    [PreserveSig] int GetVisibleItem(int start, int previous, out int item);
+    [PreserveSig] int GetSelectedItem(int start, out int item);
+    [PreserveSig] int GetSelection(int noneImpliesFolder, [MarshalAs(UnmanagedType.Interface)] out object? array);
 }
 
 [ComImport, Guid("1AC3D9F0-175C-11D1-95BE-00609797EA4F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
@@ -101,6 +107,17 @@ internal interface IShellItem
     [PreserveSig] int GetDisplayName(uint sigdn, out nint name);
     [PreserveSig] int GetAttributes(uint mask, out uint attributes);
     [PreserveSig] int Compare(IShellItem other, uint hint, out int order);
+}
+
+[ComImport, Guid("B63EA76D-1F85-456F-A19C-48159EFA858B"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+internal interface IShellItemArray
+{
+    [PreserveSig] int BindToHandler(nint pbc, ref Guid bhid, ref Guid riid, out nint ppv);
+    [PreserveSig] int GetPropertyStore(int flags, ref Guid riid, out nint ppv);
+    [PreserveSig] int GetPropertyDescriptionList(nint key, ref Guid riid, out nint ppv);
+    [PreserveSig] int GetAttributes(int flags, uint mask, out uint attributes);
+    [PreserveSig] int GetCount(out int count);
+    [PreserveSig] int GetItemAt(int index, out IShellItem? item);
 }
 
 [ComImport, Guid("BCC18B79-BA16-442F-80C4-8A59C30C463B"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
@@ -124,4 +141,5 @@ internal static class ShellIds
     public const int SWC_DESKTOP = 8;
     public const int SWFO_NEEDDISPATCH = 1;
     public const uint SVGIO_ALLVIEW = 2;
+    public const uint SFGAO_STREAM = 0x00400000, SFGAO_FOLDER = 0x20000000, SFGAO_FILESYSTEM = 0x40000000;
 }

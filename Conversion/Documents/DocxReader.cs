@@ -16,6 +16,8 @@ internal sealed class DocxReader
     static readonly XNamespace V = "urn:schemas-microsoft-com:vml";
     static readonly XNamespace MC = "http://schemas.openxmlformats.org/markup-compatibility/2006";
     static readonly XNamespace M = "http://schemas.openxmlformats.org/officeDocument/2006/math";
+    static readonly XNamespace WPS = "http://schemas.microsoft.com/office/word/2010/wordprocessingShape";
+    static readonly XNamespace Pic = "http://schemas.openxmlformats.org/drawingml/2006/picture";
 
     readonly ZipArchive _zip;
     // Relationships (images, links) are per part: the body, each header/footer and the notes all have their own.
@@ -33,10 +35,16 @@ internal sealed class DocxReader
     {
         public readonly System.Text.StringBuilder Code = new();
         public bool Separated, ReplacesResult;
+        public string? Link;
     }
+    /// <summary>How many tables, text boxes and notes the reader is inside.</summary>
+    int _depth, _tableDepth;
+    int _cells;
     readonly Dictionary<string, Style> _styles = [];
     readonly Dictionary<string, NumberingInstance> _numbering = [];
+    /// <summary>List numbers reached, per list definition (which several numbering instances can share).</summary>
     readonly Dictionary<string, int[]> _counters = [];
+    readonly HashSet<(string numId, int level)> _restarted = [];
     readonly XElement? _defaultRPr, _defaultPPr;
     readonly string? _defaultParaStyle;
     string? _majorFont, _minorFont;
@@ -49,30 +57,34 @@ internal sealed class DocxReader
     string? _previousStyle;
 
     sealed record Style(string Id, string? Name, string? BasedOn, XElement? PPr, XElement? RPr, XElement? TblPr, string Type);
-    sealed record Level(int Start, string Format, string Text, XElement? PPr, XElement? RPr);
-    sealed record NumberingInstance(string Key, Dictionary<int, Level> Levels);
+    sealed record Level(int Start, string Format, string Text, XElement? PPr, XElement? RPr, int? Restart = null, bool Legal = false);
+    /// <param name="Key">The list definition whose numbers it shares.</param>
+    /// <param name="Overrides">Levels it starts again, and at what.</param>
+    sealed record NumberingInstance(string Key, Dictionary<int, Level> Levels, Dictionary<int, int> Overrides);
 
     sealed class RunProps
     {
         public bool Bold, Italic, Underline, Strike, Caps, Hidden;
-        public string? Vert, Font;
-        public double? Size;
+        // Right-to-left text has its own bold, italic, size and font.
+        public bool Rtl, BoldCs, ItalicCs;
+        public string? Vert, Font, FontCs;
+        public double? Size, SizeCs;
         public Color? Color, Highlight;
 
         public RunProps Clone() => (RunProps)MemberwiseClone();
 
         public TextStyle ToStyle() => new()
         {
-            Bold = Bold,
-            Italic = Italic,
+            Bold = Rtl ? BoldCs : Bold,
+            Italic = Rtl ? ItalicCs : Italic,
             Underline = Underline,
             Strike = Strike,
             Superscript = Vert == "superscript",
             Subscript = Vert == "subscript",
-            Size = Size,
+            Size = Rtl ? SizeCs ?? Size : Size,
             Color = Color,
             Highlight = Highlight,
-            Font = Font,
+            Font = Rtl ? FontCs ?? Font : Font,
         };
     }
 
@@ -80,13 +92,15 @@ internal sealed class DocxReader
     {
         public TextAlignment Align = TextAlignment.Left;
         public double Before, After, Left, First, Line = 1;
-        public bool PageBreakBefore, ContextualSpacing;
+        public bool PageBreakBefore, ContextualSpacing, Bidi;
         public string? NumId;
         public int Ilvl;
         public int? OutlineLevel;
     }
 
-    public static DDocument Read(string path)
+    public static DDocument Read(string path) => DocumentFiles.Open(path, DocumentShape.Word, () => ReadDocx(path));
+
+    internal static DDocument ReadDocx(string path)
     {
         using var zip = ZipFile.OpenRead(path);
         return new DocxReader(zip).Build(Path.GetFileNameWithoutExtension(path));
@@ -99,7 +113,8 @@ internal sealed class DocxReader
         var rootRels = Load("_rels/.rels");
         var officeDoc = rootRels?.Root?.Elements(PR + "Relationship")
             .FirstOrDefault(r => ((string?)r.Attribute("Type"))?.EndsWith("/officeDocument") == true);
-        if (officeDoc != null) mainPath = ((string)officeDoc.Attribute("Target")!).TrimStart('/');
+        if ((string?)officeDoc?.Attribute("Target") is { Length: > 0 } main) mainPath = main.TrimStart('/');
+        if (zip.GetEntry(mainPath) == null && zip.GetEntry("word/document.xml") != null) mainPath = "word/document.xml";
         _docDir = mainPath.Contains('/') ? mainPath[..mainPath.LastIndexOf('/')] : "";
         MainPath = mainPath;
 
@@ -157,33 +172,43 @@ internal sealed class DocxReader
         if (Load(numberingPath ?? "word/numbering.xml")?.Root is { } numbering)
         {
             var abstracts = new Dictionary<string, Dictionary<int, Level>>();
+            var styleLinks = new Dictionary<string, string>();
             foreach (var an in numbering.Elements(W + "abstractNum"))
             {
                 var levels = new Dictionary<int, Level>();
                 foreach (var lvl in an.Elements(W + "lvl"))
-                {
-                    int ilvl = Int(Attr(lvl, "ilvl")) ?? 0;
-                    levels[ilvl] = new Level(Int(Val(lvl.Element(W + "start"))) ?? 1, Val(lvl.Element(W + "numFmt")) ?? "decimal",
-                        Val(lvl.Element(W + "lvlText")) ?? "", lvl.Element(W + "pPr"), lvl.Element(W + "rPr"));
-                }
-                if (Attr(an, "abstractNumId") is { } aid) abstracts[aid] = levels;
+                    if (Int(Attr(lvl, "ilvl")) is null or (>= 0 and <= 8)) levels[Int(Attr(lvl, "ilvl")) ?? 0] = ReadLevel(lvl);
+                if (Attr(an, "abstractNumId") is not { } aid) continue;
+                abstracts[aid] = levels;
+                if (Val(an.Element(W + "numStyleLink")) is { } link) styleLinks[aid] = link;
             }
-            foreach (var num in numbering.Elements(W + "num"))
+            // A definition that only points at a numbering style uses the one that style's numbering points to.
+            var instances = numbering.Elements(W + "num").ToList();
+            foreach (var (aid, link) in styleLinks)
+                if (abstracts[aid].Count == 0 && _styles.TryGetValue(link, out var linked) && Val(linked.PPr?.Element(W + "numPr")?.Element(W + "numId")) is { } linkedNum
+                    && instances.FirstOrDefault(n => Attr(n, "numId") == linkedNum) is { } target && Val(target.Element(W + "abstractNumId")) is { } real && abstracts.TryGetValue(real, out var realLevels))
+                    abstracts[aid] = realLevels;
+            foreach (var num in instances)
             {
                 var numId = Attr(num, "numId");
                 var aid = Val(num.Element(W + "abstractNumId"));
                 if (numId == null || aid == null || !abstracts.TryGetValue(aid, out var baseLevels)) continue;
                 var levels = new Dictionary<int, Level>(baseLevels);
+                var overrides = new Dictionary<int, int>();
                 foreach (var ov in num.Elements(W + "lvlOverride"))
                 {
                     int ilvl = Int(Attr(ov, "ilvl")) ?? 0;
-                    if (Int(Val(ov.Element(W + "startOverride"))) is int start && levels.TryGetValue(ilvl, out var l))
-                        levels[ilvl] = l with { Start = start };
+                    if (ilvl is < 0 or > 8) continue;
+                    if (ov.Element(W + "lvl") is { } replaced) levels[ilvl] = ReadLevel(replaced);
+                    if (Int(Val(ov.Element(W + "startOverride"))) is int start) overrides[ilvl] = start;
                 }
-                _numbering[numId] = new NumberingInstance(numId, levels);
+                _numbering[numId] = new NumberingInstance(aid, levels, overrides);
             }
         }
     }
+
+    static Level ReadLevel(XElement lvl) => new(Int(Val(lvl.Element(W + "start"))) ?? 1, Val(lvl.Element(W + "numFmt")) ?? "decimal",
+        Val(lvl.Element(W + "lvlText")) ?? "", lvl.Element(W + "pPr"), lvl.Element(W + "rPr"), Int(Val(lvl.Element(W + "lvlRestart"))), lvl.Element(W + "isLgl") is { } legal && On(legal));
 
     string MainPath { get; }
 
@@ -198,7 +223,8 @@ internal sealed class DocxReader
         doc.Font = baseRun.Font ?? _minorFont ?? "Calibri";
         doc.FontSize = baseRun.Size ?? 11;
 
-        _sections = body.Descendants(W + "sectPr").Where(s => s.Parent?.Name == W + "pPr" || s.Parent == body).ToList();
+        // (A changed section keeps its old settings inside it; those aren't sections.)
+        _sections = body.Descendants(W + "sectPr").Where(s => s.Parent == body || s.Parent?.Name == W + "pPr" && s.Parent.Parent?.Parent == body).ToList();
         ReadBlocks(body.Elements(), doc.Blocks, null);
 
         // The document's page settings are its first section's; later sections carry their own.
@@ -223,6 +249,7 @@ internal sealed class DocxReader
             }
         }
         ReadHeadersAndFooters(body, doc);
+        DocumentLimits.Finish(doc);
         doc.NormalizeDefaults();
         return doc;
     }
@@ -291,22 +318,97 @@ internal sealed class DocxReader
 
     void ReadBlocks(IEnumerable<XElement> elements, List<DBlock> output, Style? tableStyle)
     {
-        foreach (var el in elements)
+        _depth++;
+        bool deepEnough = !DocumentLimits.CanGoDeeper(_depth);
+        foreach (var el in Unwrapped(elements))
         {
-            if (el.Name == W + "p") ReadParagraph(el, output, tableStyle);
+            if (deepEnough) Flatten(el, output);
+            else if (el.Name == W + "p")
+            {
+                if (_joinNext is { } before && output.LastOrDefault() == before) ReadParagraph(el, output, tableStyle, before);
+                else ReadParagraph(el, output, tableStyle);
+            }
             else if (el.Name == W + "tbl")
             {
+                if (_tableDepth >= DocumentLimits.TableDepth) { Flatten(el, output); continue; }
                 var table = ReadTable(el);
+                if (table.Rows.Count == 0) continue;
                 if (_pendingSection != null) { table.Section = _pendingSection; _pendingSection = null; }
                 output.Add(table);
             }
-            else if (el.Name == W + "sdt") ReadBlocks(el.Element(W + "sdtContent")?.Elements() ?? [], output, tableStyle);
-            else if (el.Name == W + "customXml" || el.Name == W + "ins" || el.Name == W + "smartTag") ReadBlocks(el.Elements(), output, tableStyle);
-            else if (el.Name == MC + "AlternateContent") ReadBlocks(Alternate(el), output, tableStyle);
+            else if (el.Name == W + "altChunk") ReadChunk(el, output);
+            else if (el.Name == W + "bookmarkStart" || el.Name == M + "oMathPara" || el.Name == M + "oMath" || el.Name == W + "r" || el.Name == W + "hyperlink")
+                // Not where they belong, but Word shows them all the same.
+                if (el.Name != W + "bookmarkStart") ReadParagraph(new XElement(W + "p", el), output, tableStyle);
+                else if (Attr(el, "name") is { } mark) _bookmarks.Add(mark);
+        }
+        _depth--;
+    }
+
+    /// <summary>Elements with whatever merely wraps them (content controls, insertions, smart tags) taken off. Deletions go with their wrapper.</summary>
+    static IEnumerable<XElement> Unwrapped(IEnumerable<XElement> elements)
+    {
+        var pending = new Stack<IEnumerator<XElement>>();
+        pending.Push(elements.GetEnumerator());
+        while (pending.Count > 0)
+        {
+            if (!pending.Peek().MoveNext()) { pending.Pop().Dispose(); continue; }
+            var el = pending.Peek().Current;
+            var name = el.Name;
+            if (name == W + "sdt") { if (el.Element(W + "sdtContent") is { } content) pending.Push(content.Elements().GetEnumerator()); }
+            else if (name == W + "ins" || name == W + "moveTo" || name == W + "smartTag" || name == W + "customXml" || name == W + "sdtContent") pending.Push(el.Elements().GetEnumerator());
+            else if (name == MC + "AlternateContent") pending.Push(Alternate(el).GetEnumerator());
+            else yield return el;
         }
     }
 
-    void ReadParagraph(XElement p, List<DBlock> output, Style? tableStyle)
+    /// <summary>Content nested too deeply to lay out: its paragraphs, one after another.</summary>
+    void Flatten(XElement el, List<DBlock> output)
+    {
+        foreach (var p in el.DescendantsAndSelf(W + "p"))
+        {
+            var text = string.Concat(p.Descendants().Where(t => t.Name == W + "t" && t.Ancestors(W + "p").First() == p).Select(t => t.Value));
+            if (text.Length == 0) continue;
+            var para = new DParagraph();
+            para.Inlines.Add(new DText(text, TextStyle.Plain));
+            output.Add(para);
+        }
+    }
+
+    /// <summary>A whole document of another kind (HTML, RTF, plain text, Word) kept inside this one by the program that made it.</summary>
+    void ReadChunk(XElement el, List<DBlock> output)
+    {
+        if (_depth > 4 || Attr(el, R + "id") is not { } rid || !_rels.TryGetValue(rid, out var rel) || rel.external || _zip.GetEntry(Resolve(rel.target)) is not { } entry) return;
+        using var stream = PackageResources.Open(entry);
+        using var ms = new MemoryStream();
+        stream.CopyTo(ms);
+        var data = ms.ToArray();
+        try
+        {
+            var head = System.Text.Encoding.Latin1.GetString(data, 0, Math.Min(64, data.Length)).TrimStart('\u00EF', '\u00BB', '\u00BF', ' ', '\r', '\n');
+            DDocument? inner = null;
+            if (head.StartsWith("PK", StringComparison.Ordinal))
+            {
+                ms.Position = 0;
+                using var zip = new ZipArchive(ms, ZipArchiveMode.Read);
+                inner = new DocxReader(zip) { _depth = _depth + 1 }.Build("");
+            }
+            else if (head.StartsWith(@"{\rtf", StringComparison.Ordinal)) inner = RichText.ReadRtf(data, null);
+            else if (head.StartsWith('<')) inner = HtmlReader.FromHtml(HtmlReader.Decode(data), null, src => src.StartsWith("data:", StringComparison.OrdinalIgnoreCase) ? DocumentPictures.FromDataUri(src) : null);
+            if (inner != null) output.AddRange(inner.Blocks);
+            else output.AddRange(PlainText.Paragraphs(TextDecoding.Decode(data)));
+        }
+        catch (Exception ex) when (ex is ConversionException or InvalidDataException or System.Xml.XmlException or ArgumentException)
+        {
+            Log.Write($"Skipped part of a Word document: {ex.Message}");
+        }
+    }
+
+    readonly List<string> _bookmarks = [];
+    /// <summary>The paragraph whose mark was deleted: the next one runs on from it.</summary>
+    DParagraph? _joinNext;
+
+    void ReadParagraph(XElement p, List<DBlock> output, Style? tableStyle, DParagraph? joined = null)
     {
         var pPr = p.Element(W + "pPr");
         var styleId = Val(pPr?.Element(W + "pStyle")) ?? _defaultParaStyle;
@@ -327,7 +429,7 @@ internal sealed class DocxReader
         }
         ilvl = Math.Clamp(ilvl, 0, 8);
         Level? level = null;
-        if (numId != null && numId != "0" && _numbering.TryGetValue(numId, out var instance))
+        if (joined == null && numId != null && numId != "0" && _numbering.TryGetValue(numId, out var instance))
         {
             instance.Levels.TryGetValue(ilvl, out level);
             if (level != null) ApplyPara(props, level.PPr);
@@ -339,13 +441,20 @@ internal sealed class DocxReader
         if (tableStyle != null) foreach (var s in Chain(tableStyle.Id)) ApplyRun(runBase, s.RPr);
         foreach (var s in styles) ApplyRun(runBase, s.RPr);
 
-        var para = NewParagraph(props, styles);
+        // A field whose result never came in its own paragraph isn't coming: don't let it swallow the rest.
+        while (_fields.Count > 0 && !_fields.Peek().Separated) _fields.Pop();
+        var para = joined ?? NewParagraph(props, styles);
+        _joinNext = null;
         if (level != null && numId != null)
         {
             para.ListLevel = ilvl;
             para.List = level.Format == "bullet" ? ListKind.Bullet : ListKind.Number;
             para.ListLabel = Label(numId, ilvl, level);
+            // A level that draws nothing isn't a list to look at.
+            if (para.ListLabel.Trim().Length == 0) (para.List, para.ListLabel) = (ListKind.None, null);
         }
+        foreach (var bookmark in _bookmarks) para.Inlines.Add(new DAnchor(bookmark));
+        _bookmarks.Clear();
 
         var markProps = runBase.Clone();
         ApplyRun(markProps, pPr?.Element(W + "rPr"));
@@ -360,8 +469,22 @@ internal sealed class DocxReader
 
         var pending = new List<DBlock>();
         var current = para;
-        output.Add(current);
+        if (joined == null) output.Add(current);
         ReadInlines(p.Elements().Where(e => e.Name != W + "pPr"), runBase, null, ref current, output, pending, props, styles);
+        // A tracked deletion of the paragraph mark: an empty one is gone, and any other runs on into the next.
+        bool markDeleted = pPr?.Element(W + "rPr") is { } markRun && (markRun.Element(W + "del") != null || markRun.Element(W + "moveFrom") != null) && pPr.Element(W + "sectPr") == null;
+        if (markDeleted && p.ElementsAfterSelf(W + "p").Any())
+        {
+            if (current.Inlines.Count == 0 && joined == null && current == para)
+            {
+                output.Remove(current);
+                if (current.PageBreakBefore) _pendingPageBreak = true;
+                if (current.Section != null) _pendingSection = current.Section;
+                output.AddRange(pending);
+                return;
+            }
+            if (pending.Count == 0) _joinNext = current;
+        }
         // A page break at the end of a paragraph leaves nothing after it; Word doesn't show that as an
         // empty line at the top of the next page, so carry the break to the next paragraph instead.
         if (current != para && current.Inlines.Count == 0 && current.PageBreakBefore)
@@ -399,6 +522,12 @@ internal sealed class DocxReader
         };
         _pendingPageBreak = false;
         if (_pendingSection != null) { para.Section = _pendingSection; _pendingSection = null; }
+        if (props.Bidi)
+        {
+            // "Left" means the starting side, which is the right in right-to-left text.
+            para.RightToLeft = true;
+            para.Align = props.Align switch { TextAlignment.Left => TextAlignment.Right, TextAlignment.Right => TextAlignment.Left, var a => a };
+        }
 
         var name = styles.LastOrDefault()?.Name?.ToLowerInvariant();
         if (props.OutlineLevel is int outline and < 9) para.Heading = Math.Min(6, outline + 1);
@@ -409,55 +538,162 @@ internal sealed class DocxReader
 
     string Label(string numId, int ilvl, Level level)
     {
-        if (!_counters.TryGetValue(numId, out var counts))
+        var instance = _numbering[numId];
+        if (!_counters.TryGetValue(instance.Key, out var counts))
         {
             counts = new int[9];
             for (int i = 0; i < 9; i++) counts[i] = int.MinValue;
-            _counters[numId] = counts;
+            _counters[instance.Key] = counts;
         }
-        var levels = _numbering[numId].Levels;
-        if (counts[ilvl] == int.MinValue) counts[ilvl] = level.Start - 1;
-        counts[ilvl]++;
-        for (int i = ilvl + 1; i < 9; i++) counts[i] = int.MinValue;
+        var levels = instance.Levels;
+        // An instance that overrides a start begins its numbers again the first time it's used.
+        if (instance.Overrides.TryGetValue(ilvl, out int from) && _restarted.Add((numId, ilvl))) counts[ilvl] = from - 1;
+        else if (counts[ilvl] == int.MinValue) counts[ilvl] = (instance.Overrides.TryGetValue(ilvl, out from) ? from : level.Start) - 1;
+        if (counts[ilvl] < int.MaxValue) counts[ilvl]++;
+        // Deeper levels start again, unless they say they only do after some other level.
+        for (int i = ilvl + 1; i < 9; i++)
+            if (!levels.TryGetValue(i, out var deeper) || deeper.Restart is not { } restart || restart > ilvl) counts[i] = int.MinValue;
 
-        if (level.Format == "bullet") return ListLabels.NormalizeBullet(level.Text);
-        var text = level.Text;
-        for (int i = 0; i <= ilvl; i++)
+        if (level.Format == "bullet")
         {
+            var font = Attr(level.RPr?.Element(W + "rFonts"), "ascii") ?? Attr(level.RPr?.Element(W + "rFonts"), "hAnsi");
+            return level.Text.Length == 1 && SymbolText(level.Text[0], font) is { } symbol ? symbol : ListLabels.NormalizeBullet(level.Text);
+        }
+        var text = new System.Text.StringBuilder();
+        for (int k = 0; k < level.Text.Length; k++)
+        {
+            if (level.Text[k] != '%' || k + 1 >= level.Text.Length || level.Text[k + 1] is < '1' or > '9') { text.Append(level.Text[k]); continue; }
+            int i = level.Text[++k] - '1';
+            if (i > ilvl) continue;
             var lvl = levels.TryGetValue(i, out var l) ? l : level;
             int value = counts[i] == int.MinValue ? lvl.Start : counts[i];
-            text = text.Replace($"%{i + 1}", ListLabels.Format(value, lvl.Format));
+            text.Append(Number(value, level.Legal && i < ilvl ? "decimal" : lvl.Format));
         }
-        return text;
+        return text.ToString();
     }
+
+    static string Number(int n, string format) => format switch
+    {
+        "decimalZero" => n.ToString("00", System.Globalization.CultureInfo.InvariantCulture),
+        "ordinal" => n + (n % 100 is 11 or 12 or 13 ? "th" : (n % 10) switch { 1 => "st", 2 => "nd", 3 => "rd", _ => "th" }),
+        // Word doubles letters (z, aa, bb) rather than counting on (z, aa, ab).
+        "lowerLetter" or "upperLetter" when n is > 26 and <= 780 => ListLabels.Format(1 + (n - 1) % 26, format) is var one ? string.Concat(Enumerable.Repeat(one, 1 + (n - 1) / 26)) : "",
+        _ => ListLabels.Format(n, format),
+    };
+
+    /// <summary>Characters of the symbol fonts as the Unicode ones they look like.</summary>
+    static string? SymbolText(char c, string? font)
+    {
+        int code = c >= 0xF000 && c <= 0xF0FF ? c - 0xF000 : c;
+        if (code is < 0x20 or > 0xFF) return null;
+        if (font != null && font.Equals("Symbol", StringComparison.OrdinalIgnoreCase)) return code - 0x20 < SymbolFont.Length && SymbolFont[code - 0x20] is var s and not '\0' ? s.ToString() : null;
+        if (font == null || !font.StartsWith("Wingdings", StringComparison.OrdinalIgnoreCase)) return null;
+        if (font.Equals("Wingdings 2", StringComparison.OrdinalIgnoreCase))
+            return code switch { 0x50 => "✓", 0x52 => "☑", 0x54 => "☒", 0x4F => "✗", 0xA3 => "☐", 0x97 or 0x98 or 0x95 => "•", _ => null };
+        if (font.Equals("Wingdings 3", StringComparison.OrdinalIgnoreCase))
+            return code switch { 0x7D => "▶", 0x84 => "◀", 0x70 => "▲", 0x71 => "▼", 0x22 => "→", 0x21 => "←", _ => null };
+        return code switch
+        {
+            0x22 => "✂", 0x28 => "☎", 0x2A => "✉", 0x3A => "💻", 0x46 => "☞", 0x45 => "☜", 0x4A => "☺", 0x4B => "😐", 0x4C => "☹", 0x6C => "●", 0x6E => "■", 0x6F or 0xA8 => "☐",
+            0x71 or 0x72 => "❑", 0x73 => "⬧", 0x74 => "⧫", 0x75 => "◆", 0x76 => "❖", 0x77 => "⬥", 0xA1 => "○", 0xA7 => "▪", 0xAB => "★", 0xB7 or 0x9F => "•", 0x9E => "·",
+            0xD8 => "➢", 0xDF or 0xE7 => "←", 0xE0 or 0xE8 => "→", 0xE1 => "↑", 0xE2 => "↓", 0xEF => "⇦", 0xF0 => "⇨", 0xFB => "✗", 0xFC => "✓", 0xFD => "☒", 0xFE => "☑", 0x4D => "💣", 0x54 => "❄",
+            0x80 => "⓪", >= 0x81 and <= 0x8A => ((char)(0x2460 + code - 0x81)).ToString(), >= 0x8C and <= 0x95 => ((char)(0x2776 + code - 0x8C)).ToString(),
+            _ => null,
+        };
+    }
+
+    // Adobe's Symbol encoding, from 0x20.
+    const string SymbolFont =
+        " !∀#∃%&∋()∗+,−./0123456789:;<=>?≅ΑΒΧΔΕΦΓΗΙϑΚΛΜΝΟΠΘΡΣΤΥςΩΞΨΖ[∴]⊥_‾αβχδεφγηιϕκλμνοπθρστυϖωξψζ{|}∼\0" +
+        "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0" +
+        "€ϒ′≤⁄∞ƒ♣♦♥♠↔←↑→↓°±″≥×∝∂•÷≠≡≈…⏐⎯↵ℵℑℜ℘⊗⊕∅∩∪⊃⊇⊄⊂⊆∈∉∠∇®©™∏√⋅¬∧∨⇔⇐⇑⇒⇓◊〈®©™∑⎛⎜⎝⎡⎢⎣⎧⎨⎩⎪\0〉∫⌠⎮⌡⎞⎟⎠⎤⎥⎦⎫⎬⎭\0";
 
     // ------------------------------------------------------------------ inlines
 
     void ReadInlines(IEnumerable<XElement> elements, RunProps runBase, string? link, ref DParagraph current,
         List<DBlock> output, List<DBlock> pending, ParaProps props, List<Style> styles)
     {
-        foreach (var el in elements)
+        _depth++;
+        bool deepEnough = !DocumentLimits.CanGoDeeper(_depth);
+        foreach (var el in Unwrapped(elements))
         {
             var name = el.Name;
-            if (name == W + "r") ReadRun(el, runBase, link, ref current, output, pending, props, styles);
+            if (deepEnough) AddText(current, string.Concat(el.Descendants(W + "t").Select(t => t.Value)), runBase.ToStyle(), link);
+            else if (name == W + "r") ReadRun(el, runBase, link, ref current, output, pending, props, styles);
             else if (name == W + "hyperlink")
             {
                 string? target = null;
                 if (Attr(el, R + "id") is { } rid && _rels.TryGetValue(rid, out var rel)) target = rel.target;
+                if (Attr(el, "anchor") is { Length: > 0 } anchor) target = target == null ? "#" + anchor : $"{target}#{anchor}";
                 ReadInlines(el.Elements(), runBase, target ?? link, ref current, output, pending, props, styles);
             }
             else if (name == W + "fldSimple" && FieldKindOf(Attr(el, "instr")) is { } kind)
                 current.Inlines.Add(new DField(kind, RunStyleOf(el.Element(W + "r"), runBase)));
-            else if (name == W + "ins" || name == W + "smartTag" || name == W + "customXml" || name == W + "fldSimple" ||
-                     name == W + "moveTo" || name == W + "bdo" || name == W + "dir")
+            else if (name == W + "fldSimple")
+                ReadInlines(el.Elements(), runBase, FieldLink(Attr(el, "instr")) ?? link, ref current, output, pending, props, styles);
+            else if (name == W + "bdo" || name == W + "dir")
                 ReadInlines(el.Elements(), runBase, link, ref current, output, pending, props, styles);
-            else if (name == W + "sdt")
-                ReadInlines(el.Element(W + "sdtContent")?.Elements() ?? [], runBase, link, ref current, output, pending, props, styles);
-            else if (name == MC + "AlternateContent")
-                ReadInlines(Alternate(el), runBase, link, ref current, output, pending, props, styles);
+            else if (name == W + "bookmarkStart")
+            {
+                if (Attr(el, "name") is { Length: > 0 } bookmark) current.Inlines.Add(new DAnchor(bookmark));
+            }
             else if (name == M + "oMathPara" || name == M + "oMath")
-                current.Inlines.Add(new DText(string.Concat(el.Descendants(M + "t").Select(t => t.Value)), runBase.ToStyle()));
+                AddText(current, Formula(el, 0), runBase.ToStyle(), link);
         }
+        _depth--;
+    }
+
+    /// <summary>Where a HYPERLINK field leads: its address, or a "#bookmark" in this document.</summary>
+    static string? FieldLink(string? code)
+    {
+        if (code == null || !code.TrimStart().StartsWith("HYPERLINK", StringComparison.OrdinalIgnoreCase)) return null;
+        string url = "", name = "";
+        var words = System.Text.RegularExpressions.Regex.Matches(code, "\"([^\"]*)\"|\\S+").Select(m => m.Groups[1].Success ? m.Groups[1].Value : m.Value).ToList();
+        for (int i = 1; i < words.Count; i++)
+        {
+            switch (words[i].ToLowerInvariant())
+            {
+                case "\\l": if (++i < words.Count) name = words[i]; break;
+                case "\\o" or "\\t": i++; break; // a tip or a frame
+                case ['\\', _]: break;
+                default: if (url.Length == 0) url = words[i].Replace(@"\\", @"\"); break;
+            }
+        }
+        if (url.Length > 0) return name.Length > 0 ? $"{url}#{name}" : url;
+        return name.Length > 0 ? "#" + name : null;
+    }
+
+    /// <summary>An equation as a line of text: (a+b)/c for fractions, x^2 for powers, √(x) for roots.</summary>
+    static string Formula(XElement el, int depth)
+    {
+        if (!DocumentLimits.CanGoDeeper(depth, 80)) return string.Concat(el.Descendants(M + "t").Select(t => t.Value));
+        string Part(string name) => el.Element(M + name) is { } part ? Formula(part, depth + 1) : "";
+        static string Group(string s) => s.Length > 1 && !s.All(char.IsLetterOrDigit) ? $"({s})" : s;
+        string Set(string properties, string name, string fallback) => Val(el.Element(M + properties)?.Element(M + name)) ?? (string?)el.Element(M + properties)?.Element(M + name)?.Attribute(M + "val") ?? fallback;
+        string Inner() => string.Concat(el.Elements().Select(c => Formula(c, depth + 1)));
+        switch (el.Name.LocalName)
+        {
+            case "t": return el.Value;
+            case "f": return Set("fPr", "type", "bar") == "noBar" ? $"({Part("num")} {Part("den")})" : $"{Group(Part("num"))}/{Group(Part("den"))}";
+            case "sSup": return $"{Part("e")}^{Group(Part("sup"))}";
+            case "sSub": return $"{Part("e")}_{Group(Part("sub"))}";
+            case "sSubSup": return $"{Part("e")}_{Group(Part("sub"))}^{Group(Part("sup"))}";
+            case "sPre": return $"_{Group(Part("sub"))}^{Group(Part("sup"))}{Part("e")}";
+            case "rad": return $"{Part("deg")}√{(Part("e") is { Length: > 1 } e ? $"({e})" : Part("e"))}";
+            case "nary":
+                var sign = Set("naryPr", "chr", "∫");
+                return sign + (Part("sub") is { Length: > 0 } sub ? "_" + Group(sub) : "") + (Part("sup") is { Length: > 0 } sup ? "^" + Group(sup) : "") + " " + Part("e");
+            case "d":
+                return Set("dPr", "begChr", "(") + string.Join(Set("dPr", "sepChr", "|"), el.Elements(M + "e").Select(c => Formula(c, depth + 1))) + Set("dPr", "endChr", ")");
+            case "m": return "[" + string.Join("; ", el.Elements(M + "mr").Select(r => string.Join(", ", r.Elements(M + "e").Select(c => Formula(c, depth + 1))))) + "]";
+            case "eqArr": return string.Join("; ", el.Elements(M + "e").Select(c => Formula(c, depth + 1)));
+            case "func": return $"{Part("fName")} {Part("e")}";
+            case "limLow": return $"{Part("e")}_{Group(Part("lim"))}";
+            case "limUpp": return $"{Part("e")}^{Group(Part("lim"))}";
+            case "acc": return Part("e") + Set("accPr", "chr", "\u0302");
+            case "del" or "moveFrom": return "";
+        }
+        return el.Name.LocalName.EndsWith("Pr", StringComparison.Ordinal) ? "" : Inner();
     }
 
     void ReadRun(XElement r, RunProps runBase, string? link, ref DParagraph current,
@@ -467,10 +703,9 @@ internal sealed class DocxReader
         var rPr = r.Element(W + "rPr");
         if (Val(rPr?.Element(W + "rStyle")) is { } rStyle) foreach (var s in Chain(rStyle)) ApplyRun(rp, s.RPr);
         ApplyRun(rp, rPr);
-        if (rp.Hidden) return;
         var style = rp.ToStyle();
-
-        foreach (var el in r.Elements())
+        // A field's begin, code and end still count in hidden text.
+        foreach (var el in rp.Hidden ? r.Elements().Where(e => e.Name == W + "fldChar" || e.Name == W + "instrText") : r.Elements())
         {
             var n = el.Name;
             // Complex fields: begin … code … separate … displayed result … end. Page-number fields
@@ -488,6 +723,7 @@ internal sealed class DocxReader
                             current.Inlines.Add(new DField(kind, style));
                             field.ReplacesResult = true;
                         }
+                        else field.Link = FieldLink(field.Code.ToString());
                         break;
                     case "end" when _fields.Count > 0:
                         var ended = _fields.Pop();
@@ -501,18 +737,30 @@ internal sealed class DocxReader
                 if (_fields.Count > 0 && !_fields.Peek().Separated) _fields.Peek().Code.Append(el.Value);
                 continue;
             }
-            if (_fields.Any(f => f.ReplacesResult)) continue;
+            if (_fields.Count > 0)
+            {
+                if (_fields.Any(f => f.ReplacesResult)) continue;
+                // Anything before the result is part of the field's code (a nested field's result, mostly).
+                if (!_fields.Peek().Separated && n != W + "drawing" && n != W + "pict" && n != MC + "AlternateContent") { if (n == W + "t") _fields.Peek().Code.Append(el.Value); continue; }
+            }
+            var runLink = link ?? (_fields.Count > 0 ? _fields.FirstOrDefault(f => f.Link != null)?.Link : null);
 
             if (n == W + "footnoteReference" || n == W + "endnoteReference")
             {
                 bool endnote = n == W + "endnoteReference";
                 var notes = endnote ? _endnotes : _footnotes;
-                if (_currentNote == null && Attr(el, "id") is { } id && notes.TryGetValue(id, out var body))
+                if (_currentNote == null && Attr(el, "id") is { } id && notes.TryGetValue(id, out var body) && DocumentLimits.CanGoDeeper(_depth))
                 {
                     var note = new DNote(endnote ? ++_endnoteNumber : ++_footnoteNumber, endnote, style);
                     var saved = _currentNote;
                     _currentNote = note;
+                    // The note is a story of its own: the field and paragraph around it don't reach into it.
+                    var (fields, previous, previousStyle, join) = (_fields.ToArray(), _previous, _previousStyle, _joinNext);
+                    _fields.Clear();
                     WithPart((endnote ? _endnotesPath : _footnotesPath)!, () => ReadBlocks(body.Elements(), note.Blocks, null));
+                    _fields.Clear();
+                    foreach (var f in fields.Reverse()) _fields.Push(f);
+                    (_previous, _previousStyle, _joinNext) = (previous, previousStyle, join);
                     _currentNote = saved;
                     current.Inlines.Add(note);
                 }
@@ -525,14 +773,29 @@ internal sealed class DocxReader
                 continue;
             }
 
-            if (n == W + "t") AddText(current, rp.Caps ? el.Value.ToUpperInvariant() : el.Value, style, link);
-            else if (n == W + "tab" || n == W + "ptab") AddText(current, "\t", style, link);
-            else if (n == W + "noBreakHyphen") AddText(current, "-", style, link);
+            if (n == W + "t")
+            {
+                var text = rp.Caps ? el.Value.ToUpperInvariant() : el.Value;
+                if (rp.Font is "Symbol" or "Wingdings" or "Wingdings 2" or "Wingdings 3" && string.Concat(text.Select(c => SymbolText(c, rp.Font) ?? c.ToString())) is var symbols && symbols != text)
+                    AddText(current, symbols, style with { Font = null }, runLink);
+                else AddText(current, text, style, runLink);
+            }
+            else if (n == W + "tab" || n == W + "ptab") AddText(current, "\t", style, runLink);
+            else if (n == W + "noBreakHyphen") AddText(current, "\u2011", style, runLink);
+            else if (n == W + "pgNum") current.Inlines.Add(new DField(FieldKind.Page, style));
+            else if (n == W + "ruby")
+            {
+                // The reading follows the characters it belongs to, in brackets.
+                if (DocumentLimits.CanGoDeeper(_depth))
+                    ReadInlines(el.Element(W + "rubyBase")?.Elements() ?? [], runBase, runLink, ref current, output, pending, props, styles);
+                var reading = string.Concat(el.Element(W + "rt")?.Descendants(W + "t").Select(t => t.Value) ?? []);
+                if (reading.Trim().Length > 0) AddText(current, $"({reading.Trim()})", style, runLink);
+            }
             else if (n == W + "sym")
             {
                 var code = Attr(el, "char");
-                if (code != null && int.TryParse(code, System.Globalization.NumberStyles.HexNumber, null, out var ch))
-                    AddText(current, ListLabels.NormalizeBullet(((char)ch).ToString()), style, link);
+                if (code != null && int.TryParse(code, System.Globalization.NumberStyles.AllowHexSpecifier, null, out var ch) && ch is > 0 and <= 0xFFFF)
+                    AddText(current, SymbolText((char)ch, Attr(el, "font")) ?? ListLabels.NormalizeBullet(((char)ch).ToString()), style, runLink);
             }
             else if (n == W + "br" || n == W + "cr")
             {
@@ -547,13 +810,23 @@ internal sealed class DocxReader
                 }
                 else current.Inlines.Add(new DLineBreak());
             }
-            else if (n == W + "drawing") ReadDrawing(el, current, pending, runBase);
-            else if (n == W + "pict" || n == W + "object") ReadVml(el, current);
-            else if (n == MC + "AlternateContent")
+            else if (n == W + "drawing" || n == W + "pict" || n == W + "object" || n == MC + "AlternateContent")
             {
-                var choice = Alternate(el).ToList();
-                foreach (var d in choice.Where(c => c.Name == W + "drawing")) ReadDrawing(d, current, pending, runBase);
-                foreach (var d in choice.Where(c => c.Name == W + "pict")) ReadVml(d, current);
+                if (!DocumentLimits.CanGoDeeper(_depth)) { Flatten(el, pending); continue; }
+                // What's in a text box is its own story.
+                var (previous, previousStyle, join) = (_previous, _previousStyle, _joinNext);
+                var fields = _fields.ToArray();
+                _fields.Clear();
+                _depth++;
+                foreach (var d in n == MC + "AlternateContent" ? Unwrapped([el]) : [el])
+                {
+                    if (d.Name == W + "drawing") ReadDrawing(d, current, pending, runBase);
+                    else if (d.Name == W + "pict" || d.Name == W + "object") ReadVml(d, current, pending);
+                }
+                _depth--;
+                _fields.Clear();
+                foreach (var f in fields.Reverse()) _fields.Push(f);
+                (_previous, _previousStyle, _joinNext) = (previous, previousStyle, join);
             }
         }
     }
@@ -589,12 +862,28 @@ internal sealed class DocxReader
             var extent = container.Element(WP + "extent");
             double width = (Long(Attr(extent, "cx")) ?? 0) / 12700.0, height = (Long(Attr(extent, "cy")) ?? 0) / 12700.0;
 
+            if (DocumentLimits.Clamp(width, 4000) != width || DocumentLimits.Clamp(height, 4000) != height) (width, height) = (Math.Clamp(width, 0, 4000), Math.Clamp(height, 0, 4000));
+
             DImage? image = null;
-            var blip = container.Descendants(A + "blip").FirstOrDefault();
-            if (blip != null && Attr(blip, R + "embed") is { } rid && LoadImage(rid) is { } data)
-                image = new DImage(data.data, data.ext, width, height);
-            else if (Chart(container) is { } chart) image = Charts.ToImage(chart, width, height);
-            var boxes = container.Descendants(W + "txbxContent").Where(b => !b.Ancestors(W + "txbxContent").Any()).ToList();
+            var alt = (string?)container.Element(WP + "docPr")?.Attribute("descr");
+            // Text boxes belonging to this drawing, not to one inside them.
+            var boxes = container.Descendants(W + "txbxContent").Where(b => b.Ancestors().TakeWhile(a => a != container).All(a => a.Name != W + "txbxContent")).ToList();
+            var pictures = container.Descendants(A + "blip").Where(b => b.Ancestors().TakeWhile(a => a != container).All(a => a.Name != W + "txbxContent")).ToList();
+            if (pictures.Count + boxes.Count > 1 && Group(container, width, height) is { Count: > 1 } parts)
+            {
+                // Several pictures or text boxes grouped together, each in its place.
+                foreach (var part in parts)
+                    if (container.Name == WP + "anchor") current.Inlines.Add(part);
+                    else if (part.Image != null && part.Blocks.Count == 0) current.Inlines.Add(part.Image);
+                    else pending.AddRange(part.Blocks);
+                continue;
+            }
+            if (pictures.Select(b => Attr(b, R + "embed")).FirstOrDefault(i => i != null) is { } rid && LoadImage(rid) is { } data)
+            {
+                if (width < 1 || height < 1) (width, height) = ImageSize(data.data);
+                image = new DImage(data.data, data.ext, width, height) { Alt = string.IsNullOrWhiteSpace(alt) ? null : alt };
+            }
+            else if (width >= 1 && height >= 1 && Chart(container) is { } chart) image = Charts.ToImage(chart, width, height);
 
             if (container.Name == WP + "anchor")
             {
@@ -609,6 +898,46 @@ internal sealed class DocxReader
             // An inline text box: keep its text as paragraphs after this one.
             foreach (var box in boxes) ReadBlocks(box.Elements(), pending, null);
         }
+    }
+
+    /// <summary>The pictures and text boxes of a group, placed where the group puts them.</summary>
+    List<DFloat> Group(XElement container, double width, double height)
+    {
+        var parts = new List<DFloat>();
+        bool anchored = container.Name == WP + "anchor";
+        static double Emu(XElement? e, string name) => DocumentLimits.Clamp((Long(Attr(e, name)) ?? 0) / 12700.0, 1e6);
+        void Add(XElement shape, double x, double y, double sx, double sy)
+        {
+            var xfrm = shape.Elements().FirstOrDefault(e => e.Name.LocalName is "spPr")?.Element(A + "xfrm");
+            var f = anchored ? ReadAnchor(container, 0, 0) : new DFloat();
+            f.Width = Emu(xfrm?.Element(A + "ext"), "cx") * sx;
+            f.Height = Emu(xfrm?.Element(A + "ext"), "cy") * sy;
+            if (f.Width < 1 || f.Height < 1) (f.Width, f.Height) = (Math.Max(1, width), Math.Max(1, height));
+            f.X += x + Emu(xfrm?.Element(A + "off"), "x") * sx;
+            f.Y += y + Emu(xfrm?.Element(A + "off"), "y") * sy;
+            if (shape.Descendants(A + "blip").Select(b => Attr(b, R + "embed")).FirstOrDefault(i => i != null) is { } rid && LoadImage(rid) is { } data)
+                f.Image = new DImage(data.data, data.ext, f.Width, f.Height);
+            foreach (var box in shape.Elements().Where(e => e.Name.LocalName == "txbx").Elements(W + "txbxContent")) ReadBlocks(box.Elements(), f.Blocks, null);
+            if (f.Image != null || f.Blocks.Count > 0) parts.Add(f);
+        }
+        void Walk(XElement group, double x, double y, double sx, double sy, int depth)
+        {
+            var xfrm = group.Elements().FirstOrDefault(e => e.Name.LocalName == "grpSpPr")?.Element(A + "xfrm");
+            double chX = Emu(xfrm?.Element(A + "chOff"), "x"), chY = Emu(xfrm?.Element(A + "chOff"), "y");
+            double chW = Emu(xfrm?.Element(A + "chExt"), "cx"), chH = Emu(xfrm?.Element(A + "chExt"), "cy");
+            double w = depth == 0 ? width : Emu(xfrm?.Element(A + "ext"), "cx") * sx, h = depth == 0 ? height : Emu(xfrm?.Element(A + "ext"), "cy") * sy;
+            if (depth > 0) (x, y) = (x + Emu(xfrm?.Element(A + "off"), "x") * sx, y + Emu(xfrm?.Element(A + "off"), "y") * sy);
+            (sx, sy) = (chW > 0 ? w / chW : 1, chH > 0 ? h / chH : 1);
+            (x, y) = (x - chX * sx, y - chY * sy);
+            foreach (var child in group.Elements())
+            {
+                if (child.Name.LocalName == "grpSp" && depth < 10) Walk(child, x, y, sx, sy, depth + 1);
+                else if (child.Name.LocalName is "pic" or "wsp") Add(child, x, y, sx, sy);
+            }
+        }
+        foreach (var group in container.Descendants(A + "graphicData").Elements().Where(e => e.Name.LocalName is "wgp" or "wpc").Take(1))
+            Walk(group, 0, 0, 1, 1, 0);
+        return parts;
     }
 
     static DFloat ReadAnchor(XElement anchor, double width, double height)
@@ -628,8 +957,8 @@ internal sealed class DocxReader
             "margin" or "topMargin" => FloatFrom.Margin,
             _ => FloatFrom.Paragraph,
         };
-        f.X = (Long(ph?.Element(WP + "posOffset")?.Value) ?? 0) / 12700.0;
-        f.Y = (Long(pv?.Element(WP + "posOffset")?.Value) ?? 0) / 12700.0;
+        f.X = DocumentLimits.Clamp((Long(ph?.Element(WP + "posOffset")?.Value) ?? 0) / 12700.0);
+        f.Y = DocumentLimits.Clamp((Long(pv?.Element(WP + "posOffset")?.Value) ?? 0) / 12700.0);
         f.HorizontalAlign = ph?.Element(WP + "align")?.Value switch
         {
             "left" or "inside" => FloatAlign.Start,
@@ -661,23 +990,63 @@ internal sealed class DocxReader
         return f;
     }
 
-    void ReadVml(XElement pict, DParagraph current)
+    void ReadVml(XElement pict, DParagraph current, List<DBlock> pending)
     {
-        foreach (var data in pict.Descendants(V + "imagedata"))
+        bool Own(XElement e) => e.Ancestors().TakeWhile(a => a != pict).All(a => a.Name != W + "txbxContent");
+        foreach (var data in pict.Descendants(V + "imagedata").Where(Own).ToList())
         {
             if (Attr(data, R + "id") is not { } rid || LoadImage(rid) is not { } image) continue;
-            var style = (string?)data.Parent?.Attribute("style") ?? "";
-            double? w = null, h = null;
-            foreach (var part in style.Split(';'))
-            {
-                var kv = part.Split(':', 2);
-                if (kv.Length != 2) continue;
-                if (kv[0].Trim() == "width") w = Units.ParseLength(kv[1]);
-                if (kv[0].Trim() == "height") h = Units.ParseLength(kv[1]);
-            }
+            var (w, h, _, _, _) = VmlStyle(data.Parent);
             var (pw, ph) = ImageSize(image.data);
-            current.Inlines.Add(new DImage(image.data, image.ext, w ?? pw, h ?? ph));
+            current.Inlines.Add(new DImage(image.data, image.ext, w is > 1 ? w.Value : pw, h is > 1 ? h.Value : ph) { Alt = (string?)data.Parent?.Attribute("alt") });
         }
+        foreach (var box in pict.Descendants(V + "textbox").Where(Own).ToList())
+        {
+            var blocks = new List<DBlock>();
+            ReadBlocks(box.Elements(W + "txbxContent").Elements(), blocks, null);
+            if (blocks.Count == 0) continue;
+            var shape = box.Parent;
+            var (w, h, x, y, absolute) = VmlStyle(shape);
+            // In line with the text, or inside a group (whose own units its parts are placed in): the text follows the paragraph.
+            if (!absolute || w is not > 1 || h is not > 1 || shape?.Parent?.Name == V + "group") { pending.AddRange(blocks); continue; }
+            var f = new DFloat { Width = w.Value, Height = h.Value, X = x, Y = y, Wrap = FloatWrap.Square };
+            var style = (string?)shape?.Attribute("style") ?? "";
+            string? Setting(string name) => System.Text.RegularExpressions.Regex.Match(style, $@"(?:^|;)\s*{name}\s*:\s*([^;]+)").Groups[1].Value is { Length: > 0 } v ? v.Trim() : null;
+            if (Setting("mso-position-horizontal-relative") == "page") f.HorizontalFrom = FloatFrom.Page;
+            f.VerticalFrom = Setting("mso-position-vertical-relative") switch { "page" => FloatFrom.Page, "margin" => FloatFrom.Margin, _ => FloatFrom.Paragraph };
+            f.HorizontalAlign = Setting("mso-position-horizontal") switch { "left" => FloatAlign.Start, "center" => FloatAlign.Center, "right" => FloatAlign.End, _ => FloatAlign.None };
+            f.VerticalAlign = Setting("mso-position-vertical") switch { "top" => FloatAlign.Start, "center" => FloatAlign.Center, "bottom" => FloatAlign.End, _ => FloatAlign.None };
+            if ((string?)shape?.Attribute("filled") is not ("f" or "false")) f.Fill = VmlColor((string?)shape?.Attribute("fillcolor"));
+            if ((string?)shape?.Attribute("stroked") is not ("f" or "false")) f.Border = VmlColor((string?)shape?.Attribute("strokecolor")) ?? Colors.Black;
+            f.Blocks.AddRange(blocks);
+            current.Inlines.Add(f);
+        }
+        // WordArt and old text effects.
+        foreach (var path in pict.Descendants(V + "textpath").Where(Own))
+            if ((string?)path.Attribute("string") is { Length: > 0 and < 2000 } text) AddText(current, text, TextStyle.Plain, null);
+    }
+
+    static Color? VmlColor(string? value) => value == null ? null : HtmlReader.CssColor(value.Split(' ')[0].ToLowerInvariant());
+
+    static (double? w, double? h, double x, double y, bool absolute) VmlStyle(XElement? shape)
+    {
+        double? w = null, h = null;
+        double x = 0, y = 0;
+        bool absolute = false;
+        foreach (var part in ((string?)shape?.Attribute("style") ?? "").Split(';'))
+        {
+            var kv = part.Split(':', 2);
+            if (kv.Length != 2) continue;
+            switch (kv[0].Trim())
+            {
+                case "width": w = Units.ParseLength(kv[1]); break;
+                case "height": h = Units.ParseLength(kv[1]); break;
+                case "margin-left": x = Units.ParseLength(kv[1]) ?? 0; break;
+                case "margin-top": y = Units.ParseLength(kv[1]) ?? 0; break;
+                case "position": absolute = kv[1].Trim() == "absolute"; break;
+            }
+        }
+        return (w, h, x, y, absolute);
     }
 
     /// <summary>A chart drawn from the data Word keeps with it.</summary>
@@ -708,22 +1077,21 @@ internal sealed class DocxReader
     {
         if (!_rels.TryGetValue(rid, out var rel) || rel.external) return null;
         var path = Resolve(rel.target);
-        var ext = Path.GetExtension(path).TrimStart('.').ToLowerInvariant();
-        ext = ext switch { "jpg" or "jpeg" => "jpeg", "tif" => "tiff", _ => ext };
-        var entry = _zip.GetEntry(path);
-        if (entry == null) return null;
-        using var stream = PackageResources.Open(entry, media: true);
-        using var ms = new MemoryStream();
-        stream.CopyTo(ms);
-        if (ext is "png" or "jpeg" or "gif" or "bmp" or "tiff") return (ms.ToArray(), ext);
-        // Metafiles (clip art, pasted charts) and SVG become PNG so every output format can show them.
-        if (MagickImages.Decode(ms.ToArray()) is not { } bitmap) return null;
-        var png = new System.Windows.Media.Imaging.PngBitmapEncoder();
-        png.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(bitmap));
-        using var output = new MemoryStream();
-        png.Save(output);
-        return (output.ToArray(), "png");
+        if (_images.TryGetValue(path, out var known)) return known;
+        (byte[], string)? image = null;
+        if (_zip.GetEntry(path) is { } entry)
+        {
+            using var stream = PackageResources.Open(entry, media: true);
+            using var ms = new MemoryStream();
+            stream.CopyTo(ms);
+            // Metafiles (clip art, pasted charts) and SVG become PNG so every output format can show them.
+            image = DocumentPictures.Embeddable(ms.ToArray());
+        }
+        return _images[path] = image;
     }
+
+    /// <summary>Pictures already read: a logo can appear on every page.</summary>
+    readonly Dictionary<string, (byte[] data, string ext)?> _images = [];
 
     internal static (double w, double h) ImageSize(byte[] data)
     {
@@ -755,24 +1123,58 @@ internal sealed class DocxReader
         var grid = tbl.Element(W + "tblGrid")?.Elements(W + "gridCol").Select(g => Twips(Attr(g, "w")) ?? 0).ToList();
         if (grid != null && grid.Count > 0 && grid.All(w => w > 0)) table.ColumnWidths = grid;
 
-        foreach (var tr in tbl.Elements(W + "tr"))
+        _tableDepth++;
+        // Cells merged downwards, by the column they start in.
+        var merged = new Dictionary<int, DCell>();
+        foreach (var tr in Unwrapped(tbl.Elements()).Where(e => e.Name == W + "tr"))
         {
-            var row = new DRow { Header = tr.Element(W + "trPr")?.Element(W + "tblHeader") != null };
-            foreach (var tc in tr.Elements().SelectMany(e => e.Name == W + "sdt" ? e.Element(W + "sdtContent")?.Elements() ?? [] : [e])
-                         .Where(e => e.Name == W + "tc"))
+            var trPr = tr.Element(W + "trPr");
+            if (trPr?.Element(W + "del") != null) continue; // a tracked deletion of the whole row
+            var row = new DRow { Header = trPr?.Element(W + "tblHeader") is { } header && On(header) };
+            int column = 0, covered = 0;
+            void Gap(string name)
+            {
+                if (Int(Val(trPr?.Element(W + name))) is not (> 0 and var gap)) return;
+                row.Cells.Add(new DCell { ColSpan = Math.Min(gap, DocumentLimits.Columns) });
+                column += Math.Min(gap, DocumentLimits.Columns);
+            }
+            Gap("gridBefore");
+            foreach (var tc in Unwrapped(tr.Elements()).Where(e => e.Name == W + "tc"))
             {
                 var tcPr = tc.Element(W + "tcPr");
-                var cell = new DCell
+                if (tcPr?.Element(W + "cellDel") != null) continue;
+                if (++_cells > DocumentLimits.Cells || column > DocumentLimits.Columns * 8) throw new ConversionException("This document has a table that's too big.");
+                int span = Math.Clamp(Int(Val(tcPr?.Element(W + "gridSpan"))) ?? 1, 1, DocumentLimits.Columns);
+                var merge = tcPr?.Element(W + "vMerge");
+                if (merge != null && Attr(merge, "val") is null or "continue" && merged.TryGetValue(column, out var above) && above.ColSpan == span && tcPr?.Element(W + "hMerge") == null)
                 {
-                    ColSpan = Int(Val(tcPr?.Element(W + "gridSpan"))) ?? 1,
-                    Shading = Fill(tcPr?.Element(W + "shd")),
-                };
-                bool continuesMerge = tcPr?.Element(W + "vMerge") is { } vm && Attr(vm, "val") is null or "continue";
-                if (!continuesMerge) ReadBlocks(tc.Elements(), cell.Blocks, style);
+                    above.RowSpan++;
+                    covered++;
+                    column += span;
+                    continue;
+                }
+                // The old way of merging across: the cells after the first only take up room.
+                if (tcPr?.Element(W + "hMerge") is { } across && Attr(across, "val") is null or "continue" && row.Cells.LastOrDefault() is { } first && column > 0 && covered == 0)
+                {
+                    first.ColSpan += span;
+                    column += span;
+                    continue;
+                }
+                var cell = new DCell { ColSpan = span, Shading = Fill(tcPr?.Element(W + "shd")) };
+                ReadBlocks(tc.Elements(), cell.Blocks, style);
+                _joinNext = null;
                 row.Cells.Add(cell);
+                if (merge != null && Attr(merge, "val") == "restart") merged[column] = cell;
+                else merged.Remove(column);
+                column += span;
             }
-            if (row.Cells.Count > 0) table.Rows.Add(row);
+            Gap("gridAfter");
+            // Merges end where a row doesn't carry them on.
+            foreach (var start in merged.Keys.Where(k => k >= column).ToList()) merged.Remove(start);
+            if (row.Cells.Count > 0 || covered > 0) table.Rows.Add(row);
         }
+        _tableDepth--;
+        DocumentLimits.TrimColumns(table);
         return table;
     }
 
@@ -807,6 +1209,7 @@ internal sealed class DocxReader
                         _ => TextAlignment.Left,
                     };
                     break;
+                case "bidi": p.Bidi = On(el); break;
                 case "spacing":
                     if (Twips(Attr(el, "before")) is double b) p.Before = b;
                     if (Twips(Attr(el, "after")) is double a) p.After = a;
@@ -840,6 +1243,10 @@ internal sealed class DocxReader
             {
                 case "b": r.Bold = On(el); break;
                 case "i": r.Italic = On(el); break;
+                case "bCs": r.BoldCs = On(el); break;
+                case "iCs": r.ItalicCs = On(el); break;
+                case "szCs": if (Int(Attr(el, "val")) is int szCs) r.SizeCs = szCs / 2.0; break;
+                case "rtl": r.Rtl = On(el); break;
                 case "caps": r.Caps = On(el); break;
                 case "vanish": r.Hidden = On(el); break;
                 case "strike":
@@ -854,7 +1261,8 @@ internal sealed class DocxReader
                     var font = Attr(el, "ascii") ?? Attr(el, "hAnsi");
                     var theme = Attr(el, "asciiTheme") ?? Attr(el, "hAnsiTheme");
                     if (theme != null) font = theme.StartsWith("major") ? _majorFont ?? font : _minorFont ?? font;
-                    if (font != null) r.Font = font;
+                    if (!string.IsNullOrWhiteSpace(font)) r.Font = font;
+                    if (Attr(el, "cs") is { Length: > 0 } cs) r.FontCs = cs;
                     break;
             }
         }
@@ -889,8 +1297,13 @@ internal sealed class DocxReader
 
     // ------------------------------------------------------------------ helpers
 
-    static IEnumerable<XElement> Alternate(XElement alternate) =>
-        (alternate.Element(MC + "Choice") ?? alternate.Element(MC + "Fallback"))?.Elements() ?? [];
+    /// <summary>The first version of some content that uses only what this reader knows, or else the simple version.</summary>
+    static IEnumerable<XElement> Alternate(XElement alternate)
+    {
+        var choice = alternate.Elements(MC + "Choice").FirstOrDefault(c => ((string?)c.Attribute("Requires") ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries)
+            .All(prefix => prefix is "wps" or "wpg" or "wpc" or "wp14" or "w14" or "w15" or "w16se" or "a14" or "v" or "wne" || c.GetNamespaceOfPrefix(prefix) is { } ns && (ns == WPS || ns == A || ns == Pic)));
+        return (choice ?? alternate.Element(MC + "Fallback") ?? alternate.Element(MC + "Choice"))?.Elements() ?? [];
+    }
 
     XDocument? Load(string path)
     {
@@ -908,6 +1321,7 @@ internal sealed class DocxReader
 
     string Resolve(string target)
     {
+        try { target = Uri.UnescapeDataString(target); } catch (UriFormatException) { }
         if (target.StartsWith('/')) return target.TrimStart('/');
         var parts = (_docDir.Length > 0 ? _docDir + "/" + target : target).Split('/').ToList();
         for (int i = 0; i < parts.Count; i++)
@@ -924,5 +1338,5 @@ internal sealed class DocxReader
     static bool On(XElement el) => Attr(el, "val") is not ("0" or "false" or "off" or "none");
     static int? Int(string? s) => int.TryParse(s, out var v) ? v : null;
     static long? Long(string? s) => long.TryParse(s, out var v) ? v : null;
-    static double? Twips(string? s) => double.TryParse(s, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var v) ? v / 20 : null;
+    static double? Twips(string? s) => double.TryParse(s, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var v) && double.IsFinite(v) ? DocumentLimits.Clamp(v / 20) : null;
 }
