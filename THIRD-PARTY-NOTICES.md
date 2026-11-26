@@ -6,7 +6,7 @@ comes under Microsoft's terms.
 
 | Component | Version | Licence | Texts in `licenses` | Project |
 | --- | --- | --- | --- | --- |
-| FFmpeg | n8.1.3-27-g8dca1586f4-20261031 | LGPL 3.0 or later | `ffmpeg` | https://ffmpeg.org, built by https://github.com/FFmpeg-Builds/FFmpeg-Builds |
+| FFmpeg | n8.1.3-41-ga8029b6528-20261125 | LGPL 3.0 or later | `ffmpeg` | https://ffmpeg.org, built by https://github.com/FFmpeg-Builds/FFmpeg-Builds |
 | Magick.NET and ImageMagick | 15.0.0 | Apache-2.0 and ImageMagick License; contains LGPL and other libraries | `Magick.NET.txt`, `Magick.NET-Notice.txt` | https://github.com/dlemstra/Magick.NET |
 | PDFium | 158.0.8125 | BSD-3-Clause and Apache-2.0; build scripts MIT | `pdfium` | https://pdfium.googlesource.com/pdfium, built by https://github.com/bblanchon/pdfium-binaries |
 | SkiaSharp and Skia | 4.153.1 | MIT; Skia BSD-3-Clause and others | `SkiaSharp.txt`, `SkiaSharp-THIRD-PARTY-NOTICES.txt` | https://github.com/mono/SkiaSharp |
