@@ -1,7 +1,7 @@
 ; Convert Wheel installer (Inno Setup). Built by tools\build-installer.ps1, which passes:
 ;   AppDir (published app), RuntimeDir (private .NET runtime), RuntimeVersion, RuntimeMinimum, WizardDir, OutputDir,
-;   and Sign when the installer is to be signed. Version, publisher and copyright come from the exe, which has
-;   them from ConvertWheel.csproj.
+;   LicensePage (the app's licence, then the third-party and .NET terms) and Sign when the installer is to be signed.
+;   Version, publisher and copyright come from the exe, which has them from ConvertWheel.csproj.
 ;
 ; Installs per user (no administrator prompt) and downloads nothing. The .NET runtime travels inside the installer
 ; but is only copied when this PC doesn't already have .NET 10 for desktop apps; the app looks in its "runtime"
@@ -19,10 +19,13 @@
   #error ConvertWheel.exe has no version
 #endif
 #define UninstallId "{6C0B6F6E-3E8B-4C55-9F5C-8E2C1D0A7B41}"
-#if FileExists(AddBackslash(SourcePath) + "..\LICENSE.txt")
-  #define LicensePage "..\LICENSE.txt"
-#elif FileExists(AddBackslash(SourcePath) + "..\LICENSE")
-  #define LicensePage "..\LICENSE"
+#if FileExists(AddBackslash(SourcePath) + "..\LICENSE")
+  #define AppLicense "..\LICENSE"
+#endif
+#ifndef LicensePage
+  #ifdef AppLicense
+    #define LicensePage AppLicense
+  #endif
 #endif
 
 [Setup]
@@ -60,7 +63,7 @@ WizardStyle=modern
 ; The running app is closed by our own code (it lives in the tray, so there's no window to ask).
 CloseApplications=no
 #ifdef LicensePage
-; Only when the project has a licence of its own to show.
+; The app's licence, and the terms of what comes with it (the .NET runtime's ask the user to agree to them).
 LicenseFile={#LicensePage}
 #endif
 #ifdef Sign
@@ -82,8 +85,8 @@ Type: filesandordirs; Name: "{app}\licenses"; Check: IsUpdate
 
 [Files]
 Source: "{#AppDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-#ifdef LicensePage
-Source: "{#LicensePage}"; DestDir: "{app}"; Flags: ignoreversion
+#ifdef AppLicense
+Source: "{#AppLicense}"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
 #endif
 Source: "{#RuntimeDir}\*"; DestDir: "{app}\runtime"; Flags: ignoreversion recursesubdirs createallsubdirs; Check: NeedsRuntime
 

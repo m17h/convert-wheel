@@ -155,6 +155,27 @@ New-Item -ItemType Directory -Force $OutputDir | Out-Null
 $setup = Join-Path $OutputDir "ConvertWheel-Setup-$version.exe"
 if (Test-Path -LiteralPath $setup) { Remove-Item -LiteralPath $setup }
 $options = @('/Q', "/DAppDir=$appDir", "/DRuntimeDir=$runtimeDir", "/DRuntimeVersion=$runtimeVersion", "/DRuntimeMinimum=$runtimeMinimum", "/DWizardDir=$wizardDir", "/DOutputDir=$OutputDir")
+
+# The licence page: the app's own licence, then what else gets installed. Microsoft's terms for the .NET runtime
+# ask that the people who install it agree to them, so the page says so.
+$license = Join-Path $root 'LICENSE'
+if (-not (Test-Path -LiteralPath $license)) { throw 'LICENSE is missing.' }
+$terms = @"
+------------------------------------------------------------------------------
+
+Convert Wheel also installs third-party components, each under its own licence.
+THIRD-PARTY-NOTICES.md and the licenses folder in the install folder list them
+all with their full texts. Among them is FFmpeg, under the GNU LGPL 3.0.
+
+If this PC doesn't have .NET 10 for desktop apps, setup also copies Microsoft's
+.NET runtime into the app's folder. Microsoft licenses it under the Microsoft
+.NET Library terms (licenses\dotnet\LICENSE.txt in the install folder). By
+installing, you agree to those terms for the .NET runtime.
+"@
+$licensePage = Join-Path $artifacts 'license-page.txt'
+$page = (Get-Content -Raw -LiteralPath $license).TrimEnd() + "`n`n" + $terms + "`n"
+[IO.File]::WriteAllText($licensePage, ($page -replace "`r?`n", "`r`n"), [Text.UTF8Encoding]::new($true))
+$options += "/DLicensePage=$licensePage"
 if ($ForceRuntime) { $options += '/DForceRuntime' }
 if ($signTool) {
     # $q is Inno's quote and $f the file to sign. The setup and its uninstaller are both signed.

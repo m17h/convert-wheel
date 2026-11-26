@@ -153,8 +153,8 @@ machine's .NET install (checking Microsoft's signatures), fetches [Inno Setup](h
 `tools\.innosetup` (nothing is installed) and compiles `installer\ConvertWheel.iss`. It prints the SHA-256 of what it made.
 `-ForceRuntime` makes an installer that always includes the runtime, for testing the "no .NET" path on a PC that has it.
 `-SignThumbprint` and `-TimestampUrl` sign the app and the installer with a certificate from your store (off by default).
-The version and other details are in `ConvertWheel.csproj` only. A `LICENSE` file in the project folder, if there is one,
-is shown by the installer.
+The version and other details are in `ConvertWheel.csproj` only. The installer's licence page shows `LICENSE`, followed
+by a note on the third-party components and the Microsoft terms for the .NET runtime it may install.
 
 The first build fetches the FFmpeg build pinned in `tools\ffmpeg.json` (by SHA-256) and packs it into `tools\ffmpeg.tar.xz` (see
 `tools\pack-ffmpeg.ps1`; the file isn't committed), which is then embedded into the exe. After the pin changes, run that script
@@ -176,3 +176,9 @@ Command-line extras:
 
 Settings are saved in `%APPDATA%\ConvertWheel\settings.json`. Errors are logged to `%LOCALAPPDATA%\ConvertWheel\log.txt`.
 The bundled FFmpeg is unpacked once into `%LOCALAPPDATA%\ConvertWheel\tools`.
+
+## License
+
+Convert Wheel is free and open source under the [MIT License](LICENSE): anyone may use, change, fork and share it,
+including in other projects, as long as the copyright and licence notice stay with it. The third-party components
+it ships keep their own licences (see [Third-party libraries](#third-party-libraries)).
